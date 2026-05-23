@@ -1,0 +1,10 @@
+{
+  "projectId": "ediagil",
+  "appId": "1:460078650816:web:74ddf45d9846e30896e425",
+  "apiKey": "AIzaSyDE3fTCfLCdt6278V1nDiGiWAw_X2KSoXw",
+  "authDomain": "ediagil.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "ediagil.firebasestorage.app",
+  "messagingSenderId": "460078650816",
+  "measurementId": "G-E11E5Z7FHR"
+}

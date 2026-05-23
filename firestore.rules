@@ -1,0 +1,209 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── Helpers ──
+    function isSignedIn() { return request.auth != null; }
+    function isValidId(id) { return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function existing() { return resource.data; }
+
+    function isExistingOwner() {
+      return existing().userId == request.auth.uid;
+    }
+
+    // ── subjects ──
+    match /subjects/{subjectId} {
+      function isValidSubject(data) {
+        return data.keys().hasAll(['userId', 'name', 'color', 'teacher', 'schedule'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 200
+          && data.color is string && data.color.size() > 0 && data.color.size() <= 7
+          && data.teacher is string && data.teacher.size() >= 0 && data.teacher.size() <= 200
+          && data.schedule is string && data.schedule.size() >= 0 && data.schedule.size() <= 1000;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(subjectId) && isValidSubject(request.resource.data);
+      allow update: if isSignedIn() && isValidId(subjectId) && isExistingOwner() && isValidSubject(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
+    }
+
+    // ── notes ──
+    match /notes/{noteId} {
+      function isValidNote(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'title', 'content', 'date', 'createdAt', 'updatedAt'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+          && data.content is string && data.content.size() >= 0 && data.content.size() <= 300000
+          && data.date is string && data.date.size() > 0 && data.date.size() <= 30;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(noteId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(noteId) && isValidNote(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(noteId) && isExistingOwner() && isValidNote(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(noteId) && isExistingOwner();
+    }
+
+    // ── students ──
+    match /students/{studentId} {
+      function isValidStudent(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'cedula', 'firstName', 'lastName'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.cedula is string && data.cedula.size() > 0 && data.cedula.size() <= 50
+          && data.firstName is string && data.firstName.size() > 0 && data.firstName.size() <= 100
+          && data.lastName is string && data.lastName.size() > 0 && data.lastName.size() <= 100;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(studentId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(studentId) && isValidStudent(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(studentId) && isExistingOwner() && isValidStudent(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(studentId) && isExistingOwner();
+    }
+
+    // ── evaluations ──
+    match /evaluations/{evaluationId} {
+      function isValidEvaluation(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'title', 'maxScore', 'date', 'type'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+          && data.maxScore is number && data.maxScore >= 0
+          && data.date is string && data.date.size() > 0 && data.date.size() <= 30
+          && data.type is string && data.type.size() > 0 && data.type.size() <= 50;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(evaluationId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(evaluationId) && isValidEvaluation(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(evaluationId) && isExistingOwner() && isValidEvaluation(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(evaluationId) && isExistingOwner();
+    }
+
+    // ── grades ──
+    match /grades/{gradeId} {
+      function isValidGrade(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'evaluationId', 'studentId', 'score'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.evaluationId is string && data.evaluationId.size() > 0 && data.evaluationId.size() <= 128
+          && data.studentId is string && data.studentId.size() > 0 && data.studentId.size() <= 128
+          && data.score is number && data.score >= 0;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(gradeId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(gradeId) && isValidGrade(request.resource.data)
+        && exists(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId))
+        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.userId == request.auth.uid
+        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore;
+      allow update: if isSignedIn() && isValidId(gradeId) && isExistingOwner() && isValidGrade(request.resource.data)
+        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore;
+      allow delete: if isSignedIn() && isValidId(gradeId) && isExistingOwner();
+    }
+
+    // ── attendance ──
+    match /attendance/{attendanceId} {
+      function isValidAttendance(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'studentId', 'date', 'status'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.studentId is string && data.studentId.size() > 0 && data.studentId.size() <= 128
+          && data.date is string && data.date.size() > 0 && data.date.size() <= 30
+          && data.status is string && data.status.size() > 0 && data.status.size() <= 50;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(attendanceId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(attendanceId) && isValidAttendance(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(attendanceId) && isExistingOwner() && isValidAttendance(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(attendanceId) && isExistingOwner();
+    }
+
+    // ── calendarEvents ──
+    match /calendarEvents/{calendarEventId} {
+      function isValidCalendarEvent(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'title', 'date', 'type'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+          && data.date is string && data.date.size() > 0 && data.date.size() <= 30
+          && data.type is string && data.type.size() > 0 && data.type.size() <= 50;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(calendarEventId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(calendarEventId) && isValidCalendarEvent(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(calendarEventId) && isExistingOwner() && isValidCalendarEvent(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(calendarEventId) && isExistingOwner();
+    }
+
+    // ── materials ──
+    match /materials/{materialId} {
+      function isValidMaterial(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'title', 'type', 'date'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+          && data.type is string && data.type.size() > 0 && data.type.size() <= 50
+          && data.date is string && data.date.size() > 0 && data.date.size() <= 30;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(materialId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(materialId) && isValidMaterial(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(materialId) && isExistingOwner() && isValidMaterial(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(materialId) && isExistingOwner();
+    }
+
+    // ── subjectModules ──
+    match /subjectModules/{subjectModuleId} {
+      function isValidSubjectModule(data) {
+        return data.keys().hasAll(['userId', 'subjectId', 'title', 'order', 'createdAt'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
+          && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+          && data.order is number
+          && data.createdAt is number;
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(subjectModuleId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(subjectModuleId) && isValidSubjectModule(request.resource.data)
+        && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(subjectModuleId) && isExistingOwner() && isValidSubjectModule(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(subjectModuleId) && isExistingOwner();
+    }
+
+    // ── users ──
+    match /users/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasAll(['plan', 'email', 'createdAt'])
+        && request.resource.data.plan == 'free'
+        && request.resource.data.aiCallsThisMonth is number
+        && request.resource.data.aiCallsThisMonth == 0;
+
+      allow update: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.plan == existing().plan
+        && request.resource.data.aiCallsThisMonth == existing().aiCallsThisMonth;
+
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,294 @@
+{
+  "entities": {
+    "Subject": {
+      "title": "Subject",
+      "description": "A subject taught by a teacher.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": "string" },
+        "teacher": { "type": "string" },
+        "schedule": { "type": "string" },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" },
+        "plan": { "type": "string" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["userId", "name", "color", "teacher", "schedule"]
+    },
+    "Note": {
+      "title": "Note",
+      "description": "A note for a specific subject.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "moduleId": { "type": "string" },
+        "title": { "type": "string" },
+        "content": { "type": "string", "maxLength": 100000 },
+        "date": { "type": "string" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "attachment": { "type": "object" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["userId", "subjectId", "title", "content", "date", "createdAt", "updatedAt"]
+    },
+    "Student": {
+      "title": "Student",
+      "description": "A student in a subject.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "cedula": { "type": "string" },
+        "firstName": { "type": "string" },
+        "lastName": { "type": "string" },
+        "gender": { "type": "string" }
+      },
+      "required": ["userId", "subjectId", "cedula", "firstName", "lastName"]
+    },
+    "Evaluation": {
+      "title": "Evaluation",
+      "description": "An evaluation for a subject.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "moduleId": { "type": "string" },
+        "title": { "type": "string" },
+        "maxScore": { "type": "number" },
+        "date": { "type": "string" },
+        "type": { "type": "string" }
+      },
+      "required": ["userId", "subjectId", "title", "maxScore", "date", "type"]
+    },
+    "Grade": {
+      "title": "Grade",
+      "description": "A grade for a specific student in an evaluation.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "evaluationId": { "type": "string" },
+        "studentId": { "type": "string" },
+        "score": { "type": "number" }
+      },
+      "required": ["userId", "subjectId", "evaluationId", "studentId", "score"]
+    },
+    "Attendance": {
+      "title": "Attendance",
+      "description": "Attendance record.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "moduleId": { "type": "string" },
+        "studentId": { "type": "string" },
+        "date": { "type": "string" },
+        "status": { "type": "string" }
+      },
+      "required": ["userId", "subjectId", "studentId", "date", "status"]
+    },
+    "CalendarEvent": {
+      "title": "CalendarEvent",
+      "description": "A calendar event.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "moduleId": { "type": "string" },
+        "title": { "type": "string" },
+        "date": { "type": "string" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "type": { "type": "string" }
+      },
+      "required": ["userId", "subjectId", "title", "date", "type"]
+    },
+    "Material": {
+      "title": "Material",
+      "description": "Material for a subject or module.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "moduleId": { "type": "string" },
+        "title": { "type": "string" },
+        "type": { "type": "string" },
+        "description": { "type": "string" },
+        "observations": { "type": "string" },
+        "date": { "type": "string" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "attachment": { "type": "object" }
+      },
+      "required": ["userId", "subjectId", "title", "type", "date"]
+    },
+    "SubjectModule": {
+      "title": "SubjectModule",
+      "description": "A module inside a subject.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subjectId": { "type": "string" },
+        "parentId": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "order": { "type": "number" },
+        "createdAt": { "type": "number" },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" }
+      },
+      "required": ["userId", "subjectId", "title", "order", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/subjects/{subjectId}": {
+      "schema": { "$ref": "#/entities/Subject" },
+      "description": "Subjects collection"
+    },
+    "/notes/{noteId}": {
+      "schema": { "$ref": "#/entities/Note" },
+      "description": "Notes collection"
+    },
+    "/students/{studentId}": {
+      "schema": { "$ref": "#/entities/Student" },
+      "description": "Students collection"
+    },
+    "/evaluations/{evaluationId}": {
+      "schema": { "$ref": "#/entities/Evaluation" },
+      "description": "Evaluations collection"
+    },
+    "/grades/{gradeId}": {
+      "schema": { "$ref": "#/entities/Grade" },
+      "description": "Grades collection"
+    },
+    "/attendance/{attendanceId}": {
+      "schema": { "$ref": "#/entities/Attendance" },
+      "description": "Attendance collection"
+    },
+    "/calendarEvents/{calendarEventId}": {
+      "schema": { "$ref": "#/entities/CalendarEvent" },
+      "description": "Calendar Events collection"
+    },
+    "/materials/{materialId}": {
+      "schema": { "$ref": "#/entities/Material" },
+      "description": "Materials collection"
+    },
+    "/subjectModules/{subjectModuleId}": {
+      "schema": { "$ref": "#/entities/SubjectModule" },
+      "description": "Subject modules collection"
+    }
+  },
+  "indexes": [
+    {
+      "collectionId": "subjects",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "name", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "notes",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "notes",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "moduleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "students",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "evaluations",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "evaluations",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "moduleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "grades",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "grades",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "evaluationId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "grades",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "studentId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "attendance",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "attendance",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "studentId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "calendarEvents",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "calendarEvents",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "moduleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "subjectModules",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "materials",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "indexes": [
+    {
+      "collectionId": "subjects",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "name", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "notes",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "notes",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "moduleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "students",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "evaluations",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "evaluations",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "moduleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "grades",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "grades",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "evaluationId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "grades",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "studentId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "attendance",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "attendance",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "studentId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "calendarEvents",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "calendarEvents",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "moduleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "subjectModules",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "materials",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "subjectId", "order": "ASCENDING" }
+      ]
+    }
+  ]
+}
