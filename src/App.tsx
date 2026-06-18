@@ -6,6 +6,7 @@
 import { useState, useEffect, lazy, Suspense, type FormEvent } from "react";
 import { useCustomCollectionData } from "./lib/firestoreUtils";
 import { motion } from "motion/react";
+import { GuidedTour } from "./components/GuidedTour";
 import {
   BookOpen,
   Plus,
@@ -21,6 +22,7 @@ import {
   Settings,
   Layers,
   LogOut,
+  HelpCircle,
 } from "lucide-react";
 import { format, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
@@ -33,6 +35,7 @@ import { GradesTab } from "./components/GradesTab";
 import { AttendanceTab } from "./components/AttendanceTab";
 import { StudentsTab } from "./components/StudentsTab";
 import { ModulesTab } from "./components/ModulesTab";
+import { UserGuide } from "./components/UserGuide";
 import type { SubjectDoc, NoteDoc } from "./types/firestore";
 import { cn } from "./lib/utils";
 import {
@@ -44,11 +47,14 @@ import {
 } from "./lib/analytics";
 
 import { useAuth } from './components/AuthProvider';
-import { collection, query, where, orderBy, deleteDoc, doc, getDocs, writeBatch, limit } from 'firebase/firestore';
-import { db } from './lib/firebase';
+import { collection, query, where, orderBy, deleteDoc, doc, getDocs, writeBatch, limit, addDoc } from 'firebase/firestore';
+import { sendPasswordResetEmail } from 'firebase/auth';
+import { auth, db } from './lib/firebase';
 import { handleFirestoreError, OperationType } from './lib/firestoreUtils';
 import { ToastContainer } from './components/ToastContainer';
-import { STORAGE_KEYS, getStorageItem } from './lib/storageKeys';
+import { TooltipProvider } from './components/TooltipProvider';
+import { STORAGE_KEYS, getStorageItem, setStorageItem } from './lib/storageKeys';
+import { usePlan } from './hooks/usePlan';
 import { showToast } from './hooks/useToast';
 import { checkGeminiHealth } from './lib/geminiClient';
 import { useNetworkStatus } from './hooks/useNetworkStatus';
@@ -60,6 +66,31 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+
+  const handleResetPassword = async () => {
+    if (!email.trim()) {
+      setAuthError('Ingresa tu email primero.');
+      return;
+    }
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setResetSent(true);
+      setShowResetPassword(false);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+      if (message.includes('auth/user-not-found')) {
+        setAuthError('No hay cuenta con este email.');
+      } else {
+        setAuthError('Error al enviar. Verifica el email e intenta de nuevo.');
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  };
 
   const handleAuth = async (e: FormEvent) => {
     e.preventDefault();
@@ -104,6 +135,7 @@ export default function App() {
 
   // ── Verificar disponibilidad del servidor proxy al iniciar ───────────────
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     checkGeminiHealth().then(({ ok, hasKey, error }) => {
       if (!ok) {
         showToast('error', `Servidor IA no disponible: ${error || 'Inicia el servidor con npm run dev:full'}`, 8000);
@@ -117,12 +149,12 @@ export default function App() {
 
   if (!user) {
     return (
-      <>
+      <TooltipProvider>
         <ToastContainer />
         <div className="flex flex-col items-center justify-center min-h-screen bg-neutral-50 px-4">
           <div className="text-center space-y-6 max-w-sm w-full">
-            <div className="w-24 h-24 bg-white rounded-[2rem] flex items-center justify-center mx-auto border border-neutral-200 shadow-2xl">
-              <BookOpen className="w-10 h-10 text-indigo-600" />
+            <div className="w-24 h-24 bg-white rounded-[2rem] flex items-center justify-center mx-auto border border-neutral-200 shadow-2xl overflow-hidden p-1">
+              <img src="/logo.webp" alt="EdiAgil Logo" className="app-logo w-full h-full object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
             </div>
             <h1 className="text-4xl font-black text-neutral-900 tracking-tight">EdiAgil</h1>
             <p className="text-neutral-500 font-medium px-4">Gestiona tus clases, asistencias y calificaciones en la nube.</p>
@@ -147,38 +179,88 @@ export default function App() {
               {authError && (
                 <p className="text-red-500 text-sm font-medium">{authError}</p>
               )}
-              <button
-                type="submit"
-                disabled={authLoading}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl shadow-indigo-500/20 active:scale-95 transition-all disabled:opacity-50"
-              >
-                {authLoading ? 'Cargando...' : isSignUp ? 'Crear cuenta' : 'Iniciar sesión'}
-              </button>
+              {resetSent && (
+                <p className="text-emerald-600 text-sm font-medium">Te enviamos un email para restablecer tu contraseña.</p>
+              )}
+              {showResetPassword ? (
+                <div className="space-y-4">
+                  <p className="text-sm text-neutral-500 font-medium">Ingresa tu email y te enviaremos un enlace para restablecer tu contraseña.</p>
+                  <button
+                    type="button"
+                    disabled={authLoading}
+                    onClick={handleResetPassword}
+                    title="Enviar correo para restablecer contraseña"
+                    className="w-full bg-amber-500 hover:bg-amber-400 text-white px-6 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-lg active:scale-95 transition-all disabled:opacity-50"
+                  >
+                    {authLoading ? 'Enviando...' : 'Enviar enlace de recuperación'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setShowResetPassword(false); setAuthError(''); }}
+                    title="Regresar al inicio de sesión"
+                    className="w-full text-sm text-neutral-500 hover:text-neutral-900 font-bold transition-colors"
+                  >
+                    Volver
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <button
+                    id="login-button"
+                    type="submit"
+                    disabled={authLoading}
+                    title={isSignUp ? 'Crear una cuenta nueva' : 'Iniciar sesión en tu cuenta'}
+                    className="w-full bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl shadow-indigo-500/20 active:scale-95 transition-all disabled:opacity-50"
+                  >
+                    {authLoading ? 'Cargando...' : isSignUp ? 'Crear cuenta' : 'Iniciar sesión'}
+                  </button>
+                  {!isSignUp && (
+                    <button
+                      type="button"
+                      onClick={() => { setShowResetPassword(true); setAuthError(''); setResetSent(false); }}
+                      title="Solicitar restablecimiento de contraseña"
+                      className="w-full text-sm text-indigo-600 hover:text-indigo-500 font-bold transition-colors"
+                    >
+                      ¿Olvidaste tu contraseña?
+                    </button>
+                  )}
+                </>
+              )}
             </form>
-            <button
-              onClick={() => { setIsSignUp(!isSignUp); setAuthError(''); }}
-              className="text-sm text-indigo-600 hover:text-indigo-500 font-bold transition-colors"
-            >
-              {isSignUp ? '¿Ya tienes cuenta? Inicia sesión' : '¿No tienes cuenta? Regístrate'}
-            </button>
+            {!showResetPassword && (
+              <button
+                id="login-toggle"
+                onClick={() => { setIsSignUp(!isSignUp); setAuthError(''); setResetSent(false); }}
+                title="Cambiar entre inicio de sesión y registro"
+                className="text-sm text-indigo-600 hover:text-indigo-500 font-bold transition-colors"
+              >
+                {isSignUp ? '¿Ya tienes cuenta? Inicia sesión' : '¿No tienes cuenta? Regístrate'}
+              </button>
+            )}
+            <div className="flex items-center justify-center gap-4 pt-2">
+              <a href="/terminos.html" target="_blank" rel="noopener noreferrer" className="text-[11px] text-neutral-400 hover:text-indigo-600 font-medium transition-colors">Términos</a>
+              <span className="text-neutral-300 text-[11px]">·</span>
+              <a href="/privacidad.html" target="_blank" rel="noopener noreferrer" className="text-[11px] text-neutral-400 hover:text-indigo-600 font-medium transition-colors">Privacidad</a>
+            </div>
           </div>
         </div>
-      </>
+      </TooltipProvider>
     );
   }
 
   return (
-    <>
+    <TooltipProvider>
       <ToastContainer />
       <CuadernoApp />
-    </>
+    </TooltipProvider>
   );
 }
 
 function CuadernoApp() {
   const { user, logOut } = useAuth();
+  const { plan: dbPlan, loading: loadingPlan } = usePlan();
   const [currentView, setCurrentView] = useState<"dashboard" | "subject">(
-    "dashboard",
+    "subject",
   );
   const [activeTab, setActiveTab] = useState<
     "planning" | "grades" | "attendance" | "students" | "modules"
@@ -195,12 +277,38 @@ function CuadernoApp() {
   const [noteToEdit, setNoteToEdit] = useState<NoteDoc | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isTourOpen, setIsTourOpen] = useState(false);
+  const [isGuideOpen, setIsGuideOpen] = useState(false);
+  const [tourSubjectId, setTourSubjectId] = useState<string | null>(null);
   const [subjectToDelete, setSubjectToDelete] = useState<string | null>(null);
   const [noteToDelete, setNoteToDelete] = useState<string | null>(null);
 
   useEffect(() => {
     initGA();
   }, []);
+
+  useEffect(() => {
+    const leftoverTourId = localStorage.getItem('tour_subject_id');
+    if (leftoverTourId && user?.uid) {
+      (async () => {
+        try {
+          const batch = writeBatch(db);
+          batch.delete(doc(db, 'subjects', leftoverTourId));
+          const subCollections = ['notes', 'materials', 'subjectModules', 'calendarEvents', 'evaluations', 'students', 'grades', 'attendance'];
+          for (const collName of subCollections) {
+            const q = query(collection(db, collName), where('subjectId', '==', leftoverTourId), where('userId', '==', user.uid), limit(500));
+            const snapshot = await getDocs(q);
+            snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
+          }
+          await batch.commit();
+        } catch (e) {
+          console.warn("Failed to clean up leftover tour subject:", e);
+        } finally {
+          localStorage.removeItem('tour_subject_id');
+        }
+      })();
+    }
+  }, [user]);
 
   useEffect(() => {
     const path =
@@ -228,6 +336,17 @@ function CuadernoApp() {
   });
 
   useEffect(() => {
+    if (!loadingPlan && dbPlan) {
+      const sandboxMode = getStorageItem('ediagil_sandbox_mode') === 'true';
+      if (!sandboxMode) {
+        setStorageItem(STORAGE_KEYS.ACTIVE_SUBSCRIPTION, dbPlan);
+        setActiveSubscription(dbPlan);
+        window.dispatchEvent(new Event("subscription_change"));
+      }
+    }
+  }, [dbPlan, loadingPlan]);
+
+  useEffect(() => {
     const handleSubChange = () => {
       setActiveSubscription(
         (getStorageItem(STORAGE_KEYS.ACTIVE_SUBSCRIPTION) as
@@ -240,6 +359,86 @@ function CuadernoApp() {
     return () =>
       window.removeEventListener("subscription_change", handleSubChange);
   }, []);
+
+  const handleStartTour = async () => {
+    if (subjects.length === 0 && user) {
+      try {
+        const demoRef = await addDoc(collection(db, 'subjects'), {
+          name: 'Mi Asignatura Demo',
+          userId: user.uid,
+          color: '#4f46e5',
+          createdAt: Date.now(),
+          plan: 'trimestral',
+          teacher: '',
+          schedule: '',
+        });
+        setTourSubjectId(demoRef.id);
+        setSelectedSubjectId(demoRef.id);
+
+        const moduleRef = await addDoc(collection(db, 'subjectModules'), {
+          userId: user.uid,
+          subjectId: demoRef.id,
+          title: 'Unidad 1: Introducción',
+          description: 'Principios fundamentales de la asignatura',
+          order: 1,
+          createdAt: Date.now(),
+          startDate: format(new Date(), 'yyyy-MM-dd'),
+          endDate: format(new Date(new Date().setMonth(new Date().getMonth() + 2)), 'yyyy-MM-dd'),
+        });
+
+        await addDoc(collection(db, 'students'), {
+          userId: user.uid,
+          subjectId: demoRef.id,
+          cedula: '12345678',
+          firstName: 'Juan',
+          lastName: 'Pérez',
+          gender: 'M',
+        });
+
+        await addDoc(collection(db, 'evaluations'), {
+          userId: user.uid,
+          subjectId: demoRef.id,
+          moduleId: moduleRef.id,
+          title: 'Examen Diagnóstico',
+          maxScore: 100,
+          date: format(new Date(), 'yyyy-MM-dd'),
+          type: 'teorica',
+        });
+
+        localStorage.setItem('tour_subject_id', demoRef.id);
+      } catch {
+        // fallback: continue without demo subject
+      }
+    }
+    setIsTourOpen(true);
+  };
+
+  const handleCloseTour = async () => {
+    setIsTourOpen(false);
+    if (tourSubjectId) {
+      try {
+        const batch = writeBatch(db);
+        batch.delete(doc(db, 'subjects', tourSubjectId));
+
+        const subCollections = ['notes', 'materials', 'subjectModules', 'calendarEvents', 'evaluations', 'students', 'grades', 'attendance'];
+        for (const collName of subCollections) {
+          const q = query(collection(db, collName), where('subjectId', '==', tourSubjectId), where('userId', '==', user?.uid), limit(500));
+          const snapshot = await getDocs(q);
+          snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
+        }
+
+        await batch.commit();
+      } catch {
+        // cleanup silently
+      }
+
+      if (selectedSubjectId === tourSubjectId) {
+        setSelectedSubjectId(null);
+      }
+      setTourSubjectId(null);
+      localStorage.removeItem('tour_subject_id');
+    }
+  };
 
   const handleEditSubject = (subject: SubjectDoc) => {
     setSubjectToEdit(subject);
@@ -325,7 +524,7 @@ function CuadernoApp() {
         <div className="p-8 border-b border-neutral-100 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/20">
-              <BookOpen className="w-5 h-5" />
+              <img src="/logo.webp" alt="Logo" className="app-logo w-5 h-5 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
             </div>
             <h1 className="font-black text-xl tracking-tight text-neutral-900">
               Mi Cuaderno
@@ -333,6 +532,7 @@ function CuadernoApp() {
           </div>
           <button
             aria-label="Cerrar menú"
+            title="Cerrar menú lateral"
             className="md:hidden text-neutral-400 hover:text-neutral-900 transition-colors"
             onClick={() => setIsSidebarOpen(false)}
           >
@@ -356,7 +556,7 @@ function CuadernoApp() {
             )}
           >
             <div className="flex items-center gap-2">
-              <img src="/logo.png" alt="Logo" className="w-12 h-12 object-contain rounded-lg bg-white p-1 shadow-sm" onError={(e) => {
+              <img src="/logo.webp" alt="Logo" className="app-logo w-12 h-12 object-contain rounded-lg bg-white p-1 shadow-sm" style={{ filter: 'none', backgroundColor: 'transparent' }} onError={(e) => {
                 // Fallback to icon if logo is not found
                 e.currentTarget.style.display = 'none';
                 e.currentTarget.nextElementSibling?.classList.remove('hidden');
@@ -386,6 +586,7 @@ function CuadernoApp() {
               {subjects.map((subject: SubjectDoc) => (
                 <button
                   key={subject.id}
+                  title="Seleccionar esta asignatura"
                   onClick={() => {
                     setSelectedSubjectId(subject.id);
                     setCurrentView("subject");
@@ -424,6 +625,7 @@ function CuadernoApp() {
 
         <div className="p-6 border-t border-neutral-100 space-y-3">
           <button
+            id="weightings-btn"
             aria-label="Configuración"
             onClick={() => setIsSettingsModalOpen(true)}
             title="Ajustes de la aplicación"
@@ -435,6 +637,7 @@ function CuadernoApp() {
             </span>
           </button>
           <button
+            id="new-subject-btn"
             onClick={handleNewSubject}
             title="Añadir una nueva asignatura"
             className="w-full flex items-center justify-center gap-3 bg-neutral-900 hover:bg-neutral-800 text-white py-4 rounded-2xl transition-all hover:shadow-2xl active:scale-95 text-sm font-black uppercase tracking-widest"
@@ -455,11 +658,12 @@ function CuadernoApp() {
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0 bg-neutral-50 relative overflow-hidden">
+      <main className="flex-1 flex flex-col min-w-0 bg-neutral-50 relative">
         {/* Mobile Header */}
         <header className="md:hidden flex items-center gap-4 p-6 border-b border-neutral-200 bg-white shadow-sm">
           <button
             aria-label="Abrir menú"
+            title="Abrir menú lateral"
             onClick={() => setIsSidebarOpen(true)}
             className="text-neutral-500 hover:text-neutral-900 transition-colors"
           >
@@ -480,7 +684,7 @@ function CuadernoApp() {
               onNavigateToSubject={(id: string, tab: string) => {
                 setSelectedSubjectId(id);
                 setCurrentView("subject");
-                if (tab) setActiveTab(tab);
+                if (tab) setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules");
               }}
               onNewSubject={handleNewSubject}
               onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -562,7 +766,9 @@ function CuadernoApp() {
                   ].map((tab) => (
                     <button
                       key={tab.id}
-                      onClick={() => setActiveTab(tab.id)}
+                      id={`tab-${tab.id}`}
+                      onClick={() => setActiveTab(tab.id as "modules" | "grades" | "attendance" | "students")}
+                      title={`Sección de ${tab.label}`}
                       className={cn(
                          "pb-4 text-[10px] font-black uppercase tracking-[0.2em] transition-all border-b-4 whitespace-nowrap active:scale-95",
                         activeTab === tab.id
@@ -584,38 +790,46 @@ function CuadernoApp() {
                 transition={{ duration: 0.4, ease: "easeOut" }}
               >
                 {activeTab === "modules" && (
-                  <ModulesTab
-                    subjectId={selectedSubject.id!}
-                    onOpenNoteModal={(moduleId: string, note: NoteDoc | null) => {
-                      setActiveModuleIdForNote(moduleId);
-                      setNoteToEdit(note || null);
-                      setIsNoteModalOpen(true);
-                    }}
-                    onDeleteNote={(id: string) => setNoteToDelete(id)}
-                  />
+                  <div id="materials-section">
+                    <ModulesTab
+                      subjectId={selectedSubject.id!}
+                      onOpenNoteModal={(moduleId: string, note: NoteDoc | null) => {
+                        setActiveModuleIdForNote(moduleId);
+                        setNoteToEdit(note || null);
+                        setIsNoteModalOpen(true);
+                      }}
+                      onDeleteNote={(id: string) => setNoteToDelete(id)}
+                    />
+                  </div>
                 )}
                 {activeTab === "grades" && (
-                  <GradesTab subjectId={selectedSubject.id!} />
+                  <div id="grades-section">
+                    <GradesTab subjectId={selectedSubject.id!} />
+                  </div>
                 )}
                 {activeTab === "attendance" && (
-                  <AttendanceTab subjectId={selectedSubject.id!} />
+                  <div id="attendance-section">
+                    <AttendanceTab subjectId={selectedSubject.id!} />
+                  </div>
                 )}
                 {activeTab === "students" && (
-                  <StudentsTab subjectId={selectedSubject.id!} />
+                  <div id="participants-section">
+                    <StudentsTab subjectId={selectedSubject.id!} />
+                  </div>
                 )}
               </motion.div>
             </div>
           </div>
         ) : (
-          <div className="flex-1 flex items-center justify-center p-8 bg-neutral-50 relative overflow-hidden">
-            <div className="absolute inset-0 opacity-[0.03] pointer-events-none">
+          <div className="flex-1 flex items-center justify-center p-8 bg-neutral-50 relative">
+            <div className="absolute inset-0 opacity-[0.03] pointer-events-none overflow-hidden">
               <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-600 rounded-full blur-[120px]" />
               <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-purple-600 rounded-full blur-[120px]" />
             </div>
 
             <div className="text-center max-w-lg relative z-10">
               <div className="w-28 h-28 bg-white rounded-[2.5rem] flex items-center justify-center mx-auto mb-10 border border-neutral-200 shadow-2xl hover:scale-110 hover:rotate-3 transition-all duration-700 group">
-                <BookOpen className="w-12 h-12 text-indigo-600 group-hover:scale-110 transition-transform" />
+                <img src="/logo.webp" alt="Logo" className="app-logo w-12 h-12 object-contain group-hover:scale-110 transition-transform" style={{ filter: 'none', backgroundColor: 'transparent' }} />
               </div>
               <h2 className="text-4xl font-black text-neutral-900 mb-6 tracking-tight leading-tight">
                 Bienvenido a tu Cuaderno
@@ -624,17 +838,23 @@ function CuadernoApp() {
                 Organiza tus clases, toma apuntes estructurados y mantén todo tu
                 conocimiento en un solo lugar en la nube y de forma segura.
               </p>
-              {!loadingSubjects && subjects.length === 0 ? (
-                <button
-                  onClick={() => setIsSubjectModalOpen(true)}
-                  className="inline-flex items-center gap-4 bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-5 rounded-[2rem] font-black transition-all shadow-2xl shadow-indigo-500/40 hover:shadow-indigo-500/60 active:scale-95 uppercase tracking-widest text-sm"
-                >
-                  <Plus className="w-6 h-6" />
-                  Crear mi primera asignatura
-                </button>
-              ) : (
-                <div className="inline-block px-8 py-4 bg-white border border-neutral-200 rounded-3xl shadow-sm text-neutral-400 font-black uppercase tracking-[0.2em] text-[10px] animate-bounce">
-                  Selecciona una asignatura para comenzar
+              {!loadingSubjects && (
+                <div className="flex flex-col items-center gap-6">
+                  {subjects.length > 0 && (
+                    <div className="inline-block px-8 py-4 bg-white border border-neutral-200 rounded-3xl shadow-sm text-neutral-400 font-black uppercase tracking-[0.2em] text-[10px] animate-bounce">
+                      Selecciona una asignatura para comenzar
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setIsSubjectModalOpen(true)}
+                    title="Crear una nueva asignatura"
+                    style={{ touchAction: 'manipulation' }}
+                    className="inline-flex items-center gap-4 bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-5 rounded-[2rem] font-black transition-all shadow-2xl shadow-indigo-500/40 hover:shadow-indigo-500/60 active:scale-95 uppercase tracking-widest text-sm"
+                  >
+                    <Plus className="w-6 h-6" />
+                    {subjects.length === 0 ? "Crear mi primera asignatura" : "Crear nueva asignatura"}
+                  </button>
                 </div>
               )}
             </div>
@@ -659,12 +879,14 @@ function CuadernoApp() {
             <div className="flex gap-4">
               <button
                 onClick={() => setSubjectToDelete(null)}
+                title="Cancelar y mantener la asignatura"
                 className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
               >
                 Cancelar
               </button>
               <button
                 onClick={() => handleDeleteSubject(subjectToDelete)}
+                title="Eliminar permanentemente la asignatura y todos sus datos"
                 className="flex-1 bg-red-600 hover:bg-red-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-red-500/20 active:scale-95"
               >
                 Eliminar
@@ -691,12 +913,14 @@ function CuadernoApp() {
             <div className="flex gap-4">
               <button
                 onClick={() => setNoteToDelete(null)}
+                title="Cancelar y mantener el apunte"
                 className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
               >
                 Cancelar
               </button>
               <button
                 onClick={() => handleDeleteNote(noteToDelete)}
+                title="Eliminar permanentemente este apunte"
                 className="flex-1 bg-red-600 hover:bg-red-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-red-500/20 active:scale-95"
               >
                 Eliminar
@@ -730,6 +954,36 @@ function CuadernoApp() {
           />
         </>
       )}
+
+      <GuidedTour
+        run={isTourOpen}
+        onClose={handleCloseTour}
+        setCurrentView={setCurrentView}
+        setActiveTab={setActiveTab}
+        isAuthenticated={!!user}
+        firstSubjectId={subjects.length > 0 ? subjects[0].id : tourSubjectId}
+        onSelectSubject={(id) => setSelectedSubjectId(id)}
+      />
+
+      <UserGuide
+        isOpen={isGuideOpen}
+        onClose={() => setIsGuideOpen(false)}
+        onStartTour={handleStartTour}
+      />
+
+      {/* Help / Tour floating button */}
+      <button
+        id="tour-help-btn"
+        onClick={() => setIsGuideOpen(true)}
+        className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl shadow-2xl shadow-indigo-500/40 flex items-center justify-center transition-all active:scale-90 hover:scale-110 group"
+        title="Guía de uso"
+        aria-label="Abrir guía de uso"
+      >
+        <HelpCircle className="w-6 h-6" />
+        <span className="absolute right-16 bg-neutral-900 text-white text-xs font-black px-3 py-1.5 rounded-xl whitespace-nowrap opacity-0 group-hover:opacity-100 transition-all duration-200 pointer-events-none tracking-wide">
+          Guía de uso
+        </span>
+      </button>
     </div>
   );
 }

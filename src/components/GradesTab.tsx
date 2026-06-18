@@ -1,20 +1,18 @@
 import { format } from 'date-fns';
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useCustomCollectionData } from "../lib/firestoreUtils";
-import { collection, query, where, addDoc, updateDoc, deleteDoc, doc, writeBatch, getDocs, limit } from 'firebase/firestore';
+import { collection, query, where, addDoc, updateDoc, doc, writeBatch, getDocs, limit } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthProvider';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
-import { Plus, Trash2, ChevronLeft, BarChart3, UserCheck, UserX, Info, Edit3, Download, ChevronRight, ChevronDown, Wand2, X } from 'lucide-react';
-import type { EvaluationDoc, SubjectModuleDoc } from '../types/firestore';
-import { safeJSONParse, cn } from '../lib/utils';
+import { Plus, Trash2, ChevronLeft, BarChart3, UserCheck, UserX, Info, Edit3, Download, ChevronRight, ChevronDown } from 'lucide-react';
+import { safeJSONParse, cn, parseLocalDate } from '../lib/utils';
 import { GradesSummary } from './GradesSummary';
 import { STORAGE_KEYS, getStorageItem } from '../lib/storageKeys';
 import { executeBatchChunked, createSetOp } from '../lib/batchUtils';
 
 import { exportSubjectDataToExcel } from '../lib/exportUtils';
-import { extractTextFromFile } from '../lib/fileParser';
-import { ai } from '../lib/gemini';
+import type { SubjectModuleDoc, EvaluationDoc } from '../types/firestore';
 
 export function GradesTab({ subjectId }: { subjectId: string }) {
   const { user } = useAuth();
@@ -30,13 +28,8 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
   const [evalToDelete, setEvalToDelete] = useState<string | null>(null);
   const [expandedModules, setExpandedModules] = useState<Record<string, boolean>>({});
   
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [isProcessingAI, setIsProcessingAI] = useState(false);
-  const [aiAlertMessage, setAiAlertMessage] = useState<string | null>(null);
-
-  // Optimización: Debounce para evitar sobrecargar Firestore
   const [localScores, setLocalScores] = useState<Record<string, string>>({});
-  const pendingWrites = useRef<Record<string, NodeJS.Timeout>>({});
+  const [savingGrades, setSavingGrades] = useState(false);
 
   const studentsQuery = user?.uid ? query(collection(db, 'students'), where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
   const [students = []] = useCustomCollectionData(studentsQuery);
@@ -57,8 +50,8 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
     const groups: { module: SubjectModuleDoc | null, evals: EvaluationDoc[] }[] = [];
     
     modules.forEach(mod => {
-      const start = mod.startDate ? new Date(mod.startDate).getTime() : null;
-      let end = mod.endDate ? new Date(mod.endDate).getTime() : null;
+      const start = mod.startDate ? parseLocalDate(mod.startDate).getTime() : null;
+      let end = mod.endDate ? parseLocalDate(mod.endDate).getTime() : null;
       if (end) {
         // expand the end date to the end of the day
         end = end + 86400000 - 1; 
@@ -69,7 +62,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
         if (ev.moduleId) return false; // Belongs to a different module
         if (!ev.date) return false;
         
-        const evDate = new Date(ev.date).getTime();
+        const evDate = parseLocalDate(ev.date).getTime();
         if (start && end) {
           return evDate >= start && evDate <= end;
         }
@@ -87,6 +80,21 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
 
     return groups;
   }, [evaluations, modules]);
+
+  useEffect(() => {
+    if (groupedEvaluations.length > 0) {
+      const tourSubjectId = localStorage.getItem('tour_subject_id');
+      if (tourSubjectId === subjectId) {
+        const firstGroupId = groupedEvaluations[0].module
+          ? `module-${groupedEvaluations[0].module.id}`
+          : 'unassigned';
+        setExpandedModules(prev => {
+          if (prev[firstGroupId]) return prev;
+          return { ...prev, [firstGroupId]: true };
+        });
+      }
+    }
+  }, [groupedEvaluations, subjectId]);
 
   const toggleModule = (id: string) => {
     setExpandedModules(prev => ({ ...prev, [id]: !prev[id] }));
@@ -135,6 +143,8 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
       setEditingEvalId(null);
       setEvalTitle('');
       setEvalMaxScore('100');
+      setEvalType('teorica');
+      setEvalDate(format(new Date(), 'yyyy-MM-dd'));
       setEvalModuleId('');
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'evaluations');
@@ -176,41 +186,34 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
   };
 
   const handleScoreChange = (studentId: string, scoreStr: string) => {
-    if (!selectedEvalId || !user) {
-      console.warn("No evaluation selected when changing score");
-      return;
-    }
-
-    // 1. Actualización visual instantánea
+    if (!selectedEvalId || !user) return;
     setLocalScores(prev => ({ ...prev, [studentId]: scoreStr }));
+  };
 
-    // 2. Cancelar el guardado anterior si se sigue escribiendo
-    if (pendingWrites.current[studentId]) {
-      clearTimeout(pendingWrites.current[studentId]);
-    }
-
-    // 3. Programar el guardado real en Firestore tras 1.5s (Debounce)
-    pendingWrites.current[studentId] = setTimeout(async () => {
-      let scoreStrNormalized = scoreStr.trim().replace(',', '.');
-      let score = Number(scoreStrNormalized);
-      if (isNaN(score)) return;
-
+  const handleSaveGrades = async () => {
+    if (!selectedEvalId || !user) return;
+    setSavingGrades(true);
+    try {
       const evaluation = (evaluations || []).find(e => e.id === selectedEvalId);
-      const max = evaluation?.maxScore || 100;
-      
-      if (score > max) score = max;
-      if (score < 0) score = 0;
+      if (!evaluation) return;
+      const max = evaluation.maxScore || 100;
 
-      try {
-        const existing = await getDocs(query(collection(db, 'grades'), where('userId', '==', user.uid), where('evaluationId', '==', selectedEvalId), where('studentId', '==', studentId), limit(500)));
+      const batch = writeBatch(db);
+      let opsCount = 0;
 
-        if (!existing.empty) {
-          await updateDoc(doc(db, 'grades', existing.docs[0].id), { 
-            score,
-            subjectId
-          });
+      for (const [studentId, scoreStr] of Object.entries(localScores)) {
+        const normalized = scoreStr.trim().replace(',', '.');
+        let score = Number(normalized);
+        if (isNaN(score)) continue;
+        if (score > max) score = max;
+        if (score < 0) score = 0;
+
+        const existingGrade = (grades || []).find(g => g.studentId === studentId);
+
+        if (existingGrade) {
+          batch.update(doc(db, 'grades', existingGrade.id!), { score, subjectId });
         } else {
-          await addDoc(collection(db, 'grades'), {
+          batch.set(doc(collection(db, 'grades')), {
             userId: user.uid,
             subjectId,
             evaluationId: selectedEvalId,
@@ -218,10 +221,18 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
             score
           });
         }
-      } catch (error) {
-        handleFirestoreError(error, OperationType.WRITE, 'grades');
+        opsCount++;
       }
-    }, 1500);
+
+      if (opsCount > 0) {
+        await batch.commit();
+      }
+      setLocalScores({});
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'grades');
+    } finally {
+      setSavingGrades(false);
+    }
   };
 
   const parseWeights = (data: string | null) => {
@@ -313,78 +324,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
     };
   };
 
-  const handleAIUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !selectedEvalId) return;
 
-    setIsProcessingAI(true);
-    const reader = new FileReader();
-
-    reader.onload = async (event) => {
-      try {
-        const result = event.target?.result as string;
-        let contents: any[] = [];
-
-        if (file.type.startsWith('image/')) {
-          const base64Data = result.split(',')[1];
-          contents = [
-            {
-              inlineData: {
-                data: base64Data,
-                mimeType: file.type
-              }
-            },
-            `Analiza esta imagen con calificaciones. Busca la nota (número) para cada uno de los siguientes estudiantes en esta evaluación. \nDevuelve SOLO un JSON con la estructura {"grades": [{"studentId": <id>, "score": <nota_encontrada>}]}. \nSi no encuentras la nota o no estás seguro, omite a ese estudiante.\nImportante: Las notas pueden tener comas o puntos decimales, extrae el número con punto decimal.\nEstudiantes:\n` + 
-            students.map(s => `ID: ${s.id} - Nombre: ${s.firstName} ${s.lastName} - Cédula: ${s.cedula}`).join('\n')
-          ];
-        } else {
-          const text = await extractTextFromFile(result, file.type);
-          contents = [
-            `Analiza el siguiente texto extraído de un documento de notas. Busca la nota (número) para cada uno de los siguientes estudiantes en esta evaluación. \nDevuelve SOLO un JSON con la estructura {"grades": [{"studentId": <id>, "score": <nota_encontrada>}]}. \nSi no encuentras la nota o no estás seguro, omite a ese estudiante.\nImportante: Las notas pueden tener comas o puntos decimales, extrae el número con punto decimal.\nEstudiantes:\n` + 
-            students.map(s => `ID: ${s.id} - Nombre: ${s.firstName} ${s.lastName} - Cédula: ${s.cedula}`).join('\n') + `\n\nDocumento:\n${text}`
-          ];
-        }
-
-        const aiResponse = await ai({
-          model: 'gemini-2.5-flash',
-          contents,
-          config: { 
-            temperature: 0.1,
-            responseMimeType: "application/json"
-          }
-        });
-
-        if (!aiResponse.text) throw new Error("No response");
-        const jsonMatch = aiResponse.text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("No JSON found");
-
-        const parsed = JSON.parse(jsonMatch[0]);
-        const newGrades = parsed.grades;
-        
-        let count = 0;
-        for (const g of newGrades) {
-          if (g.studentId && typeof g.score === 'number' || typeof g.score === 'string') {
-            const exists = students.find(s => String(s.id) === String(g.studentId));
-            if (exists) {
-              await handleScoreChange(exists.id!, String(g.score));
-              count++;
-            }
-          }
-        }
-        
-        setAiAlertMessage(`¡Magia completada! Se identificaron y cargaron ${count} calificaciones correctamente.`);
-        
-      } catch (error) {
-        console.error(error);
-        setAiAlertMessage('Error procesando el documento mediante IA. Asegúrate de que las notas sean legibles, contenga los nombres de los estudiantes, y revisa que tu API Key de Gemini esté configurada (o usa los límites gratuitos).');
-      } finally {
-        setIsProcessingAI(false);
-        if (fileInputRef.current) fileInputRef.current.value = '';
-      }
-    };
-
-    reader.readAsDataURL(file);
-  };
 
   if (students.length === 0) {
     return (
@@ -420,9 +360,10 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
           {!selectedEvalId && (
             <>
               <button
+                id="exporta-tu-informe-de-clases-en-excel-y-editalo-para-tus-entregas"
                 onClick={() => exportSubjectDataToExcel(user!.uid, user!.displayName || user!.email!, subjectId)}
                 className="inline-flex items-center gap-2 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 hover:text-emerald-700 px-6 py-4 rounded-2xl text-sm font-black transition-all border border-emerald-200 uppercase tracking-widest active:scale-95 shadow-sm ml-auto"
-                title="Exportar Reporte a Excel"
+                title="exporta tu informe de clases en excel y editalo para tus entregas"
               >
                 <Download className="w-5 h-5" />
                 Exportar Excel
@@ -468,6 +409,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
               <button
                 onClick={() => setIsAddingEval(!isAddingEval)}
                 className="flex items-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-4 rounded-2xl text-sm font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest"
+                title="Registrar una nueva evaluación en esta asignatura"
               >
                 <Plus className="w-5 h-5" />
                 <span className="hidden sm:inline">Nueva Eval.</span>
@@ -499,7 +441,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
             <label className="block text-[10px] font-black text-neutral-400 uppercase tracking-[0.2em] mb-4 px-1">Tipo de Evaluación</label>
             <select 
               value={evalType} 
-              onChange={e => setEvalType(e.target.value)}
+              onChange={e => setEvalType(e.target.value as 'teorica' | 'practica' | 'apreciativa')}
               className="w-full bg-neutral-50 border border-neutral-200 rounded-2xl px-6 py-4 text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all font-bold cursor-pointer text-lg"
             >
               <option value="teorica">{weights.teorica.name} ({weights.teorica.value}%)</option>
@@ -547,10 +489,11 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                       setEvalTitle('');
                     }} 
                     className="flex-1 sm:flex-none px-8 py-4 text-xs font-black text-neutral-400 hover:text-neutral-900 transition-colors uppercase tracking-widest"
+                    title="Cancelar el registro de la evaluación"
                   >
                     Cancelar
                   </button>
-                  <button type="submit" className="flex-1 sm:flex-none px-12 py-4 text-xs font-black bg-indigo-600 text-white rounded-2xl hover:bg-indigo-500 transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest">
+                  <button type="submit" className="flex-1 sm:flex-none px-12 py-4 text-xs font-black bg-indigo-600 text-white rounded-2xl hover:bg-indigo-500 transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest" title="Guardar los detalles de la evaluación">
                     {editingEvalId ? 'Actualizar Evaluación' : 'Guardar Evaluación'}
                   </button>
                 </div>
@@ -559,20 +502,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
         </form>
       )}
 
-      {aiAlertMessage && (
-        <div className="fixed inset-0 bg-neutral-900/40 backdrop-blur-md z-50 flex items-center justify-center p-4">
-          <div className="bg-white border border-neutral-200 rounded-[2.5rem] p-10 max-w-sm w-full shadow-2xl animate-in fade-in zoom-in duration-300">
-            <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-8 mx-auto">
-              <Wand2 className="w-8 h-8" />
-            </div>
-            <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">Magia IA</h3>
-            <p className="text-neutral-500 mb-10 text-center font-medium leading-relaxed">{aiAlertMessage}</p>
-            <button onClick={() => setAiAlertMessage(null)} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs">
-              Aceptar
-            </button>
-          </div>
-        </div>
-      )}
+
 
       {selectedEvalId ? (() => {
         const evaluation = (evaluations || []).find(e => e.id === selectedEvalId);
@@ -584,6 +514,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
               <button 
                 onClick={() => setSelectedEvalId(null)}
                 className="p-4 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-2xl transition-all active:scale-95 border border-neutral-200 bg-white shadow-sm shrink-0"
+                title="Volver a la lista de evaluaciones"
               >
                 <ChevronLeft className="w-8 h-8" />
               </button>
@@ -592,35 +523,32 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                 <div className="flex items-center gap-4 mt-2">
                   <span className="text-[10px] font-black uppercase tracking-widest px-3 py-1 rounded-lg border bg-indigo-50 text-indigo-600 border-indigo-100">{evaluation.type}</span>
                   <p className="text-sm text-neutral-400 font-black uppercase tracking-widest">
-                    {new Date(evaluation.date).toLocaleDateString()} • {evaluation.maxScore || 100} PTS
+                    {parseLocalDate(evaluation.date).toLocaleDateString()} • {evaluation.maxScore || 100} PTS
                   </p>
                 </div>
               </div>
               <div className="flex items-center gap-2 flex-wrap">
-                <input 
-                  type="file" 
-                  accept="image/*, .pdf, .csv, .xlsx, .xls" 
-                  className="hidden" 
-                  ref={fileInputRef}
-                  onChange={handleAIUpload}
-                  disabled={isProcessingAI}
-                />
+              {Object.keys(localScores).length > 0 && (
                 <button 
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={isProcessingAI}
-                  className="flex items-center gap-2 bg-gradient-to-r from-pink-500 to-indigo-600 hover:from-pink-400 hover:to-indigo-500 text-white px-5 py-4 rounded-2xl text-[11px] font-black transition-all shadow-lg shadow-indigo-500/20 active:scale-95 uppercase tracking-widest shrink-0"
-                  title="Adjuntar y extraer notas con IA mágica"
+                  onClick={handleSaveGrades}
+                  disabled={savingGrades}
+                  className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-4 rounded-2xl text-[11px] font-black transition-all shadow-lg shadow-emerald-500/20 active:scale-95 uppercase tracking-widest shrink-0"
+                  title="Guardar las calificaciones modificadas en la base de datos"
                 >
-                  <Wand2 className={cn("w-5 h-5", isProcessingAI && "animate-spin")} />
-                  <span className="hidden lg:inline">{isProcessingAI ? "Procesando..." : "IA Mágica"}</span>
+                  {savingGrades ? "Guardando..." : `Guardar (${Object.keys(localScores).length})`}
                 </button>
-                <button 
-                  onClick={() => handleEditEval(evaluation)}
-                  className="flex items-center gap-2 bg-white border border-neutral-200 hover:border-indigo-500 text-indigo-600 px-5 py-4 rounded-2xl text-[11px] font-black transition-all shadow-sm active:scale-95 uppercase tracking-widest shrink-0 bg-transparent"
-                >
-                  <Edit3 className="w-5 h-5" />
-                  <span className="hidden lg:inline">Editar</span>
-                </button>
+              )}
+              <button 
+                onClick={() => {
+                  setSelectedEvalId(null);
+                  handleEditEval(evaluation);
+                }}
+                className="flex items-center gap-2 bg-white border border-neutral-200 hover:border-indigo-500 text-indigo-600 px-5 py-4 rounded-2xl text-[11px] font-black transition-all shadow-sm active:scale-95 uppercase tracking-widest shrink-0 bg-transparent"
+                title="Editar la configuración de esta evaluación"
+              >
+                <Edit3 className="w-5 h-5" />
+                <span className="hidden lg:inline">Editar</span>
+              </button>
               </div>
             </div>
 
@@ -699,6 +627,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                       setEvalType('apreciativa');
                       setIsAddingEval(true);
                     }}
+                    title="Crear una evaluación de tipo apreciativa automáticamente"
                     className="px-6 py-3 bg-amber-50 text-amber-600 rounded-xl font-black text-xs uppercase tracking-widest border border-amber-100 hover:bg-amber-100 transition-all"
                   >
                     + Agregar Nota Apreciativa
@@ -718,6 +647,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                       <button 
                         onClick={() => toggleModule(groupId)}
                         className="w-full flex items-center justify-between px-8 py-6 hover:bg-neutral-50 transition-colors"
+                        title={isExpanded ? "Contraer grupo de evaluaciones" : "Expandir grupo de evaluaciones"}
                       >
                         <div className="flex items-center gap-4">
                           <div className={cn(
@@ -732,7 +662,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                             </h4>
                             {group.module && (group.module.startDate || group.module.endDate) && (
                               <p className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mt-1">
-                                {group.module.startDate ? new Date(group.module.startDate).toLocaleDateString() : '...'} - {group.module.endDate ? new Date(group.module.endDate).toLocaleDateString() : '...'}
+                                {group.module.startDate ? parseLocalDate(group.module.startDate).toLocaleDateString() : '...'} - {group.module.endDate ? parseLocalDate(group.module.endDate).toLocaleDateString() : '...'}
                               </p>
                             )}
                           </div>
@@ -747,7 +677,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
 
                       {isExpanded && (
                         <div className="border-t border-neutral-100 bg-neutral-50/30 overflow-x-auto">
-                          <table className="w-full text-left text-sm">
+                <table id="grades-table" className="w-full text-left text-sm">
                             <thead className="bg-neutral-50/50 text-neutral-500 border-b border-neutral-100">
                               <tr>
                                 <th className="px-8 py-4 font-black uppercase tracking-[0.2em] text-[10px]">Evaluación</th>
@@ -776,7 +706,7 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                                   </td>
                                   <td className="px-8 py-4">
                                     <div className="flex items-center gap-2 text-neutral-500 font-bold uppercase tracking-widest text-[10px]">
-                                      {new Date(evaluation.date).toLocaleDateString()}
+                                      {parseLocalDate(evaluation.date).toLocaleDateString()}
                                     </div>
                                   </td>
                                   <td className="px-8 py-4 text-center text-neutral-900 font-black">{evaluation.maxScore || 100}</td>
@@ -831,8 +761,8 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
             <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">Eliminar Evaluación</h3>
             <p className="text-neutral-500 mb-10 text-center font-medium leading-relaxed">¿Estás seguro de que deseas eliminar esta evaluación y todas sus calificaciones? Esta acción no se puede deshacer.</p>
             <div className="flex gap-4">
-              <button onClick={() => setEvalToDelete(null)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95">Cancelar</button>
-              <button onClick={confirmDeleteEval} className="flex-1 bg-red-600 hover:bg-red-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-red-500/20 active:scale-95">Eliminar</button>
+              <button onClick={() => setEvalToDelete(null)} title="Cancelar y mantener la evaluación" className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95">Cancelar</button>
+              <button onClick={confirmDeleteEval} title="Eliminar permanentemente la evaluación" className="flex-1 bg-red-600 hover:bg-red-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-red-500/20 active:scale-95">Eliminar</button>
             </div>
           </div>
         </div>

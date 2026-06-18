@@ -158,7 +158,7 @@ export const ProgressWidget = memo(function ProgressWidget() {
     if (active && payload && payload.length) {
       return (
         <div className="bg-neutral-900 text-white p-4 rounded-2xl shadow-xl border border-neutral-800">
-          <p className="font-black text-sm mb-1">{label}</p>
+          <p className="font-black text-sm mb-1">{String(label)}</p>
           <p className="text-emerald-400 font-bold text-lg">
             Promedio: {payload[0].value} <span className="text-neutral-400 text-xs font-medium">/ {payload[0].payload?.maxScore}</span>
           </p>
@@ -182,8 +182,8 @@ export const ProgressWidget = memo(function ProgressWidget() {
         </div>
       </div>
 
-      <div className="h-[300px] w-full mt-4">
-        <ResponsiveContainer width="100%" height="100%">
+      <div className="h-[300px] w-full mt-4 min-w-0">
+        <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
           <BarChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f5f5f5" />
             <XAxis 

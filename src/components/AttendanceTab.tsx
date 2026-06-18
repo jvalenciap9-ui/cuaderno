@@ -207,7 +207,7 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
             <div className="flex flex-col sm:flex-row sm:items-center gap-4">
               <select 
                 value={viewMode}
-                onChange={(e) => setViewMode(e.target.value)}
+                onChange={(e) => setViewMode(e.target.value as 'week' | 'module' | 'evaluation')}
                 className="appearance-none bg-neutral-50 border border-neutral-200 rounded-xl px-4 py-2.5 text-xs font-black text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all cursor-pointer uppercase tracking-widest"
               >
                 <option value="week">Por Semana</option>
@@ -218,7 +218,7 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
               <div className="flex-1">
                 {viewMode === 'week' && (
                   <div className="flex items-center justify-between bg-neutral-50 border border-neutral-200 rounded-xl p-1 relative">
-                    <button onClick={() => setCurrentWeekStart(subWeeks(currentWeekStart, 1))} className="p-2 hover:bg-white rounded-lg transition-all active:scale-90 text-neutral-400 hover:text-neutral-900 hover:shadow-sm z-10">
+                    <button onClick={() => setCurrentWeekStart(subWeeks(currentWeekStart, 1))} className="p-2 hover:bg-white rounded-lg transition-all active:scale-90 text-neutral-400 hover:text-neutral-900 hover:shadow-sm z-10" title="Ver semana anterior">
                       <ChevronLeft className="w-4 h-4" />
                     </button>
                     
@@ -239,7 +239,7 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
                       </span>
                     </div>
 
-                    <button onClick={() => setCurrentWeekStart(addWeeks(currentWeekStart, 1))} className="p-2 hover:bg-white rounded-lg transition-all active:scale-90 text-neutral-400 hover:text-neutral-900 hover:shadow-sm z-10">
+                    <button onClick={() => setCurrentWeekStart(addWeeks(currentWeekStart, 1))} className="p-2 hover:bg-white rounded-lg transition-all active:scale-90 text-neutral-400 hover:text-neutral-900 hover:shadow-sm z-10" title="Ver semana siguiente">
                       <ChevronRight className="w-4 h-4" />
                     </button>
                   </div>
@@ -352,6 +352,7 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
                                   status === 'absent' ? 'bg-red-50 border-red-200 text-red-600' :
                                   'bg-neutral-50 border-neutral-100 text-neutral-300 hover:border-neutral-300 hover:bg-white hover:text-neutral-400'
                                 )}
+                                title={status === 'present' ? 'Asistencia: Presente. Haz clic para cambiar a Tardanza.' : status === 'late' ? 'Asistencia: Tardanza. Haz clic para cambiar a Ausente.' : status === 'absent' ? 'Asistencia: Ausente. Haz clic para limpiar registro.' : 'Sin registro. Haz clic para marcar Presente.'}
                               >
                                 {status === 'present' && <Check className="w-7 h-7" />}
                                 {status === 'late' && <Clock className="w-7 h-7" />}

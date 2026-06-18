@@ -21,12 +21,18 @@ export interface UserProfile {
   createdAt: unknown;
   aiCallsThisMonth: number;
   aiCallsResetAt: number;
+  paymentProvider?: string;
+  paymentSessionId?: string;
+  paymentAmount?: number;
+  subscriptionId?: string;
+  expiresAt?: number;
+  updatedAt?: unknown;
 }
 
 export const PLAN_LIMITS: Record<PlanType, { maxSubjects: number; aiCallsPerMonth: number; label: string }> = {
-  free:   { maxSubjects: 3,   aiCallsPerMonth: 15,   label: 'Gratis'        },
-  pro:    { maxSubjects: 999, aiCallsPerMonth: 500,  label: 'Pro'           },
-  school: { maxSubjects: 999, aiCallsPerMonth: 9999, label: 'Institucional' },
+  free:   { maxSubjects: 2,    aiCallsPerMonth: 15,   label: 'Gratis'        },
+  pro:    { maxSubjects: 999,  aiCallsPerMonth: 2000, label: 'Premium Pro'   },
+  school: { maxSubjects: 999,  aiCallsPerMonth: 9999, label: 'Institucional' },
 };
 
 export function usePlan() {
