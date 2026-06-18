@@ -118,16 +118,19 @@ export const GradesSummary = memo(function GradesSummary({ subjectId, onNavigate
       
       categories.forEach(cat => {
         const typeEvals = evaluations.filter(e => e.type === cat.id);
-        if (typeEvals.length > 0) {
+        const activeEvals = typeEvals.filter(ev =>
+          studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
+        );
+        if (activeEvals.length > 0) {
           globalTotalWeightUsed += cat.weight;
           let sumPct = 0;
-          typeEvals.forEach(ev => {
+          activeEvals.forEach(ev => {
             const grade = studentGrades.find(g => g.evaluationId === ev.id);
             const score = grade?.score || 0;
             const max = ev.maxScore || 100;
             sumPct += (score / max);
           });
-          const avg = sumPct / typeEvals.length;
+          const avg = sumPct / activeEvals.length;
           globalWeightedSum += avg * cat.weight;
           globalDetails[cat.id as keyof typeof globalDetails] = avg * 100;
         }
@@ -142,16 +145,19 @@ export const GradesSummary = memo(function GradesSummary({ subjectId, onNavigate
         let modTotalWeightUsed = 0;
         categories.forEach(cat => {
           const typeEvals = evaluations.filter(e => e.type === cat.id && e.moduleId === mod.id);
-          if (typeEvals.length > 0) {
+          const activeEvals = typeEvals.filter(ev =>
+            studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
+          );
+          if (activeEvals.length > 0) {
             modTotalWeightUsed += cat.weight;
             let sumPct = 0;
-            typeEvals.forEach(ev => {
+            activeEvals.forEach(ev => {
               const grade = studentGrades.find(g => g.evaluationId === ev.id);
               const score = grade?.score || 0;
               const max = ev.maxScore || 100;
               sumPct += (score / max);
             });
-            const avg = sumPct / typeEvals.length;
+            const avg = sumPct / activeEvals.length;
             modWeightedSum += avg * cat.weight;
           }
         });
@@ -193,9 +199,7 @@ export const GradesSummary = memo(function GradesSummary({ subjectId, onNavigate
 
   const isDashboard = !subjectId;
   const top5 = isDashboard ? studentGradesList.slice(0, 5) : [];
-  const bottom5 = isDashboard && studentGradesList.length > 5 
-    ? studentGradesList.slice(5).slice(-5).reverse() 
-    : [];
+  const bottom5 = isDashboard ? [...studentGradesList].slice(-5).reverse() : [];
 
   const savedScale = getStorageItem(STORAGE_KEYS.GRADING_SCALE);
   const gradingScale = safeJSONParse(savedScale, { maxScore: 100, minPassingScore: 71 });

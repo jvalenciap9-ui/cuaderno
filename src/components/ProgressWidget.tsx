@@ -96,16 +96,19 @@ export const ProgressWidget = memo(function ProgressWidget() {
 
         categories.forEach(cat => {
           const typeEvals = subjectEvals.filter(e => e.type === cat.id);
-          if (typeEvals.length > 0) {
+          const activeEvals = typeEvals.filter(ev =>
+            studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
+          );
+          if (activeEvals.length > 0) {
             totalWeightUsed += cat.weight;
             let sumPct = 0;
-            typeEvals.forEach(ev => {
+            activeEvals.forEach(ev => {
               const grade = studentGrades.find(g => g.evaluationId === ev.id);
               const score = grade?.score || 0;
               const max = ev.maxScore || 100;
               sumPct += (score / max);
             });
-            const avg = sumPct / typeEvals.length;
+            const avg = sumPct / activeEvals.length;
             weightedSumTotal += avg * cat.weight;
           }
         });

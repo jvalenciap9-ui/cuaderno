@@ -1,7 +1,7 @@
 import { format } from 'date-fns';
 import { collection, query, where, getDocs, doc, getDoc, limit } from 'firebase/firestore';
 import { db } from './firebase';
-import { safeJSONParse } from './utils';
+import { safeJSONParse, parseLocalDate } from './utils';
 import { STORAGE_KEYS, getStorageItem } from './storageKeys';
 
 // Helper function to calculate grades
@@ -106,16 +106,19 @@ export async function exportSubjectDataToExcel(userId: string, userName: string 
       let totalWeightUsed = 0;
       categories.forEach(cat => {
         const typeEvals = evalsSubset.filter(e => e.type === cat.id);
-        if (typeEvals.length > 0) {
+        const activeEvals = typeEvals.filter(ev =>
+          studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
+        );
+        if (activeEvals.length > 0) {
           totalWeightUsed += cat.weight;
           let sumPct = 0;
-          typeEvals.forEach(ev => {
+          activeEvals.forEach(ev => {
             const grade = studentGrades.find(g => g.evaluationId === ev.id);
             const score = grade?.score || 0;
             const max = ev.maxScore || 100;
             sumPct += (score / max);
           });
-          const avg = sumPct / typeEvals.length;
+          const avg = sumPct / activeEvals.length;
           weightedSum += avg * cat.weight;
         }
       });
@@ -135,21 +138,21 @@ export async function exportSubjectDataToExcel(userId: string, userName: string 
 
       let modAttendance = [...attendanceSessions];
       if (mod.id !== null) {
-        const startTimestamp = mod.startDate ? new Date(mod.startDate).getTime() : null;
-        let endTimestamp = mod.endDate ? new Date(mod.endDate).getTime() : null;
+        const startTimestamp = mod.startDate ? parseLocalDate(mod.startDate).getTime() : null;
+        let endTimestamp = mod.endDate ? parseLocalDate(mod.endDate).getTime() : null;
         if (endTimestamp) endTimestamp += 86400000 - 1; 
 
         modAttendance = attendanceSessions.filter(a => {
-          const aTime = new Date(a.date).getTime();
+          const aTime = parseLocalDate(a.date).getTime();
           if (startTimestamp && endTimestamp) return aTime >= startTimestamp && aTime <= endTimestamp;
           return false;
         });
       } else if (subjectModules.length > 0) {
          modAttendance = attendanceSessions.filter(a => {
-           const aTime = new Date(a.date).getTime();
+           const aTime = parseLocalDate(a.date).getTime();
            for (const sm of subjectModules!) {
-             const ms = sm.startDate ? new Date(sm.startDate).getTime() : null;
-             let me = sm.endDate ? new Date(sm.endDate).getTime() : null;
+             const ms = sm.startDate ? parseLocalDate(sm.startDate).getTime() : null;
+             let me = sm.endDate ? parseLocalDate(sm.endDate).getTime() : null;
              if (me) me += 86400000 - 1;
              if (ms && me && aTime >= ms && aTime <= me) return false;
            }
@@ -191,8 +194,7 @@ export async function exportSubjectDataToExcel(userId: string, userName: string 
         let uniqueDates = Array.from(new Set(modAttendance.map(s => s.date))).sort();
         
         uniqueDates = uniqueDates.filter(dateStr => {
-          const dateObj = new Date(dateStr);
-          const day = new Date(dateObj.getTime() + dateObj.getTimezoneOffset() * 60000).getDay();
+          const day = parseLocalDate(dateStr).getDay();
           return day !== 0 && day !== 6;
         });
 
