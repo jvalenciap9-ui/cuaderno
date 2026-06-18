@@ -293,27 +293,30 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
     }
 
     let weightedSum = 0;
+    let totalWeightUsed = 0;
     const details: Record<string, number> = { teorica: 0, practica: 0, apreciativa: 0, checkpoint: 0 };
 
     categories.forEach(cat => {
       const typeEvals = evaluations.filter(e => e.type === cat.id);
-      if (typeEvals.length > 0) {
+      const activeEvals = typeEvals.filter(ev =>
+        studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
+      );
+      if (activeEvals.length > 0) {
+        totalWeightUsed += cat.weight;
         let sumPct = 0;
-        typeEvals.forEach(ev => {
+        activeEvals.forEach(ev => {
           const grade = studentGrades.find(g => g.evaluationId === ev.id);
           const score = grade?.score || 0;
           const max = ev.maxScore || 100;
           sumPct += (score / max);
         });
-        const avg = sumPct / typeEvals.length;
-        const contribution = avg * cat.weight;
-        weightedSum += contribution;
-        // Return the average scaled to 100% for the specific category UI
+        const avg = sumPct / activeEvals.length;
+        weightedSum += avg * cat.weight;
         details[cat.id as keyof typeof details] = avg * 100;
       }
     });
 
-    const finalGrade = (weightedSum / 100) * (gradingScale.maxScore || 100);
+    const finalGrade = totalWeightUsed > 0 ? (weightedSum / totalWeightUsed) * (gradingScale.maxScore || 100) : 0;
     
     return {
       total: Math.round(finalGrade * 10) / 10,
