@@ -13,9 +13,11 @@ firebase-applet-config.rar
 gemini_key.txt
 .firebase/
 firebase functions.json
-"firebase init functions.js"
+*firebase init functions.js
+firebase-applet-config.json.*
 
 # Archivos temporales y de herramientas
 .agents/*.txt
 tour_ids.csv
 "Ediagil Notes/"
+Ediagil Notes/
