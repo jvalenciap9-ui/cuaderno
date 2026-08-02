@@ -45,3 +45,36 @@ echo "VITE_GEMINI_API_KEY=tu_clave_aqui" > .env.local
 
 # 4. Ejecutar en modo desarrollo
 npm run dev
+```
+
+## 💎 Suscripción Premium y Monetización
+
+EdiAgil ofrece un modelo **Freemium** diseñado para adaptarse a las necesidades de profesores individuales e instituciones:
+
+### 🌟 Planes Disponibles
+
+1. **Plan Gratis ($0/mes)**
+   - Hasta 3 asignaturas simultáneas.
+   - Apuntes y registro de notas/asistencia guardados localmente.
+   - Hasta 50 consultas de IA mensuales.
+   - Soporte a través de la comunidad.
+
+2. **Plan Premium Pro ($4.99/mes)**
+   - Asignaturas y apuntes **ilimitados**.
+   - Sincronización en tiempo real multidispositivo mediante **Cloud Firestore**.
+   - Hasta 500 consultas mensuales de IA Avanzada (Gemini 2.5 Pro).
+   - Generación ilimitada de planificaciones, horarios y exámenes.
+   - Soporte prioritario por correo electrónico.
+
+3. **Plan Institucional ($99.99/año)**
+   - Incluye **30 licencias anuales** Pro para docentes del centro educativo.
+   - **Panel Administrativo** centralizado para coordinadores y directores escolares.
+   - Sincronización en la nube institucional.
+   - Soporte 24/7 y asistencia en onboarding para profesores.
+
+### 💖 Cómo apoyar el proyecto (Monetización)
+
+El proyecto soporta múltiples canales de pago seguros integrados con el backend de Firebase:
+- **Pasarela Global (Lemon Squeezy):** Haz clic en "Gestionar Plan" en la pestaña de Ajustes para pagar con tarjeta internacional.
+- **GitHub Sponsors:** Puedes patrocinar este proyecto en GitHub. El sistema detectará automáticamente tu patrocinio y activará tu cuenta Pro sin comisiones intermedias.
+- **Canje de Códigos de Licencia:** Si pagas por transferencia local (Yape/Mercado Pago) o compras en lote para tu institución, el administrador te entregará un código de activación único que puedes canjear desde la pestaña de Suscripción para desbloquear tu cuenta Pro por un año.
