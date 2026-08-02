@@ -1,0 +1,6 @@
+# Configuración de Financiamiento y Soporte para EdiAgil
+# Esto habilita el botón "Sponsor" en la barra superior derecha de tu repositorio en GitHub.
+
+github: [jvalenciap9] # Cambia esto por tu usuario real de GitHub
+ko_fi: jvalenciap9   # Tu cuenta de Ko-Fi si tienes una
+custom: ['https://lemonsqueezy.com/'] # Enlace a tu tienda de Lemon Squeezy o checkout
