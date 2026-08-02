@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, lazy, Suspense, type FormEvent } from "react";
+import { useState, useEffect, lazy, Suspense, useRef, type FormEvent } from "react";
 import { useCustomCollectionData } from "./lib/firestoreUtils";
 import { motion } from "motion/react";
 import { GuidedTour } from "./components/GuidedTour";
@@ -23,7 +23,16 @@ import {
   Layers,
   LogOut,
   HelpCircle,
+  Download,
+  Upload,
+  ArrowLeft,
 } from "lucide-react";
+import {
+  exportSubjectToJSON,
+  triggerJSONDownload,
+  importSubjectFromJSON,
+  isValidBackup,
+} from "./lib/jsonSyncUtils";
 import { format, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
 
@@ -35,7 +44,9 @@ import { GradesTab } from "./components/GradesTab";
 import { AttendanceTab } from "./components/AttendanceTab";
 import { StudentsTab } from "./components/StudentsTab";
 import { ModulesTab } from "./components/ModulesTab";
+import { SubjectCalendar } from "./components/SubjectCalendar";
 import { UserGuide } from "./components/UserGuide";
+import { AdminDashboard } from "./components/AdminDashboard";
 import type { SubjectDoc, NoteDoc } from "./types/firestore";
 import { cn } from "./lib/utils";
 import {
@@ -53,21 +64,94 @@ import { auth, db } from './lib/firebase';
 import { handleFirestoreError, OperationType } from './lib/firestoreUtils';
 import { ToastContainer } from './components/ToastContainer';
 import { TooltipProvider } from './components/TooltipProvider';
-import { STORAGE_KEYS, getStorageItem, setStorageItem } from './lib/storageKeys';
+import { GradeSettingsProvider } from './contexts/GradeSettingsContext';
+import { STORAGE_KEYS, getStorageItem, setStorageItem, clearAppStorage } from './lib/storageKeys';
+import { db as dexieDb } from './lib/db';
 import { usePlan } from './hooks/usePlan';
 import { showToast } from './hooks/useToast';
 import { checkGeminiHealth } from './lib/geminiClient';
 import { useNetworkStatus } from './hooks/useNetworkStatus';
+import { addSubjectCounterOp } from './lib/subjectCounter';
+import { navigate, usePathname } from './lib/router';
+import { LandingPage } from './components/LandingPage';
 
 export default function App() {
-  const { user, signIn, signUp, logOut } = useAuth();
-  const [isSignUp, setIsSignUp] = useState(false);
+  const { user } = useAuth();
+  const pathname = usePathname();
+
+  // ── Toast global listener (recibe errores de handleFirestoreError) ──────
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { type, message } = (e as CustomEvent).detail;
+      showToast(type, message);
+    };
+    window.addEventListener('app:toast', handler);
+    return () => window.removeEventListener('app:toast', handler);
+  }, []);
+
+  // ── Verificar disponibilidad del servidor proxy al iniciar ───────────────
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    checkGeminiHealth().then(({ ok, hasKey, error }) => {
+      if (!ok) {
+        showToast('error', `Servidor IA no disponible: ${error || 'Inicia el servidor con npm run dev:full'}`, 8000);
+      } else if (!hasKey) {
+        showToast('warning', 'Falta GEMINI_API_KEY en .env.local — La IA no funcionará.', 8000);
+      }
+    });
+  }, []);
+
+  // Normalizar la URL a /app cuando el usuario está autenticado
+  useEffect(() => {
+    if (user && (pathname === '/' || pathname === '/login')) {
+      window.history.replaceState({}, '', '/app');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }
+  }, [user, pathname]);
+
+  useNetworkStatus();
+
+  if (!user) {
+    if (pathname === '/login' || pathname === '/app') {
+      return <LoginScreen onBack={() => navigate('/')} />;
+    }
+    return <LandingPage />;
+  }
+
+  return (
+    <TooltipProvider>
+      <ToastContainer />
+      <GradeSettingsProvider>
+        <CuadernoApp />
+      </GradeSettingsProvider>
+    </TooltipProvider>
+  );
+}
+
+function LoginScreen({ onBack }: { onBack: () => void }) {
+  const { signIn, signUp, signInWithGoogle } = useAuth();
+  const [isSignUp, setIsSignUp] = useState(
+    () => new URLSearchParams(window.location.search).get('mode') === 'signup',
+  );
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [showResetPassword, setShowResetPassword] = useState(false);
   const [resetSent, setResetSent] = useState(false);
+
+  const handleGoogleLogin = async () => {
+    setGoogleLoading(true);
+    setAuthError('');
+    try {
+      await signInWithGoogle();
+    } catch {
+      setAuthError('Error al iniciar sesión con Google. Asegúrate de haber habilitado el proveedor en Firebase Console > Authentication > Sign-in method.');
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
 
   const handleResetPassword = async () => {
     if (!email.trim()) {
@@ -80,13 +164,8 @@ export default function App() {
       await sendPasswordResetEmail(auth, email);
       setResetSent(true);
       setShowResetPassword(false);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : '';
-      if (message.includes('auth/user-not-found')) {
-        setAuthError('No hay cuenta con este email.');
-      } else {
-        setAuthError('Error al enviar. Verifica el email e intenta de nuevo.');
-      }
+    } catch {
+      setAuthError('Error al enviar el correo de recuperación. Inténtalo de nuevo más tarde.');
     } finally {
       setAuthLoading(false);
     }
@@ -123,36 +202,19 @@ export default function App() {
     }
   };
 
-  // ── Toast global listener (recibe errores de handleFirestoreError) ──────
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { type, message } = (e as CustomEvent).detail;
-      showToast(type, message);
-    };
-    window.addEventListener('app:toast', handler);
-    return () => window.removeEventListener('app:toast', handler);
-  }, []);
-
-  // ── Verificar disponibilidad del servidor proxy al iniciar ───────────────
-  useEffect(() => {
-    if (!import.meta.env.DEV) return;
-    checkGeminiHealth().then(({ ok, hasKey, error }) => {
-      if (!ok) {
-        showToast('error', `Servidor IA no disponible: ${error || 'Inicia el servidor con npm run dev:full'}`, 8000);
-      } else if (!hasKey) {
-        showToast('warning', 'Falta GEMINI_API_KEY en .env.local — La IA no funcionará.', 8000);
-      }
-    });
-  }, []);
-
-  useNetworkStatus();
-
-  if (!user) {
-    return (
-      <TooltipProvider>
-        <ToastContainer />
-        <div className="flex flex-col items-center justify-center min-h-screen bg-neutral-50 px-4">
-          <div className="text-center space-y-6 max-w-sm w-full">
+  return (
+    <TooltipProvider>
+      <ToastContainer />
+      <div className="flex flex-col items-center justify-center min-h-screen bg-neutral-50 px-4">
+        <button
+          onClick={onBack}
+          title="Volver a la página principal"
+          className="mb-8 inline-flex items-center gap-2 text-sm font-bold text-neutral-500 hover:text-neutral-900 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Volver a la página principal
+        </button>
+        <div className="text-center space-y-6 max-w-sm w-full">
             <div className="w-24 h-24 bg-white rounded-[2rem] flex items-center justify-center mx-auto border border-neutral-200 shadow-2xl overflow-hidden p-1">
               <img src="/logo.webp" alt="EdiAgil Logo" className="app-logo w-full h-full object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
             </div>
@@ -214,6 +276,22 @@ export default function App() {
                   >
                     {authLoading ? 'Cargando...' : isSignUp ? 'Crear cuenta' : 'Iniciar sesión'}
                   </button>
+                  <div className="relative flex items-center gap-4 py-1">
+                    <div className="flex-1 h-px bg-neutral-200" />
+                    <span className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400">o</span>
+                    <div className="flex-1 h-px bg-neutral-200" />
+                  </div>
+                  <button
+                    id="google-login-button"
+                    type="button"
+                    disabled={googleLoading || authLoading}
+                    onClick={handleGoogleLogin}
+                    title="Iniciar sesión con Google"
+                    className="w-full flex items-center justify-center gap-3 bg-white border border-neutral-200 hover:bg-neutral-50 hover:border-neutral-300 text-neutral-700 px-6 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-sm active:scale-95 transition-all disabled:opacity-50"
+                  >
+                    <GoogleG className="w-5 h-5" />
+                    {googleLoading ? 'Conectando...' : 'Continuar con Google'}
+                  </button>
                   {!isSignUp && (
                     <button
                       type="button"
@@ -244,26 +322,18 @@ export default function App() {
             </div>
           </div>
         </div>
-      </TooltipProvider>
-    );
-  }
-
-  return (
-    <TooltipProvider>
-      <ToastContainer />
-      <CuadernoApp />
     </TooltipProvider>
   );
 }
 
 function CuadernoApp() {
   const { user, logOut } = useAuth();
-  const { plan: dbPlan, loading: loadingPlan } = usePlan();
-  const [currentView, setCurrentView] = useState<"dashboard" | "subject">(
+  const { plan: dbPlan, loading: loadingPlan, isAdmin, profile } = usePlan();
+  const [currentView, setCurrentView] = useState<"dashboard" | "subject" | "admin">(
     "subject",
   );
   const [activeTab, setActiveTab] = useState<
-    "planning" | "grades" | "attendance" | "students" | "modules"
+    "planning" | "grades" | "attendance" | "students" | "modules" | "calendar"
   >("modules");
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(
     null,
@@ -275,8 +345,14 @@ function CuadernoApp() {
   >(undefined);
   const [subjectToEdit, setSubjectToEdit] = useState<SubjectDoc | null>(null);
   const [noteToEdit, setNoteToEdit] = useState<NoteDoc | null>(null);
+
+  const [importedBackupData, setImportedBackupData] = useState<any>(null);
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isImportingLoading, setIsImportingLoading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<'general' | 'advanced' | 'billing'>('general');
   const [isTourOpen, setIsTourOpen] = useState(false);
   const [isGuideOpen, setIsGuideOpen] = useState(false);
   const [tourSubjectId, setTourSubjectId] = useState<string | null>(null);
@@ -285,6 +361,23 @@ function CuadernoApp() {
 
   useEffect(() => {
     initGA();
+  }, []);
+
+  useEffect(() => {
+    if (isAdmin && currentView === "dashboard") {
+      setCurrentView("admin");
+    }
+  }, [isAdmin, currentView]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('checkout') === 'success') {
+      showToast('success', '¡Pago exitoso! Tu plan Premium ha sido activado.');
+      setSettingsInitialTab('billing');
+      setIsSettingsModalOpen(true);
+      window.history.replaceState({}, '', '/app');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }
   }, []);
 
   useEffect(() => {
@@ -300,6 +393,7 @@ function CuadernoApp() {
             const snapshot = await getDocs(q);
             snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
           }
+          if (user?.uid) await addSubjectCounterOp(batch, user.uid, -1);
           await batch.commit();
         } catch (e) {
           console.warn("Failed to clean up leftover tour subject:", e);
@@ -314,7 +408,9 @@ function CuadernoApp() {
     const path =
       currentView === "dashboard"
         ? "/dashboard"
-        : `/subject/${selectedSubjectId}/${activeTab}`;
+        : currentView === "admin"
+          ? "/admin"
+          : `/subject/${selectedSubjectId}/${activeTab}`;
     trackPageView(path);
   }, [currentView, selectedSubjectId, activeTab]);
 
@@ -363,7 +459,9 @@ function CuadernoApp() {
   const handleStartTour = async () => {
     if (subjects.length === 0 && user) {
       try {
-        const demoRef = await addDoc(collection(db, 'subjects'), {
+        const batch = writeBatch(db);
+        const demoRef = doc(collection(db, 'subjects'));
+        batch.set(demoRef, {
           name: 'Mi Asignatura Demo',
           userId: user.uid,
           color: '#4f46e5',
@@ -372,6 +470,8 @@ function CuadernoApp() {
           teacher: '',
           schedule: '',
         });
+        await addSubjectCounterOp(batch, user.uid, +1);
+        await batch.commit();
         setTourSubjectId(demoRef.id);
         setSelectedSubjectId(demoRef.id);
 
@@ -427,6 +527,7 @@ function CuadernoApp() {
           snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
         }
 
+        if (user?.uid) await addSubjectCounterOp(batch, user.uid, -1);
         await batch.commit();
       } catch {
         // cleanup silently
@@ -447,14 +548,15 @@ function CuadernoApp() {
 
   const handleNewSubject = () => {
     if (activeSubscription === "free") {
-      const oneYearAgo = Date.now() - 365 * 24 * 60 * 60 * 1000;
-      const subjectsLastYear = subjects.filter(
-        (s) => (s.createdAt || Date.now()) > oneYearAgo,
+      const currentYear = new Date().getFullYear();
+      const subjectsThisYear = subjects.filter(
+        (s) => {
+          const created = s.createdAt ? new Date(s.createdAt) : null;
+          return created !== null && created.getFullYear() === currentYear;
+        },
       );
-      if (subjectsLastYear.length >= 3) {
-        alert(
-          "Has alcanzado el límite de crear 3 asignaturas por año en el plan gratis. Por favor, mejora tu plan en la configuración para crear asignaturas ilimitadas o espera para crear una nueva.",
-        );
+      if (subjectsThisYear.length >= 2) {
+        showToast('warning', 'Has alcanzado el límite de 2 asignaturas por año en el plan gratis. Mejora tu plan en Configuración para crear hasta 999.');
         return;
       }
     }
@@ -477,6 +579,7 @@ function CuadernoApp() {
         snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
       }
 
+      if (user?.uid) await addSubjectCounterOp(batch, user.uid, -1);
       await batch.commit();
 
       if (selectedSubjectId === id) setSelectedSubjectId(null);
@@ -502,6 +605,82 @@ function CuadernoApp() {
     }
   };
 
+  const handleExportJSON = async (subject: SubjectDoc) => {
+    if (!user) return;
+    try {
+      showToast('info', 'Generando archivo de exportación...');
+      const backup = await exportSubjectToJSON(user.uid, subject.id);
+      triggerJSONDownload(backup, subject.name);
+      showToast('success', 'Asignatura exportada con éxito.');
+    } catch (error) {
+      console.error(error);
+      showToast('error', 'Error al exportar la asignatura.');
+    }
+  };
+
+  const triggerFileInputClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleFileImportChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const json = JSON.parse(event.target?.result as string);
+        if (isValidBackup(json)) {
+          setImportedBackupData(json);
+          setIsImportModalOpen(true);
+        } else {
+          showToast('error', 'El archivo no tiene un formato válido de respaldo de EdiAgil.');
+        }
+      } catch (err) {
+        showToast('error', 'Error al leer el archivo JSON.');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleLogout = async () => {
+    try {
+      clearAppStorage();
+      await dexieDb.delete();
+    } catch (e) {
+      console.warn('Error cleaning up local data:', e);
+    }
+    logOut();
+  };
+
+  const handleConfirmImport = async (mode: 'create' | 'overwrite') => {
+    if (!user || !importedBackupData) return;
+    setIsImportingLoading(true);
+    try {
+      showToast('info', mode === 'create' ? 'Creando asignatura...' : 'Sobrescribiendo asignatura...');
+      const newSubjectId = await importSubjectFromJSON(
+        user.uid,
+        importedBackupData,
+        mode,
+        mode === 'overwrite' ? selectedSubjectId! : undefined
+      );
+
+      showToast('success', mode === 'create' ? 'Asignatura importada con éxito.' : 'Asignatura sobrescrita con éxito.');
+      setSelectedSubjectId(newSubjectId);
+      setCurrentView('subject');
+      setIsImportModalOpen(false);
+      setImportedBackupData(null);
+    } catch (error) {
+      console.error(error);
+      showToast('error', 'Ocurrió un error al importar los datos.');
+    } finally {
+      setIsImportingLoading(false);
+    }
+  };
+
   return (
     <div className="flex h-screen bg-neutral-50 text-neutral-900 font-sans overflow-hidden selection:bg-indigo-500/30">
       {/* Mobile Sidebar Overlay */}
@@ -523,12 +702,28 @@ function CuadernoApp() {
       >
         <div className="p-8 border-b border-neutral-100 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/20">
-              <img src="/logo.webp" alt="Logo" className="app-logo w-5 h-5 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
-            </div>
-            <h1 className="font-black text-xl tracking-tight text-neutral-900">
-              Mi Cuaderno
-            </h1>
+            {isAdmin ? (
+              <>
+                <img src="/logo.webp" alt="Logo EdiAgil" className="app-logo w-7 h-7 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
+                <div>
+                  <h1 className="font-black text-xl tracking-tight text-neutral-900">
+                    Panel Institucional
+                  </h1>
+                  <p className="text-xs font-medium text-neutral-500">
+                    {profile?.institutionName || 'Cuenta institucional'}
+                  </p>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/20">
+                  <img src="/logo.webp" alt="Logo" className="app-logo w-5 h-5 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
+                </div>
+                <h1 className="font-black text-xl tracking-tight text-neutral-900">
+                  Mi Cuaderno
+                </h1>
+              </>
+            )}
           </div>
           <button
             aria-label="Cerrar menú"
@@ -541,37 +736,73 @@ function CuadernoApp() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-3 custom-scrollbar">
-          <button
-            onClick={() => {
-              setCurrentView("dashboard");
-              setSelectedSubjectId(null);
-              setIsSidebarOpen(false);
-            }}
-            title="Ver el panel principal"
-            className={cn(
-              "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all mb-6 hover:scale-[1.02] active:scale-95 group",
-              currentView === "dashboard"
-                ? "bg-indigo-600 text-white shadow-xl shadow-indigo-500/20"
-                : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900",
-            )}
-          >
-            <div className="flex items-center gap-2">
-              <img src="/logo.webp" alt="Logo" className="app-logo w-12 h-12 object-contain rounded-lg bg-white p-1 shadow-sm" style={{ filter: 'none', backgroundColor: 'transparent' }} onError={(e) => {
-                // Fallback to icon if logo is not found
-                e.currentTarget.style.display = 'none';
-                e.currentTarget.nextElementSibling?.classList.remove('hidden');
-              }} />
-              <LayoutDashboard
-                className={cn(
-                  "hidden w-5 h-5 transition-transform group-hover:rotate-12",
-                  currentView === "dashboard" ? "text-white" : "text-neutral-400",
-                )}
-              />
-            </div>
-            <span className="font-black text-sm uppercase tracking-widest">
-              Dashboard
-            </span>
-          </button>
+          {!isAdmin && (
+            <button
+              onClick={() => {
+                setCurrentView("dashboard");
+                setSelectedSubjectId(null);
+                setIsSidebarOpen(false);
+              }}
+              title="Ver el panel principal"
+              className={cn(
+                "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all mb-6 hover:scale-[1.02] active:scale-95 group",
+                currentView === "dashboard"
+                  ? "bg-indigo-600 text-white shadow-xl shadow-indigo-500/20"
+                  : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900",
+              )}
+            >
+              <div className="flex items-center gap-2">
+                <img src="/logo.webp" alt="Logo" className="app-logo w-12 h-12 object-contain rounded-lg bg-white p-1 shadow-sm" style={{ filter: 'none', backgroundColor: 'transparent' }} onError={(e) => {
+                  // Fallback to icon if logo is not found
+                  e.currentTarget.style.display = 'none';
+                  e.currentTarget.nextElementSibling?.classList.remove('hidden');
+                }} />
+                <LayoutDashboard
+                  className={cn(
+                    "hidden w-5 h-5 transition-transform group-hover:rotate-12",
+                    currentView === "dashboard" ? "text-white" : "text-neutral-400",
+                  )}
+                />
+              </div>
+              <span className="font-black text-sm uppercase tracking-widest">
+                Dashboard
+              </span>
+            </button>
+          )}
+
+          {isAdmin && (
+            <button
+              onClick={() => {
+                setCurrentView("admin");
+                setSelectedSubjectId(null);
+                setIsSidebarOpen(false);
+              }}
+              title="Panel institucional de administración"
+              className={cn(
+                "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all mb-6 hover:scale-[1.02] active:scale-95 group",
+                currentView === "admin"
+                  ? "bg-blue-600 text-white shadow-xl shadow-blue-500/20"
+                  : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900",
+              )}
+            >
+              <div className="flex items-center gap-2">
+                <img src="/logo.webp" alt="Logo" className="app-logo w-12 h-12 object-contain rounded-lg bg-white p-1 shadow-sm" style={{ filter: 'none', backgroundColor: 'transparent' }} onError={(e) => {
+                  // Fallback to icon if logo is not found
+                  e.currentTarget.style.display = 'none';
+                  e.currentTarget.nextElementSibling?.classList.remove('hidden');
+                }} />
+                <LayoutDashboard
+                  className={cn(
+                    "hidden w-5 h-5 transition-transform group-hover:rotate-12",
+                    currentView === "admin" ? "text-white" : "text-neutral-400",
+                  )}
+                />
+              </div>
+              <span className="font-black text-sm uppercase tracking-widest">
+                Panel Administrativo
+              </span>
+            </button>
+          )}
 
           <div className="text-[10px] font-black text-neutral-400 uppercase tracking-[0.2em] mb-6 px-4">
             Asignaturas
@@ -646,9 +877,25 @@ function CuadernoApp() {
             Nueva Asignatura
           </button>
           <button
+            id="import-subject-btn"
+            onClick={triggerFileInputClick}
+            title="Importar asignatura desde archivo JSON"
+            className="w-full flex items-center justify-center gap-3 bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-700 py-3.5 rounded-2xl transition-all hover:shadow-md active:scale-95 text-xs font-black uppercase tracking-widest"
+          >
+            <Upload className="w-4 h-4 text-neutral-500" />
+            Importar JSON
+          </button>
+          <input
+            type="file"
+            accept=".json"
+            onChange={handleFileImportChange}
+            ref={fileInputRef}
+            className="hidden"
+          />
+          <button
             aria-label="Cerrar sesión"
-            onClick={logOut}
-            title="Cerrar Sessión"
+            onClick={handleLogout}
+            title="Cerrar Sesión"
             className="w-full mt-2 flex items-center justify-center gap-3 bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-600 py-3 rounded-2xl transition-all active:scale-95 text-xs font-black uppercase tracking-widest"
           >
             <LogOut className="w-4 h-4" />
@@ -672,19 +919,25 @@ function CuadernoApp() {
           <span className="font-black truncate text-neutral-900 uppercase tracking-widest text-sm">
             {currentView === "dashboard"
               ? "Dashboard"
-              : selectedSubject
-                ? selectedSubject.name
-                : "Mi Cuaderno"}
+              : currentView === "admin"
+                ? "Panel Administrativo"
+                : selectedSubject
+                  ? selectedSubject.name
+                  : "Mi Cuaderno"}
           </span>
         </header>
 
-        {currentView === "dashboard" ? (
+        {currentView === "admin" ? (
+          <div className="flex-1 overflow-y-auto custom-scrollbar">
+            <AdminDashboard />
+          </div>
+        ) : currentView === "dashboard" ? (
           <div className="flex-1 overflow-y-auto custom-scrollbar">
             <Dashboard
               onNavigateToSubject={(id: string, tab: string) => {
                 setSelectedSubjectId(id);
                 setCurrentView("subject");
-                if (tab) setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules");
+                if (tab) setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules" | "calendar");
               }}
               onNewSubject={handleNewSubject}
               onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -738,6 +991,14 @@ function CuadernoApp() {
                   <div className="flex items-center gap-4 shrink-0">
                     <div className="flex items-center gap-2 bg-white p-1.5 rounded-2xl border border-neutral-200 shadow-sm">
                       <button
+                        aria-label="Exportar JSON"
+                        onClick={() => handleExportJSON(selectedSubject)}
+                        className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all active:scale-90"
+                        title="Exportar asignatura como JSON"
+                      >
+                        <Download className="w-6 h-6" />
+                      </button>
+                      <button
                         aria-label="Editar asignatura"
                         onClick={() => handleEditSubject(selectedSubject)}
                         className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all active:scale-90"
@@ -760,6 +1021,7 @@ function CuadernoApp() {
                 <div className="flex items-center gap-8 border-b border-neutral-200 mb-8 overflow-x-auto no-scrollbar scroll-smooth">
                   {[
                     { id: "modules", label: "Módulos y Materiales" },
+                    { id: "calendar", label: "Calendario" },
                     { id: "grades", label: "Calificaciones" },
                     { id: "attendance", label: "Asistencia" },
                     { id: "students", label: "Participantes" },
@@ -767,7 +1029,7 @@ function CuadernoApp() {
                     <button
                       key={tab.id}
                       id={`tab-${tab.id}`}
-                      onClick={() => setActiveTab(tab.id as "modules" | "grades" | "attendance" | "students")}
+                      onClick={() => setActiveTab(tab.id as "modules" | "calendar" | "grades" | "attendance" | "students")}
                       title={`Sección de ${tab.label}`}
                       className={cn(
                          "pb-4 text-[10px] font-black uppercase tracking-[0.2em] transition-all border-b-4 whitespace-nowrap active:scale-95",
@@ -800,6 +1062,11 @@ function CuadernoApp() {
                       }}
                       onDeleteNote={(id: string) => setNoteToDelete(id)}
                     />
+                  </div>
+                )}
+                {activeTab === "calendar" && (
+                  <div id="subject-calendar-section">
+                    <SubjectCalendar subjectId={selectedSubject.id!} />
                   </div>
                 )}
                 {activeTab === "grades" && (
@@ -930,6 +1197,70 @@ function CuadernoApp() {
         </div>
       )}
 
+      {/* JSON Import Options Modal */}
+      {isImportModalOpen && importedBackupData && (
+        <div className="fixed inset-0 bg-neutral-900/40 backdrop-blur-md z-[60] flex items-center justify-center p-4">
+          <div className="bg-white border border-neutral-200 rounded-[2.5rem] p-10 max-w-md w-full shadow-2xl animate-in fade-in zoom-in duration-300">
+            <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-8 mx-auto">
+              <Upload className="w-8 h-8" />
+            </div>
+            <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">
+              Importar Asignatura
+            </h3>
+            <p className="text-neutral-500 mb-6 text-center font-medium leading-relaxed">
+              Se detectó el respaldo de: <strong className="text-neutral-900">{importedBackupData.subject.name}</strong>.
+              <br />
+              ¿Cómo deseas realizar la importación?
+            </p>
+
+            {isImportingLoading ? (
+              <div className="flex flex-col items-center justify-center py-6">
+                <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-600 mb-3" />
+                <span className="text-sm font-bold text-neutral-500">Importando datos, por favor espera...</span>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                <button
+                  onClick={() => handleConfirmImport('create')}
+                  title="Importar como una nueva asignatura"
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
+                >
+                  Crear como nueva asignatura
+                </button>
+
+                {selectedSubject && (
+                  <div className="border-t border-neutral-100 pt-4 mt-2">
+                    <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-4">
+                      <p className="text-[11px] text-amber-700 font-bold leading-normal">
+                        ⚠️ ATENCIÓN: Sobrescribir eliminará permanentemente todos los datos actuales de la asignatura &quot;{selectedSubject.name}&quot; antes de importar.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleConfirmImport('overwrite')}
+                      title="Sobrescribir los datos de la asignatura actual"
+                      className="w-full bg-amber-500 hover:bg-amber-400 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
+                    >
+                      Sobrescribir asignatura actual
+                    </button>
+                  </div>
+                )}
+
+                <button
+                  onClick={() => {
+                    setIsImportModalOpen(false);
+                    setImportedBackupData(null);
+                  }}
+                  title="Cancelar la importación"
+                  className="w-full bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95 mt-2"
+                >
+                  Cancelar
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <SubjectModal
         isOpen={isSubjectModalOpen}
         onClose={() => setIsSubjectModalOpen(false)}
@@ -940,6 +1271,7 @@ function CuadernoApp() {
         <SettingsModal
           isOpen={isSettingsModalOpen}
           onClose={() => setIsSettingsModalOpen(false)}
+          initialTab={settingsInitialTab}
         />
       </Suspense>
 
@@ -985,5 +1317,16 @@ function CuadernoApp() {
         </span>
       </button>
     </div>
+  );
+}
+
+function GoogleG({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z" />
+      <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z" />
+      <path fill="#FBBC05" d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z" />
+      <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z" />
+    </svg>
   );
 }
