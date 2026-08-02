@@ -1,4 +1,4 @@
-import React, { memo, useMemo } from 'react';
+import { memo, useMemo } from 'react';
 import { useCustomCollectionData } from "../lib/firestoreUtils";
 import { collection, query, where, limit } from 'firebase/firestore';
 import { db } from '../lib/firebase';
@@ -7,9 +7,12 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import { TrendingUp } from 'lucide-react';
 import { safeJSONParse } from '../lib/utils';
 import { STORAGE_KEYS, getStorageItem } from '../lib/storageKeys';
+import { parseWeights, calculateStudentGrades } from '../lib/gradeCalculator';
+import { useGradeSettings } from '../contexts/GradeSettingsContext';
 
 export const ProgressWidget = memo(function ProgressWidget() {
   const { user } = useAuth();
+  const { viewMode, calculationMode } = useGradeSettings();
   
   const subjectsQuery = user?.uid ? query(collection(db, 'subjects'), where('userId', '==', user?.uid), limit(500)) : null;
   const [subjects = []] = useCustomCollectionData(subjectsQuery);
@@ -23,38 +26,11 @@ export const ProgressWidget = memo(function ProgressWidget() {
   const gradesQuery = user?.uid ? query(collection(db, 'grades'), where('userId', '==', user?.uid), limit(500)) : null;
   const [allGrades = []] = useCustomCollectionData(gradesQuery);
 
+  const modulesQuery = user?.uid ? query(collection(db, 'subjectModules'), where('userId', '==', user?.uid), limit(500)) : null;
+  const [allModules = []] = useCustomCollectionData(modulesQuery);
+
   const data = useMemo(() => {
     if (!subjects.length) return [];
-
-    const parseWeights = (data: string | null) => {
-      const defaultWeights = { 
-        teorica: { name: 'Teórica', value: 30 }, 
-        practica: { name: 'Práctica', value: 60 }, 
-        apreciativa: { name: 'Apreciativa', value: 10 },
-        checkpoint: { name: 'Agregar 4ta Nota', value: 0 }
-      };
-      if (!data) return defaultWeights;
-      try {
-        const parsed = safeJSONParse<Record<string, unknown> | null>(data, null);
-        if (!parsed) return defaultWeights;
-        const output = { ...defaultWeights };
-        (['teorica', 'practica', 'apreciativa', 'checkpoint'] as const).forEach(key => {
-          const val = parsed[key];
-          if (val !== undefined) {
-            if (typeof val === 'number') {
-              output[key].value = val;
-            } else if (typeof val === 'object' && val !== null) {
-              const w = val as { value?: number; name?: string };
-              output[key].value = typeof w.value === 'number' ? w.value : (parseFloat(String(w.value)) || output[key].value);
-              output[key].name = w.name ?? output[key].name;
-            }
-          }
-        });
-        return output;
-      } catch (e) {
-        return defaultWeights;
-      }
-    };
 
     const weights = parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS));
     const useCheckpoint = safeJSONParse(getStorageItem(STORAGE_KEYS.USE_CHECKPOINT), false);
@@ -66,6 +42,7 @@ export const ProgressWidget = memo(function ProgressWidget() {
       const subjectStudents = students.filter(s => s.subjectId === subject.id);
       const subjectEvals = evaluations.filter(e => e.subjectId === subject.id);
       const subjectGrades = allGrades.filter(g => g.subjectId === subject.id);
+      const subjectModules = allModules.filter(m => m.subjectId === subject.id);
 
       if (subjectStudents.length === 0 || subjectEvals.length === 0) {
         return {
@@ -80,45 +57,21 @@ export const ProgressWidget = memo(function ProgressWidget() {
 
       subjectStudents.forEach(student => {
         const studentGrades = subjectGrades.filter(g => g.studentId === student.id);
-        
-        const categories: { id: string; weight: number }[] = [
-          { id: 'teorica', weight: weights.teorica.value },
-          { id: 'practica', weight: weights.practica.value },
-          { id: 'apreciativa', weight: weights.apreciativa.value }
-        ];
-
-        if (useCheckpoint) {
-          categories.push({ id: 'checkpoint', weight: weights.checkpoint.value });
-        }
-
-        let weightedSumTotal = 0;
-        let totalWeightUsed = 0;
-
-        categories.forEach(cat => {
-          const typeEvals = subjectEvals.filter(e => e.type === cat.id);
-          const activeEvals = typeEvals.filter(ev =>
-            studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
-          );
-          if (activeEvals.length > 0) {
-            totalWeightUsed += cat.weight;
-            let sumPct = 0;
-            activeEvals.forEach(ev => {
-              const grade = studentGrades.find(g => g.evaluationId === ev.id);
-              const score = grade?.score || 0;
-              const max = ev.maxScore || 100;
-              sumPct += (score / max);
-            });
-            const avg = sumPct / activeEvals.length;
-            weightedSumTotal += avg * cat.weight;
-          }
-        });
-
-        const finalGrade = totalWeightUsed > 0 ? (weightedSumTotal / totalWeightUsed) * (gradingScale.maxScore || 100) : 0;
-        
-        totalSubjectScore += finalGrade;
+        const grades = calculateStudentGrades(
+          student.id,
+          studentGrades,
+          subjectEvals,
+          subjectModules,
+          useCheckpoint,
+          weights,
+          gradingScale,
+          viewMode,
+          calculationMode
+        );
+        totalSubjectScore += grades.total;
       });
 
-      const average = Math.round((totalSubjectScore / subjectStudents.length) * 10) / 10;
+      const average = totalSubjectScore / subjectStudents.length;
 
       // Extract hex color from tailwind class
       const colorMap: Record<string, string> = {
@@ -153,7 +106,7 @@ export const ProgressWidget = memo(function ProgressWidget() {
         maxScore: gradingScale.maxScore
       };
     });
-  }, [subjects, students, evaluations, allGrades]);
+  }, [subjects, students, evaluations, allGrades, allModules, viewMode, calculationMode]);
 
   if (data.length === 0) return null;
 
@@ -185,8 +138,8 @@ export const ProgressWidget = memo(function ProgressWidget() {
         </div>
       </div>
 
-      <div className="h-[300px] w-full mt-4 min-w-0">
-        <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
+      <div className="w-full mt-4" style={{ height: '300px', minWidth: 0 }}>
+        <ResponsiveContainer width="100%" height={300}>
           <BarChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f5f5f5" />
             <XAxis 

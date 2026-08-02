@@ -11,6 +11,18 @@ import { extractTextFromFile } from '../lib/fileParser';
 import { ai } from '../lib/gemini';
 import { cn } from '../lib/utils';
 
+function extractJSON(text: string): string {
+  const trimmed = text.trim();
+  try { JSON.parse(trimmed); return trimmed; } catch { /* not plain JSON */ }
+  const jsonBlock = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (jsonBlock) { try { JSON.parse(jsonBlock[1].trim()); return jsonBlock[1].trim(); } catch { /* not valid */ } }
+  const braceMatch = trimmed.match(/\{[\s\S]*\}/);
+  if (braceMatch) return braceMatch[0];
+  const bracketMatch = trimmed.match(/\[[\s\S]*\]/);
+  if (bracketMatch) return bracketMatch[0];
+  throw new Error('No se encontró JSON válido en la respuesta de la IA.');
+}
+
 export function StudentsTab({ subjectId }: { subjectId: string }) {
   const { user } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -59,33 +71,78 @@ export function StudentsTab({ subjectId }: { subjectId: string }) {
     if (file.name.toLowerCase().endsWith('.pdf')) {
       reader.onload = async (event) => {
         try {
-          const result = event.target?.result as string;
-          const text = await extractTextFromFile(result, file.type);
+          const text = await extractTextFromFile(event.target?.result as ArrayBuffer, file.type);
+
+          if (!text || text.trim().length < 10) {
+            throw new Error('El PDF no contiene suficiente texto legible. Asegúrate de que no sea un documento escaneado (solo imágenes) sin capa de texto OCR.');
+          }
 
           const prompt = `
-Analiza la siguiente lista de participantes/estudiantes. Extrae los estudiantes devolviendo SOLAMENTE un JSON con un array llamado "students". 
-Intenta encontrar el nombre ("firstName"), apellido ("lastName"), y número de documento/cédula ("cedula", aunque a veces puede no estar presente, pon "" en ese caso). Genero ('gender') en 'M' o 'F' si se deduce, sino "". 
-Ejemplo de formato:
-{"students": [{"cedula": "123456", "firstName": "Juan Pablo", "lastName": "Perez Gomez", "gender": "M"}]}
+Eres un asistente de gestión educativa experto en análisis y estructuración de listas de clase y matrículas académicas.
+Tu tarea es analizar el siguiente texto extraído de un archivo y extraer la lista completa de estudiantes/participantes de forma limpia.
 
-Documento:
+INSTRUCCIONES CLAVE DE EXTRACCIÓN Y LIMPIEZA:
+1. **Detección de Nombre y Apellido (Muy Importante en Español)**:
+   - En las listas académicas en español, es muy común que el apellido se escriba antes del nombre (ej. "Pérez Gómez, Juan Pablo" o "PEREZ GOMEZ JUAN PABLO").
+   - Identifica y separa correctamente los nombres de pila ("firstName") de los apellidos ("lastName").
+   - Ejemplo: Para "PEREZ GOMEZ JUAN PABLO", el lastName es "Pérez Gómez" y el firstName es "Juan Pablo".
+   - Ejemplo: Para "Juan Pablo Pérez Gómez", el firstName es "Juan Pablo" y el lastName es "Pérez Gómez".
+
+2. **Formato Title Case**:
+   - Convierte todos los nombres y apellidos a formato "Title Case" (iniciales en mayúscula, el resto en minúscula, ej: "Juan Pablo", "Pérez Gómez").
+   - Respeta las tildes y caracteres especiales de la ortografía del español si están presentes.
+
+3. **Cédula / Documento de Identidad**:
+   - Busca campos de cédula de identidad, DNI, run, pasaporte o código de estudiante numérico (campo "cedula").
+   - Si no está disponible o no se puede asociar claramente, deja el valor como "".
+   - Elimina puntos, guiones o espacios en el número de cédula (ej: "17.234.567-8" -> "172345678").
+
+4. **Género ("gender")**:
+   - Analiza el género del estudiante si se indica explícitamente en alguna columna (ej: "M/F", "H/M", "Masculino/Femenino") o dedúcelo a partir del primer nombre.
+   - Solo puede ser "M" (Masculino), "F" (Femenino), o "" (si es ambiguo o no se puede deducir).
+
+5. **Exclusión de Basura**:
+   - Omite encabezados de tablas, firmas, nombres de docentes, nombres de materias, correos, promedios, notas u otros textos que no correspondan a un estudiante de la lista.
+   - Asegúrate de extraer TODOS los estudiantes legítimos de la lista sin omitir ninguno.
+
+Devuelve ÚNICA y EXCLUSIVAMENTE un objeto JSON puro (sin bloques Markdown, sin explicaciones ni rodeos) con esta estructura:
+{
+  "students": [
+    {
+      "cedula": "Número de cédula o ID",
+      "firstName": "Nombres",
+      "lastName": "Apellidos",
+      "gender": "M|F|"
+    }
+  ]
+}
+
+Si no encuentras ningún estudiante en el documento, devuelve exactamente: {"students": []}
+
+Documento a procesar:
 ${text}
           `;
 
           const aiResponse = await ai({
-            model: 'gemini-2.5-flash',
+            model: 'gemini-2.0-flash',
             contents: prompt,
-            config: { 
-              temperature: 0.1,
+            config: {
+              temperature: 0.05,
               responseMimeType: "application/json"
             }
           });
-          
-          if (!aiResponse.text) throw new Error("No response");
-          const jsonMatch = aiResponse.text.match(/\{[\s\S]*\}/);
-          if (!jsonMatch) throw new Error("No JSON found");
-          
-          const parsed = JSON.parse(jsonMatch[0]);
+
+          if (!aiResponse.text || !aiResponse.text.trim()) {
+            throw new Error('La IA no generó ninguna respuesta. Verifica que tu API Key de Gemini sea válida.');
+          }
+
+          const jsonStr = extractJSON(aiResponse.text);
+          const parsed = JSON.parse(jsonStr);
+
+          if (!Array.isArray(parsed.students)) {
+            throw new Error('La respuesta de la IA no contiene un array "students" válido.');
+          }
+
           const newStudents: Array<{ userId: string; subjectId: string; cedula: string; firstName: string; lastName: string; gender: 'M' | 'F' | null }> = parsed.students.filter((s: { firstName?: string; lastName?: string }) => s.firstName && s.lastName).map((s: { cedula?: string; firstName: string; lastName: string; gender?: string }) => ({
             userId: user.uid,
             subjectId,
@@ -105,17 +162,24 @@ ${text}
             setAlertMessage(`Se extrajeron y añadieron ${newStudents.length} estudiantes desde el PDF mediante IA.`);
             trackEvent(ANALYTICS_CATEGORIES.STUDENT, ANALYTICS_ACTIONS.IMPORT, undefined, newStudents.length);
           } else {
-             setAlertMessage('La IA no pudo detectar estudiantes en el PDF. Intenta con un formato más claro.');
+             setAlertMessage('La IA no pudo detectar estudiantes en el PDF. Intenta con un formato más claro o usa el archivo Excel.');
           }
         } catch (error) {
           console.error(error);
-          setAlertMessage('Error procesando el PDF con IA. Asegúrate de tener configurada tu API Key de Gemini y que el PDF contenga texto legible.');
+          const msg = error instanceof Error ? error.message : 'Error desconocido';
+          if (msg.includes('API Key') || msg.includes('API key') || msg.includes('PERMISSION_DENIED') || msg.includes('not configured') || msg.includes('401') || msg.includes('403')) {
+            setAlertMessage('Error de autenticación con la IA. Verifica que tu API Key de Gemini sea válida en Configuración → IA.');
+          } else if (msg.includes('no contiene suficiente texto') || msg.includes('texto legible')) {
+            setAlertMessage(msg);
+          } else {
+            setAlertMessage(`Error procesando el PDF con IA: ${msg}`);
+          }
         } finally {
           setIsProcessingFile(false);
           if (fileInputRef.current) fileInputRef.current.value = '';
         }
       };
-      reader.readAsDataURL(file);
+      reader.readAsArrayBuffer(file);
     } else {
       // Excel Flow
       reader.onload = async (event) => {
@@ -256,7 +320,7 @@ ${text}
             </div>
             <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">Aviso</h3>
             <p className="text-neutral-500 mb-10 text-center font-medium leading-relaxed">{alertMessage}</p>
-            <button onClick={() => setAlertMessage(null)} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs">
+            <button onClick={() => setAlertMessage(null)} title="Cerrar aviso" className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs">
               Aceptar
             </button>
           </div>
@@ -276,10 +340,10 @@ ${text}
               ¿Estás seguro de eliminar TODOS los estudiantes de esta asignatura? También se eliminarán todas sus calificaciones y registros de asistencia. Esta acción no se puede deshacer.
             </p>
             <div className="flex gap-4">
-              <button onClick={() => setShowDeleteAllConfirm(false)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 py-3.5 rounded-2xl font-bold transition-all active:scale-95">
+              <button onClick={() => setShowDeleteAllConfirm(false)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 py-3.5 rounded-2xl font-bold transition-all active:scale-95" title="Cancelar y no borrar la lista">
                 Cancelar
               </button>
-              <button onClick={confirmDeleteAll} className="flex-1 bg-red-500 hover:bg-red-600 text-white py-3.5 rounded-2xl font-bold transition-all shadow-xl shadow-red-500/20 active:scale-95">
+              <button onClick={confirmDeleteAll} className="flex-1 bg-red-500 hover:bg-red-600 text-white py-3.5 rounded-2xl font-bold transition-all shadow-xl shadow-red-500/20 active:scale-95" title="Eliminar permanentemente todos los estudiantes, asistencia y notas">
                 Sí, borrar todos
               </button>
             </div>
@@ -298,10 +362,10 @@ ${text}
               ¿Eliminar estudiante? También se eliminarán sus calificaciones y asistencia.
             </p>
             <div className="flex gap-4">
-              <button onClick={() => setStudentToDelete(null)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 py-3.5 rounded-2xl font-bold transition-all active:scale-95">
+              <button onClick={() => setStudentToDelete(null)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 py-3.5 rounded-2xl font-bold transition-all active:scale-95" title="Cancelar y mantener el estudiante">
                 Cancelar
               </button>
-              <button onClick={confirmDeleteStudent} className="flex-1 bg-red-500 hover:bg-red-600 text-white py-3.5 rounded-2xl font-bold transition-all shadow-xl shadow-red-500/20 active:scale-95">
+              <button onClick={confirmDeleteStudent} className="flex-1 bg-red-500 hover:bg-red-600 text-white py-3.5 rounded-2xl font-bold transition-all shadow-xl shadow-red-500/20 active:scale-95" title="Eliminar permanentemente al estudiante, su asistencia y notas">
                 Eliminar
               </button>
             </div>
@@ -314,7 +378,7 @@ ${text}
           <div className="bg-white border border-neutral-200 rounded-[2.5rem] p-10 max-w-md w-full shadow-2xl animate-in fade-in zoom-in duration-300">
             <div className="flex items-center justify-between mb-8">
               <h3 className="text-2xl font-black text-neutral-900 tracking-tight">Nuevo Participante</h3>
-              <button onClick={() => setIsAddingStudent(false)} className="text-neutral-400 hover:text-neutral-900 transition-colors p-2 hover:bg-neutral-50 rounded-xl">
+              <button onClick={() => setIsAddingStudent(false)} className="text-neutral-400 hover:text-neutral-900 transition-colors p-2 hover:bg-neutral-50 rounded-xl" title="Cerrar formulario">
                 <X className="w-6 h-6" />
               </button>
             </div>
@@ -364,10 +428,10 @@ ${text}
                 </select>
               </div>
               <div className="pt-4 flex gap-4">
-                <button type="button" onClick={() => setIsAddingStudent(false)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95">
+                <button type="button" onClick={() => setIsAddingStudent(false)} className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95" title="Cancelar registro">
                   Cancelar
                 </button>
-                <button type="submit" className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-indigo-500/20 active:scale-95">
+                <button type="submit" className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-indigo-500/20 active:scale-95" title="Guardar la información del estudiante">
                   Guardar
                 </button>
               </div>
@@ -411,6 +475,7 @@ ${text}
             <button
               onClick={() => setShowDeleteAllConfirm(true)}
               className="flex-1 lg:flex-none flex items-center justify-center gap-3 bg-red-50 hover:bg-red-100 text-red-600 px-8 py-4 rounded-2xl text-xs font-black transition-all border border-red-100 active:scale-95 uppercase tracking-widest"
+              title="Eliminar todos los estudiantes de esta asignatura"
             >
               <AlertTriangle className="w-5 h-5" />
               Borrar Todos
@@ -425,17 +490,21 @@ ${text}
             disabled={isProcessingFile}
           />
           <button
+            id="add-manual-btn"
             onClick={() => setIsAddingStudent(true)}
             className="flex-1 lg:flex-none flex items-center justify-center gap-3 bg-white border border-neutral-200 hover:border-indigo-500 text-indigo-600 px-8 py-4 rounded-2xl text-xs font-black transition-all shadow-sm active:scale-95 uppercase tracking-widest disabled:opacity-50"
             disabled={isProcessingFile}
+            title="Registrar un estudiante manualmente"
           >
             <Plus className="w-5 h-5" />
             Nuevo
           </button>
           <button
+            id="import-file-btn"
             onClick={() => fileInputRef.current?.click()}
             className="flex-1 lg:lg:flex-none flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-4 rounded-2xl text-xs font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest disabled:opacity-50"
             disabled={isProcessingFile}
+            title="Importar lista de estudiantes desde un archivo Excel, CSV o PDF"
           >
             <FileSpreadsheet className={`w-5 h-5 ${isProcessingFile ? 'animate-pulse' : ''}`} />
             {isProcessingFile ? "PROCESANDO..." : "IMPORTAR"}
@@ -453,15 +522,19 @@ ${text}
             <p className="text-lg mt-4 font-medium text-neutral-500">Importa un archivo Excel (.xlsx, .xls) para comenzar.</p>
             <div className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-4">
               <button
+                id="add-manual-btn"
                 onClick={() => setIsAddingStudent(true)}
                 className="flex items-center justify-center gap-3 bg-white border border-neutral-200 hover:border-indigo-500 text-indigo-600 px-10 py-5 rounded-2xl text-sm font-black transition-all shadow-sm active:scale-95 uppercase tracking-widest w-full sm:w-auto"
+                title="Registrar un estudiante manualmente"
               >
                 <Plus className="w-6 h-6" />
                 Añadir Manualmente
               </button>
               <button
+                id="import-file-btn"
                 onClick={() => fileInputRef.current?.click()}
                 className="flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-5 rounded-2xl text-sm font-black transition-all shadow-2xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest w-full sm:w-auto"
+                title="Importar lista de estudiantes desde un archivo Excel, CSV o PDF"
               >
                 <FileSpreadsheet className="w-6 h-6" />
                 Importar Excel

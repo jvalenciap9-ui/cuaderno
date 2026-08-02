@@ -8,8 +8,9 @@ import {
 } from "../lib/analytics";
 import type { SubjectDoc } from '../types/firestore';
 import { useAuth } from './AuthProvider';
-import { collection, doc, addDoc, updateDoc, writeBatch, query, where, getDocs, deleteDoc, limit } from 'firebase/firestore';
+import { collection, doc, updateDoc, writeBatch, query, where, getDocs, deleteDoc, limit } from 'firebase/firestore';
 import { db } from '../lib/firebase';
+import { addSubjectCounterOp } from '../lib/subjectCounter';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 
 type SubjectPlan = "otro" | "semanal" | "mensual" | "trimestral" | "cuatrimestral" | "anual_8" | "anual_10";
@@ -88,7 +89,9 @@ export function SubjectModal({
         });
         trackEvent(ANALYTICS_CATEGORIES.SUBJECT, ANALYTICS_ACTIONS.EDIT);
       } else {
-        await addDoc(collection(db, 'subjects'), {
+        const subjectRef = doc(collection(db, 'subjects'));
+        const batch = writeBatch(db);
+        batch.set(subjectRef, {
           userId: user.uid,
           name,
           teacher,
@@ -99,6 +102,8 @@ export function SubjectModal({
           color,
           createdAt: Date.now(),
         });
+        await addSubjectCounterOp(batch, user.uid, +1);
+        await batch.commit();
         trackEvent(ANALYTICS_CATEGORIES.SUBJECT, ANALYTICS_ACTIONS.CREATE);
       }
       onClose();
@@ -127,6 +132,7 @@ export function SubjectModal({
             <button
               type="button"
               aria-label="Cerrar"
+              title="Cerrar ventana"
               onClick={onClose}
               className="text-neutral-400 hover:text-neutral-900 transition-colors p-2 hover:bg-neutral-50 rounded-xl"
             >
@@ -235,6 +241,7 @@ export function SubjectModal({
                       key={c}
                       type="button"
                       onClick={() => setColor(c)}
+                      title="Seleccionar este color"
                       className={`w-10 h-10 rounded-full transition-all duration-300 border-4 border-white shadow-sm ${color === c ? "scale-125 shadow-xl ring-2 ring-indigo-500/20" : "hover:scale-110 opacity-60 hover:opacity-100"}`}
                       style={{ backgroundColor: c }}
                     />
@@ -249,6 +256,7 @@ export function SubjectModal({
                   <button
                     type="button"
                     onClick={() => setShowDeleteConfirm(true)}
+                    title="Eliminar esta asignatura"
                     className="flex items-center gap-2 px-4 py-2 rounded-xl text-red-500 hover:bg-red-50 transition-all text-xs font-black uppercase tracking-widest"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -266,12 +274,14 @@ export function SubjectModal({
                     <button
                       type="button"
                       onClick={() => setShowDeleteConfirm(false)}
+                      title="Cancelar eliminación"
                       className="text-xs font-black text-neutral-400 hover:text-neutral-900 transition-colors uppercase tracking-widest"
                     >
                       No
                     </button>
                     <button
                       type="button"
+                      title="Confirmar eliminación de la asignatura"
                       onClick={async () => {
                         try {
                           const id = subjectToEdit!.id!;
@@ -286,6 +296,7 @@ export function SubjectModal({
                             snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
                           }
   
+                          await addSubjectCounterOp(batch, user!.uid, -1);
                           await batch.commit();
                           
                           trackEvent(
@@ -309,6 +320,7 @@ export function SubjectModal({
                     type="button"
                     disabled={isSubmitting}
                     onClick={onClose}
+                    title="Cancelar y cerrar ventana"
                     className="px-6 py-4 text-xs font-black text-neutral-400 hover:text-neutral-900 transition-colors uppercase tracking-widest disabled:opacity-50"
                   >
                     Cancelar
@@ -316,6 +328,7 @@ export function SubjectModal({
                   <button
                     type="submit"
                     disabled={isSubmitting}
+                    title="Guardar la asignatura"
                     className="px-10 py-4 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs disabled:opacity-50 disabled:scale-100"
                   >
                     Guardar

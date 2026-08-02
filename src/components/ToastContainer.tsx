@@ -9,33 +9,33 @@ import { CheckCircle, XCircle, AlertTriangle, Info, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 const CONFIG: Record<ToastType, { icon: React.ElementType; bg: string; border: string; text: string; iconColor: string }> = {
-  success: {
+   success: {
     icon: CheckCircle,
-    bg: 'bg-white',
-    border: 'border-emerald-200',
-    text: 'text-neutral-800',
-    iconColor: 'text-emerald-500',
+    bg: 'bg-neutral-800',
+    border: 'border-emerald-600',
+    text: 'text-emerald-100',
+    iconColor: 'text-emerald-400',
   },
   error: {
     icon: XCircle,
-    bg: 'bg-white',
-    border: 'border-red-200',
-    text: 'text-neutral-800',
-    iconColor: 'text-red-500',
+    bg: 'bg-neutral-800',
+    border: 'border-red-600',
+    text: 'text-red-100',
+    iconColor: 'text-red-400',
   },
   warning: {
     icon: AlertTriangle,
-    bg: 'bg-white',
-    border: 'border-amber-200',
-    text: 'text-neutral-800',
-    iconColor: 'text-amber-500',
+    bg: 'bg-neutral-800',
+    border: 'border-amber-600',
+    text: 'text-amber-100',
+    iconColor: 'text-amber-400',
   },
   info: {
     icon: Info,
-    bg: 'bg-white',
-    border: 'border-indigo-200',
-    text: 'text-neutral-800',
-    iconColor: 'text-indigo-500',
+    bg: 'bg-neutral-800',
+    border: 'border-indigo-600',
+    text: 'text-indigo-100',
+    iconColor: 'text-indigo-400',
   },
 };
 
@@ -66,7 +66,7 @@ export function ToastContainer() {
             </p>
             <button
               onClick={() => dismiss(toast.id)}
-              className="shrink-0 text-neutral-300 hover:text-neutral-600 transition-colors mt-0.5"
+              className="shrink-0 text-neutral-500 hover:text-neutral-300 transition-colors mt-0.5"
             >
               <X className="w-4 h-4" />
             </button>

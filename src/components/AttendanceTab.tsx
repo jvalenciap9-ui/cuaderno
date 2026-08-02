@@ -4,7 +4,7 @@ import { collection, query, where, addDoc, updateDoc, deleteDoc, doc, limit } fr
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthProvider';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
-import { Check, X as XIcon, Clock, ChevronLeft, ChevronRight, Calendar, BarChart3 } from 'lucide-react';
+import { Check, X as XIcon, Clock, ChevronLeft, ChevronRight, Calendar, BarChart3, Info, AlertTriangle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { 
   startOfWeek, 
@@ -27,6 +27,13 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
   const [viewMode, setViewMode] = useState<'week' | 'module' | 'evaluation'>('week');
   const [selectedModuleId, setSelectedModuleId] = useState<string | ''>('');
   const [selectedEvalId, setSelectedEvalId] = useState<string | ''>('');
+  const [warningModalOpen, setWarningModalOpen] = useState(false);
+  const [pendingAttendance, setPendingAttendance] = useState<{ studentId: string, dateStr: string, currentStatus: string | undefined } | null>(null);
+  const [warningMessage, setWarningMessage] = useState<{ title: string, message: string }>({ title: '', message: '' });
+
+  const subjectsQuery = user?.uid ? query(collection(db, 'subjects'), where('userId', '==', user?.uid), limit(500)) : null;
+  const [subjects = []] = useCustomCollectionData(subjectsQuery);
+  const subject = subjects.find(s => s.id === subjectId);
 
   const studentsQuery = user?.uid ? query(collection(db, 'students'), where('subjectId', '==', subjectId), where('userId', '==', user?.uid), limit(500)) : null;
   const [students = [], loadingStudents] = useCustomCollectionData(studentsQuery);
@@ -98,7 +105,7 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
     return allAttendance.filter(a => visibleDateStrings.has(a.date));
   }, [allAttendance, visibleDateStrings]);
 
-  const handleStatusChange = async (studentId: string, dateStr: string, currentStatus: string | undefined) => {
+  const processAttendanceChange = async (studentId: string, dateStr: string, currentStatus: string | undefined) => {
     if (!user) return;
     const nextStatusMap: Record<string, 'present' | 'absent' | 'late' | undefined> = {
       'present': 'late',
@@ -129,6 +136,51 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, 'attendance');
     }
+  };
+
+  const handleStatusChange = async (studentId: string, dateStr: string, currentStatus: string | undefined) => {
+    if (!user) return;
+
+    let isOutOfRange = false;
+    let title = '';
+    let message = '';
+    const dateToCheck = parseISO(dateStr).getTime();
+
+    if (viewMode === 'module' && selectedModuleId) {
+      const mod = modules.find(m => m.id === selectedModuleId);
+      if (mod) {
+        const modStart = mod.startDate ? parseISO(mod.startDate).getTime() : null;
+        let modEnd = mod.endDate ? parseISO(mod.endDate).getTime() : null;
+        if (modEnd) modEnd += 86400000 - 1; 
+
+        if ((modStart && dateToCheck < modStart) || (modEnd && dateToCheck > modEnd)) {
+          isOutOfRange = true;
+          title = 'Fecha fuera del período del módulo';
+          message = `La fecha ${format(parseISO(dateStr), 'dd/MM/yyyy')} está fuera del rango configurado para el módulo "${mod.title}" (${mod.startDate ? format(parseISO(mod.startDate), 'dd/MM/yyyy') : 'N/A'} - ${mod.endDate ? format(parseISO(mod.endDate), 'dd/MM/yyyy') : 'N/A'}).`;
+        }
+      }
+    } else {
+      if (subject) {
+        const subStart = subject.startDate ? parseISO(subject.startDate).getTime() : null;
+        let subEnd = subject.endDate ? parseISO(subject.endDate).getTime() : null;
+        if (subEnd) subEnd += 86400000 - 1;
+
+        if ((subStart && dateToCheck < subStart) || (subEnd && dateToCheck > subEnd)) {
+          isOutOfRange = true;
+          title = 'Fecha fuera del período de la asignatura';
+          message = `La fecha ${format(parseISO(dateStr), 'dd/MM/yyyy')} está fuera del rango configurado para la asignatura "${subject.name}" (${subject.startDate ? format(parseISO(subject.startDate), 'dd/MM/yyyy') : 'N/A'} - ${subject.endDate ? format(parseISO(subject.endDate), 'dd/MM/yyyy') : 'N/A'}).`;
+        }
+      }
+    }
+
+    if (isOutOfRange) {
+      setWarningMessage({ title, message });
+      setPendingAttendance({ studentId, dateStr, currentStatus });
+      setWarningModalOpen(true);
+      return;
+    }
+
+    await processAttendanceChange(studentId, dateStr, currentStatus);
   };
 
   const getGlobalStats = () => {
@@ -291,6 +343,30 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
         </div>
       </div>
 
+      {/* Banner explicativo del ciclo de asistencia */}
+      <div className="bg-indigo-50/40 border border-indigo-100/60 rounded-[2rem] p-6 flex flex-col md:flex-row items-center justify-between gap-6 shadow-sm">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-2xl bg-indigo-100/80 flex items-center justify-center text-indigo-600 shrink-0 shadow-inner">
+            <Info className="w-6 h-6" />
+          </div>
+          <div>
+            <h4 className="text-sm font-black text-neutral-900 uppercase tracking-wider">¿Cómo registrar la asistencia?</h4>
+            <p className="text-neutral-500 text-xs mt-1 font-medium leading-relaxed">
+              Haz clic consecutivamente sobre el casillero de un estudiante para alternar cíclicamente entre los diferentes estados de asistencia.
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-center gap-2 bg-white px-5 py-3 rounded-2xl border border-neutral-100 shadow-sm text-xs font-black tracking-wide text-neutral-600">
+          <span className="flex items-center gap-1.5 text-emerald-600 bg-emerald-50/60 px-2.5 py-1 rounded-xl border border-emerald-100/50"><Check className="w-4 h-4" /> Presente</span>
+          <span className="text-neutral-300">→</span>
+          <span className="flex items-center gap-1.5 text-amber-600 bg-amber-50/60 px-2.5 py-1 rounded-xl border border-amber-100/50"><Clock className="w-4 h-4" /> Tarde</span>
+          <span className="text-neutral-300">→</span>
+          <span className="flex items-center gap-1.5 text-red-600 bg-red-50/60 px-2.5 py-1 rounded-xl border border-red-100/50"><XIcon className="w-4 h-4" /> Ausente</span>
+          <span className="text-neutral-300">→</span>
+          <span className="text-neutral-400 bg-neutral-50 px-2.5 py-1 rounded-xl border border-neutral-100/50">Sin Registro</span>
+        </div>
+      </div>
+
       {displayDays.length === 0 ? (
         <div className="bg-white border border-neutral-200 rounded-[3rem] p-16 text-center shadow-sm">
           <Calendar className="w-12 h-12 text-neutral-200 mx-auto mb-4" />
@@ -394,6 +470,41 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
         </div>
         <div className="ml-auto italic opacity-60">Haz clic en los cuadros para cambiar el estado</div>
       </div>
+
+      {warningModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/40 backdrop-blur-md">
+          <div className="bg-white border border-neutral-200 p-10 rounded-[2.5rem] shadow-2xl max-w-md w-full mx-4 animate-in fade-in zoom-in duration-300">
+            <div className="w-16 h-16 bg-amber-50 text-amber-600 rounded-2xl flex items-center justify-center mb-8 mx-auto">
+              <AlertTriangle className="w-8 h-8" />
+            </div>
+            <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">{warningMessage.title}</h3>
+            <p className="text-neutral-500 mb-10 text-center font-medium leading-relaxed">{warningMessage.message}</p>
+            <div className="flex gap-4">
+              <button 
+                onClick={() => {
+                  setWarningModalOpen(false);
+                  setPendingAttendance(null);
+                }} 
+                className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
+              >
+                Cancelar
+              </button>
+              <button 
+                onClick={async () => {
+                  setWarningModalOpen(false);
+                  if (pendingAttendance) {
+                    await processAttendanceChange(pendingAttendance.studentId, pendingAttendance.dateStr, pendingAttendance.currentStatus);
+                    setPendingAttendance(null);
+                  }
+                }} 
+                className="flex-1 bg-amber-600 hover:bg-amber-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-amber-500/20 active:scale-95"
+              >
+                Registrar de todas formas
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

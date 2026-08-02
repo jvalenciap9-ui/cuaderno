@@ -8,15 +8,12 @@ import {
   CheckCircle2, 
   ChevronDown, 
   CalendarDays, 
-  CalendarRange, 
-  FolderOpen, 
-  Users, 
   User, 
   BarChart3,
   TrendingUp
 } from 'lucide-react';
 import type { AttendanceDoc } from '../types/firestore';
-import { cn } from '../lib/utils';
+import { cn, parseLocalDate } from '../lib/utils';
 
 interface AttendanceReportProps {
   subjectId?: string | 'all';
@@ -26,7 +23,7 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
   const { user } = useAuth();
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | 'all'>(subjectId);
   const [selectedDate, setSelectedDate] = useState<string>(format(new Date(), 'yyyy-MM-dd'));
-  const [reportType, setReportType] = useState<'day' | 'week' | 'module'>('day');
+  const [reportType, setReportType] = useState<'day' | 'week'>('day');
 
   // Sync with prop
   React.useEffect(() => {
@@ -48,13 +45,13 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
     : query(studentsRef, where('userId', '==', user?.uid), where('subjectId', '==', selectedSubjectId), limit(500))) : null;
   const [students = [], loadingStudents] = useCustomCollectionData(allStudentsQuery);
 
-  const modulesRef = collection(db, 'subjectModules');
-  const allModulesQuery = user?.uid ? (selectedSubjectId === 'all'
-    ? query(modulesRef, where('userId', '==', user?.uid), limit(500))
-    : query(modulesRef, where('userId', '==', user?.uid), where('subjectId', '==', selectedSubjectId), limit(500))) : null;
-  const [modules = [], loadingModules] = useCustomCollectionData(allModulesQuery);
-
-  const [selectedModuleId, setSelectedModuleId] = useState<string | 'all'>('all');
+  const [selectedWeekStart, setSelectedWeekStart] = useState<string>(() => {
+    const now = new Date();
+    const day = now.getDay();
+    const diff = now.getDate() - day + (day === 0 ? -6 : 1);
+    const monday = new Date(now.setDate(diff));
+    return format(monday, 'yyyy-MM-dd');
+  });
 
   const stats = useMemo(() => {
     const maleStudents = students.filter(s => s.gender === 'M');
@@ -88,24 +85,21 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
     };
 
     // Daily
-    const todayAttendance = attendance.filter(a => a.date === selectedDate);
-    const daily = getStatsForSet(todayAttendance);
+    const dayAttendance = attendance.filter(a => a.date === selectedDate);
+    const daily = getStatsForSet(dayAttendance);
 
     // Weekly
-    const selectedDateObj = new Date(selectedDate);
-    const oneWeekAgo = new Date(selectedDateObj);
-    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-    const weeklyAttendance = attendance.filter(a => new Date(a.date) >= oneWeekAgo && new Date(a.date) <= selectedDateObj);
+    const weekStart = parseLocalDate(selectedWeekStart);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 6);
+    const weeklyAttendance = attendance.filter(a => {
+      const aDate = parseLocalDate(a.date);
+      return aDate >= weekStart && aDate <= weekEnd;
+    });
     const weekly = getStatsForSet(weeklyAttendance);
 
-    // Module
-    const moduleAttendance = selectedModuleId === 'all' 
-      ? attendance 
-      : attendance.filter(a => a.moduleId === selectedModuleId);
-    const moduleStats = getStatsForSet(moduleAttendance);
-
-    return { day: daily, week: weekly, module: moduleStats };
-  }, [attendance, students, selectedDate, selectedModuleId]);
+    return { day: daily, week: weekly };
+  }, [attendance, students, selectedDate, selectedWeekStart]);
 
   const currentStats = stats[reportType] || { 
     rate: 0, 
@@ -118,7 +112,7 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
     femaleRate: 0 
   };
 
-  const isLoading = loadingSubjects || loadingAttendance || loadingStudents || loadingModules;
+  const isLoading = loadingSubjects || loadingAttendance || loadingStudents;
 
   if (isLoading) {
     return (
@@ -151,12 +145,11 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
           <div className="relative group min-w-[120px]">
              <select
               value={reportType}
-              onChange={(e) => setReportType(e.target.value as 'day' | 'week' | 'module')}
+              onChange={(e) => setReportType(e.target.value as 'day' | 'week')}
               className="w-full appearance-none bg-white border border-neutral-200 rounded-xl px-4 py-2.5 pr-10 text-[10px] font-black uppercase tracking-widest text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all cursor-pointer shadow-sm"
             >
               <option value="day">Día</option>
               <option value="week">Semana</option>
-              <option value="module">Módulo</option>
             </select>
             <ChevronDown className="w-4 h-4 text-neutral-400 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none group-hover:text-indigo-500 transition-colors" />
           </div>
@@ -168,7 +161,6 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
               value={selectedSubjectId}
               onChange={(e) => {
                 setSelectedSubjectId(e.target.value === 'all' ? 'all' : e.target.value);
-                setSelectedModuleId('all');
               }}
               className="w-full appearance-none bg-white border border-neutral-200 rounded-2xl px-4 py-2.5 pr-10 text-xs font-bold text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all cursor-pointer shadow-sm"
             >
@@ -180,32 +172,25 @@ export const AttendanceReport = memo(function AttendanceReport({ subjectId = 'al
             <ChevronDown className="w-4 h-4 text-neutral-400 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none group-hover:text-indigo-500 transition-colors" />
           </div>
 
-          <div className="relative group">
-            <select
-              value={selectedModuleId}
-              onChange={(e) => setSelectedModuleId(e.target.value === 'all' ? 'all' : e.target.value)}
-              className="w-full appearance-none bg-white border border-neutral-200 rounded-2xl px-4 py-2.5 pr-10 text-xs font-bold text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={selectedSubjectId === 'all'}
-            >
-              <option value="all">Todos los Módulos</option>
-              {modules.map(m => (
-                <option key={m.id} value={m.id}>{m.title}</option>
-              ))}
-            </select>
-            <ChevronDown className="w-4 h-4 text-neutral-400 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none group-hover:text-indigo-500 transition-colors" />
+          <div className="relative">
+            {reportType === 'day' ? (
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                className="w-full bg-white border border-neutral-200 rounded-2xl px-4 py-2.5 pr-10 text-xs font-bold text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all shadow-sm cursor-pointer"
+              />
+            ) : (
+              <input
+                type="date"
+                value={selectedWeekStart}
+                onChange={(e) => setSelectedWeekStart(e.target.value)}
+                className="w-full bg-white border border-neutral-200 rounded-2xl px-4 py-2.5 pr-10 text-xs font-bold text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all shadow-sm cursor-pointer"
+              />
+            )}
+            <CalendarDays className="w-4 h-4 text-neutral-400 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none" />
           </div>
         </div>
-        
-        {reportType === 'day' && (
-          <div className="relative">
-            <input
-              type="date"
-              value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              className="w-full bg-white border border-neutral-200 rounded-2xl px-4 py-2.5 text-xs font-bold text-neutral-900 outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all shadow-sm cursor-pointer"
-            />
-          </div>
-        )}
       </div>
 
       <div className="p-6 space-y-5">

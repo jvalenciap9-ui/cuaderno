@@ -5,6 +5,7 @@ import { collection, query, where, orderBy, doc, addDoc, updateDoc, deleteDoc, w
 import { db } from "../lib/firebase";
 import { useAuth } from "./AuthProvider";
 import { handleFirestoreError, OperationType } from "../lib/firestoreUtils";
+import { toast } from '../hooks/useToast';
 import {
   Plus,
   Trash2,
@@ -22,7 +23,7 @@ import {
   FileQuestion,
 } from "lucide-react";
 import type { NoteDoc, SubjectModuleDoc } from "../types/firestore";
-import { cn } from "../lib/utils";
+import { cn, parseLocalDate } from "../lib/utils";
 import { format, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
 
@@ -54,13 +55,25 @@ export function ModulesTab({
   const notesRef = collection(db, 'notes');
   const notesQuery = user?.uid ? query(notesRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
   const [notesData] = useCustomCollectionData(notesQuery);
-  const notes = Array.isArray(notesData) ? [...notesData].sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime()) : [];
+  const notes = Array.isArray(notesData) ? [...notesData].sort((a, b) => parseLocalDate(b.date || 0).getTime() - parseLocalDate(a.date || 0).getTime()) : [];
 
   const [isAdding, setIsAdding] = useState(false);
   const [addingParentId, setAddingParentId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [expandedModules, setExpandedModules] = useState<string[]>([]);
   const [expandedNotes, setExpandedNotes] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (modules.length > 0) {
+      const tourSubjectId = localStorage.getItem('tour_subject_id');
+      if (tourSubjectId === subjectId) {
+        setExpandedModules(prev => {
+          if (prev.includes(modules[0].id!)) return prev;
+          return [...prev, modules[0].id!];
+        });
+      }
+    }
+  }, [modules, subjectId]);
   const [moduleToDelete, setModuleToDelete] = useState<string | null>(null);
   const [processingNoteId, setProcessingNoteId] = useState<string | null>(null);
   const [aiAlertMessage, setAiAlertMessage] = useState<string | null>(null);
@@ -131,33 +144,58 @@ export function ModulesTab({
         : "";
 
       contents.push(
-        `Eres un asistente experto en comprensión de lectura y estructuración de sílabos universitarios.
+        `Eres un asistente experto en comprensión de lectura y estructuración de sílabos y planes de clase universitarios.
         
         !!! INSTRUCCIÓN CRÍTICA DE TIEMPO !!! 
         Para este documento en particular, HOY ES EXACTAMENTE: ${note.date} (${formattedDate}).
-        Cualquier referencia temporal (como "hoy", "mañana", "el próximo jueves") DEBE calcularse matemáticamente a partir de esta fecha base.
+        - Si el documento tiene fechas explícitas, USA LAS FECHAS DEL DOCUMENTO directamente.
+        - Si el documento usa "Semana 1, Semana 2...", calcula: Semana 1 empieza en la fecha base, Semana 2 = fecha base + 7 días, etc.
+        - Si el documento es una tabla con días de la semana (Lunes, Martes...), asígnale al Lunes de la Semana 1 la fecha base. Si dice "Lunes 8:00" de la Semana 1, es la fecha base a las 8:00.
         
-        !!! EXTRACCIÓN MASIVA Y EXHAUSTIVA DE PLANES Y MÚLTIPLES SEMANAS !!!
-        - Este documento puede contener un sílabo completo o un plan trimestral/semestral.
-        - ATENCIÓN: Si el documento detalla actividades para MUCHAS SEMANAS (Semana 1, Semana 2, Semana 3, Semana 4, Semana 5, etc.), DEBES PROCESARLAS TODAS SIN EXCEPCIÓN. NO TE DETENGAS en la primera o segunda semana.
-        - ES OBLIGATORIO LEER TODO EL DOCUMENTO. Si hay planes para 16 semanas, genera eventos y clases para las 16 semanas.
-        - El estudiante te pide que extraigas de forma MASIVA Y OBLIGATORIA la lista COMPLETA de:
-          1. MÓDULOS (e.g., Unidades, Trimestres, Semanas principales). EXTRAE TODOS (pueden ser 7+).
-          2. APUNTES / CLASES (notes). Extrae el título y la fecha exacta para CADA clase/apunte de cada módulo (pueden ser 12+ por módulo, ¡EXTRAE TODOS!).
-          3. EVENTOS DE CALENDARIO (events). Tareas, fechas límite, clases específicas si aplican diferenciadas. 
-          4. EVALUACIONES (evaluations). Exámenes y pruebas referenciadas.
-        - Identifica a qué fecha exacta (YYYY-MM-DD) corresponde CADA día de clase detallado en el documento (sumando días a la fecha base según correspondan las semanas. Ej. Semana 2 es +7 días, Semana 3 es +14 días).
+        !!! EXTRACCIÓN MASIVA DE PLANES CON MÚLTIPLES SEMANAS !!!
+        - ATENCIÓN: Si el documento detalla actividades para MUCHAS SEMANAS (Semana 1, Semana 2, Semana 3, Semana 4, etc.), DEBES PROCESARLAS TODAS SIN EXCEPCIÓN.
+        - LEE TODO EL DOCUMENTO. Si hay 4 semanas, genera eventos y evaluaciones para las 4 semanas completas.
+        
+        FORMATO DE EXTRACCIÓN - POR CADA DÍA DE CLASE:
+        - Crea 1 EVENTO por día con:
+          - "title": el TEMA PRINCIPAL de la clase de ese día (ej: "Presente Simple - afirmativo y negativo")
+          - "topic": el tema del módulo/unidad (ej: "Gramática Básica")
+          - "description": actividades principales del día separadas por " | " (ej: "Explicación teórica | Ejercicios en parejas | Quiz corto")
+          - "startTime": hora de inicio si está disponible (ej: "8:00")
+          - "endTime": hora de fin si está disponible (ej: "9:30")
+          - "order": número de orden del día dentro de la semana (Lunes=1, Martes=2...)
+          - "type": "class" para clases normales, "exam" si hay examen/quiz, "deadline" si es solo entrega
+        - Si un día tiene EXAMEN o QUIZ, adicionalmente crea una EVALUACIÓN.
         
         ${moduleInfo}
 
         Extrae OBLIGATORIAMENTE TODOS los datos en un objeto JSON puro (sin bloques Markdown) con este formato estricto:
         {
-          "newModules": [{"tempId": "m1", "title": "Nombre Módulo", "description": "Descripción opcional", "startDate": "YYYY-MM-DD", "endDate": "YYYY-MM-DD"}],
-          "newNotes": [{"title": "Título del apunte/clase", "content": "Breve descripción", "date": "YYYY-MM-DD", "moduleId": "string|tempId"}],
-          "events": [{"title": "Título evento", "date": "YYYY-MM-DD", "type": "class|exam|deadline|other", "moduleId": "string|tempId"}],
-          "evaluations": [{"title": "Título evaluación", "maxScore": 100, "date": "YYYY-MM-DD", "type": "teorica|practica", "moduleId": "string|tempId"}]
+          "newModules": [{"tempId": "m1", "title": "Nombre Módulo", "description": "", "startDate": "YYYY-MM-DD", "endDate": "YYYY-MM-DD"}],
+          "events": [
+            {
+              "title": "Tema principal de la clase",
+              "topic": "Módulo/Unidad al que pertenece",
+              "description": "Actividad 1 | Actividad 2 | Actividad 3",
+              "date": "YYYY-MM-DD",
+              "startTime": "HH:MM",
+              "endTime": "HH:MM",
+              "order": 1,
+              "type": "class|exam|deadline",
+              "moduleId": "ID del módulo (usar el ID real si ya existe, o tempId si es nuevo)"
+            }
+          ],
+          "evaluations": [
+            {
+              "title": "Nombre de la prueba/examen",
+              "maxScore": 100,
+              "date": "YYYY-MM-DD",
+              "type": "teorica|practica",
+              "moduleId": "string"
+            }
+          ]
         }
-        NO RESUMAS NADA. Si el documento detalla 84 clases, genera 84 objetos dentro de "newNotes" o "events". Usa un "tempId" (ej. "m1") en "newModules" para referenciarlo en las clases/eventos extraídos si son nuevos.`
+        NO RESUMAS NADA. Si hay 4 semanas con 5 días cada una = 20 días lectivos, genera 20 eventos. Usa "tempId" (ej. "m1") en newModules solo si creas módulos nuevos.`
       );
 
       const response = await ai({
@@ -169,13 +207,59 @@ export function ModulesTab({
         }
       });
 
-      if (!response.text) throw new Error("Sin respuesta de Gemini");
-      const cleanText = response.text.replace(/```json\n?|\n?```/g, "").trim();
-      const match = cleanText.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("La IA no devolvió un JSON válido");
-      
-      const data = JSON.parse(match[0]);
-      let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
+if (!response.text) throw new Error("Sin respuesta de Gemini");
+console.log("DEBUG response.text:", JSON.stringify(response.text).substring(0, 200));
+
+// La Cloud Function devuelve { text: "..." } donde text puede ser un JSON string
+let textToProcess = response.text;
+
+// Si el texto es un JSON escapado, extraerlo
+try {
+  const parsed = JSON.parse(textToProcess);
+  if (parsed && typeof parsed === 'object' && parsed.text) {
+    textToProcess = parsed.text;
+  }
+} catch(e) {
+  // No es JSON, usar tal cual
+}
+
+// Limpiar bloques de markdown
+let cleanText = response.text;
+// Si es un JSON con propiedad 'text', extraerlo
+try {
+  const parsed = JSON.parse(cleanText);
+  if (parsed.text) cleanText = parsed.text;
+} catch(e) {}
+cleanText = cleanText.replace(/```json\n?|\n?```/g, "").trim();
+
+// Extraer el objeto JSON
+let match = cleanText.match(/\{[\s\S]*\}/);
+if (!match) {
+  match = textToProcess.match(/\{[\s\S]*\}/);
+}
+if (!match) {
+  console.warn("Gemini no devolvió JSON válido:", textToProcess.substring(0, 300));
+  match = ['{"newModules":[],"newNotes":[],"events":[],"evaluations":[]}'];
+}
+
+// Parsear con manejo de errores
+let data;
+try {
+  data = JSON.parse(match[0]);
+} catch (parseError) {
+  // Intentar arreglar JSON mal formado
+  try {
+    const fixedJson = match[0]
+      .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3')
+      .replace(/'/g, '"');
+    data = JSON.parse(fixedJson);
+  } catch (e2) {
+    console.error("No se pudo parsear JSON:", match[0].substring(0, 200));
+    data = { newModules: [], newNotes: [], events: [], evaluations: [] };
+  }
+}
+
+let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
 
       const batch = writeBatch(db);
       const tempIdToRealId: Record<string, string> = {};
@@ -235,7 +319,12 @@ export function ModulesTab({
             moduleId: resolveModuleId(ev.moduleId),
             title: ev.title || 'Evento Extraído',
             date: ev.date || note.date,
-            type: ev.type || 'other'
+            type: ev.type || 'other',
+            topic: ev.topic || null,
+            description: ev.description || null,
+            startTime: ev.startTime || null,
+            endTime: ev.endTime || null,
+            order: typeof ev.order === 'number' ? ev.order : null,
           });
           addedEvents++;
         }
@@ -264,7 +353,7 @@ export function ModulesTab({
       console.error("Error en MAGIC AI:", e);
       const msg = 'Hubo un error al procesar la IA: ' + ((e instanceof Error ? e.message : '') || 'Desconocido');
       setAiAlertMessage(msg);
-      alert(msg);
+      toast.error(msg);
     } finally {
       setProcessingNoteId(null);
     }
@@ -379,37 +468,35 @@ export function ModulesTab({
     setIsConfirmingGeneratePlan(true);
   };
   
+  const getPlanLabel = () => {
+    return 'Módulo';
+  };
+
   const confirmGeneratePlan = async () => {
     setIsConfirmingGeneratePlan(false);
     if (!subject || !user) return;
     const plan = subject.plan || "otro";
     let numModules = 0;
-    let label = "Módulo";
+    let label = getPlanLabel();
 
     switch (plan) {
       case "semanal":
         numModules = 16;
-        label = "Semana";
         break;
       case "mensual":
         numModules = 6;
-        label = "Mes";
         break;
       case "trimestral":
         numModules = 3;
-        label = "Trimestre";
         break;
       case "cuatrimestral":
         numModules = 4;
-        label = "Cuatrimestre / Mes";
         break;
       case "anual_8":
         numModules = 8;
-        label = "Mes";
         break;
       case "anual_10":
         numModules = 10;
-        label = "Mes";
         break;
       default:
         numModules = 6;
@@ -471,7 +558,7 @@ export function ModulesTab({
         {(parentOptions.length > 0) && (
           <div>
             <label className="block text-[10px] font-black text-neutral-400 uppercase tracking-[0.2em] mb-4 px-1">
-              ¿Pertenece a un período/trimestre?
+              ¿Pertenece a un módulo/período?
             </label>
             <select
               value={addingParentId || ""}
@@ -483,7 +570,7 @@ export function ModulesTab({
                 <option key={p.id} value={p.id!}>Sí, dentro de: {p.title}</option>
               ))}
             </select>
-            <p className="text-xs text-neutral-500 mt-2 ml-2 font-medium">Si seleccionas un trimestre, se agrupará dentro de él.</p>
+            <p className="text-xs text-neutral-500 mt-2 ml-2 font-medium">Si seleccionas un módulo, se agrupará dentro de él.</p>
           </div>
         )}
 
@@ -531,6 +618,7 @@ export function ModulesTab({
               type="button"
               onClick={() => setModuleToDelete(editingId)}
               className="flex items-center gap-3 px-6 py-3 rounded-2xl text-red-600 hover:bg-red-50 transition-all text-xs font-black uppercase tracking-widest active:scale-95"
+              title="Eliminar este módulo permanentemente"
             >
               <Trash2 className="w-5 h-5" />
               Eliminar
@@ -542,12 +630,14 @@ export function ModulesTab({
             type="button"
             onClick={resetForm}
             className="flex-1 sm:flex-none px-6 py-4 text-xs font-black text-neutral-400 hover:text-neutral-900 transition-colors uppercase tracking-widest"
+            title="Cancelar la edición y cerrar el formulario"
           >
             Cancelar
           </button>
           <button
             type="submit"
             className="flex-1 sm:flex-none px-8 py-4 text-xs font-black bg-indigo-600 text-white rounded-2xl hover:bg-indigo-50 transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest"
+            title="Guardar o actualizar la información del módulo"
           >
             {editingId ? "Actualizar" : "Guardar"}
           </button>
@@ -569,8 +659,10 @@ export function ModulesTab({
           </h5>
           <div className="flex flex-wrap items-center gap-4">
             <button
+              id="add-note-btn"
               onClick={() => onOpenNoteModal(moduleId)}
               className="flex items-center gap-2 text-indigo-600 hover:text-indigo-500 text-[10px] font-black uppercase tracking-widest transition-all active:scale-95"
+              title="Añadir un apunte o material a este módulo"
             >
               <Plus className="w-4 h-4" />
               Nuevo Apunte
@@ -722,12 +814,14 @@ export function ModulesTab({
               <button
                 onClick={() => setModuleToDelete(null)}
                 className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
+                title="Cancelar y mantener el módulo"
               >
                 Cancelar
               </button>
               <button
                 onClick={() => handleDelete(moduleToDelete)}
                 className="flex-1 bg-red-600 hover:bg-red-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-red-500/20 active:scale-95"
+                title="Eliminar permanentemente el módulo y todo su contenido"
               >
                 Eliminar
               </button>
@@ -753,12 +847,14 @@ export function ModulesTab({
               <button
                 onClick={() => setIsConfirmingGeneratePlan(false)}
                 className="flex-1 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
+                title="Cancelar generación de formato"
               >
                 Cancelar
               </button>
               <button
                 onClick={confirmGeneratePlan}
                 className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all shadow-lg shadow-indigo-500/20 active:scale-95"
+                title="Generar la estructura de módulos de acuerdo al plan"
               >
                 Sí, generar
               </button>
@@ -787,14 +883,17 @@ export function ModulesTab({
             <button
               onClick={handleGeneratePlanModules}
               className="flex items-center gap-2 bg-neutral-100 hover:bg-neutral-200 text-indigo-600 px-6 py-4 rounded-2xl text-sm font-black transition-all shadow-sm active:scale-95 uppercase tracking-widest"
+              title="Generar módulos predefinidos según el plan de la materia"
             >
               Generar formato
             </button>
           )}
           {!isAdding && (
             <button
+              id="add-module-btn"
               onClick={() => setIsAdding(true)}
               className="flex items-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-4 rounded-2xl text-sm font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest"
+              title="Crear un nuevo módulo o sección manualmente"
             >
               <Plus className="w-5 h-5" />
               Nueva Sección / Módulo
@@ -856,7 +955,7 @@ export function ModulesTab({
                   >
                     <div className="flex flex-col sm:flex-row sm:items-center gap-4 mb-3">
                       <span className="bg-neutral-100 text-neutral-500 text-[10px] font-black px-4 py-1.5 rounded-full uppercase tracking-widest border border-neutral-200 shrink-0">
-                        Módulo {index + 1}
+                        {getPlanLabel()} {index + 1}
                       </span>
                       <h4 className="text-2xl font-black text-neutral-900 group-hover:text-indigo-600 transition-colors leading-tight">
                         {mod.title}
@@ -895,7 +994,7 @@ export function ModulesTab({
                       </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-all duration-300 translate-x-4 group-hover:translate-x-0">
+                  <div className="flex items-center gap-2">
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -931,6 +1030,7 @@ export function ModulesTab({
                           setAddingParentId(mod.id!);
                         }}
                         className="flex items-center gap-2 text-indigo-600 hover:text-indigo-500 text-[10px] font-black uppercase tracking-widest transition-all active:scale-95"
+                        title="Agregar un submódulo a esta sección"
                       >
                         <Plus className="w-4 h-4" />
                         Nuevo Módulo
@@ -953,18 +1053,18 @@ export function ModulesTab({
                         }
 
                         return (
-                          <div key={child.id} className="bg-neutral-50 border border-neutral-200 p-6 rounded-[2.5rem] group hover:border-indigo-200 transition-all duration-300 shadow-sm hover:shadow-xl">
+                          <div key={child.id} className="bg-neutral-50 border border-neutral-200 p-6 rounded-[2.5rem] hover:border-indigo-200 transition-all duration-300 shadow-sm hover:shadow-xl">
                              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 cursor-pointer" onClick={() => toggleModule(child.id!)}>
                                 <div className="flex-1">
                                    <div className="flex items-center gap-3">
-                                      <span className="text-[10px] font-black uppercase tracking-widest text-indigo-500 bg-indigo-50 px-3 py-1.5 rounded-full border border-indigo-100/50">Módulo {cIdx + 1}</span>
+                                      <span className="text-[10px] font-black uppercase tracking-widest text-indigo-500 bg-indigo-50 px-3 py-1.5 rounded-full border border-indigo-100/50">{getPlanLabel()} {cIdx + 1}</span>
                                       <h5 className="text-xl font-black text-neutral-900 group-hover:text-indigo-600 transition-colors">{child.title}</h5>
                                    </div>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <button onClick={(e) => { e.stopPropagation(); handleEdit(child); }} className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all active:scale-90" title="Editar módulo"><Edit3 className="w-5 h-5" /></button>
                                     <button onClick={(e) => { e.stopPropagation(); setModuleToDelete(child.id!); }} className="p-3 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all active:scale-90" title="Eliminar módulo"><Trash2 className="w-5 h-5" /></button>
-                                    <button className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all cursor-pointer">
+                                    <button className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all cursor-pointer" title={isChildExpanded ? "Contraer submódulo" : "Expandir submódulo"}>
                                         {isChildExpanded ? <ChevronUp className="w-6 h-6" /> : <ChevronDown className="w-6 h-6" />}
                                     </button>
                                 </div>
@@ -987,7 +1087,7 @@ export function ModulesTab({
           })
         )}
 
-        {(unassignedNotes.length > 0) && (
+        {(unassignedNotes.length > 0 || modules.length === 0) && (
           <div className="mt-16 pt-16 border-t border-neutral-200">
             <div className="flex items-center gap-4 mb-10">
               <div className="w-12 h-12 bg-neutral-100 rounded-2xl flex items-center justify-center border border-neutral-200 shadow-sm">
@@ -1018,7 +1118,7 @@ export function ModulesTab({
             </div>
             <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">Magia IA</h3>
             <p className="text-neutral-500 mb-10 text-center font-medium leading-relaxed">{aiAlertMessage}</p>
-            <button onClick={() => setAiAlertMessage(null)} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs">
+            <button onClick={() => setAiAlertMessage(null)} title="Cerrar mensaje de IA" className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs">
               Aceptar
             </button>
           </div>

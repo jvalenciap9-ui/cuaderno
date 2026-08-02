@@ -10,6 +10,7 @@ import { collection, doc, addDoc, updateDoc, deleteDoc } from 'firebase/firestor
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { db, storage } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { showToast } from '../hooks/useToast';
 
 interface NoteModalProps {
   isOpen: boolean;
@@ -120,7 +121,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
       onClose();
     } catch (error: unknown) {
       setIsUploading(false);
-      alert(`No se pudo guardar: ${error instanceof Error ? error.message : 'Error desconocido'}\nSi estás subiendo archivos y recibes permisos denegados, asegúrate de activar y configurar Firebase Storage correctamente.`);
+      showToast('error', `No se pudo guardar: ${error instanceof Error ? error.message : 'Error desconocido'}. Si subes archivos, verifica Firebase Storage.`);
       handleFirestoreError(error, OperationType.WRITE, 'notes');
     }
   };
@@ -140,7 +141,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
             <h2 className="text-2xl font-black text-neutral-900 tracking-tight">
               {noteToEdit ? 'Editar Apunte' : 'Nuevo Apunte'}
             </h2>
-            <button type="button" aria-label="Cerrar" onClick={onClose} className="text-neutral-400 hover:text-neutral-900 transition-colors p-2 hover:bg-neutral-50 rounded-xl">
+            <button type="button" aria-label="Cerrar" title="Cerrar ventana" onClick={onClose} className="text-neutral-400 hover:text-neutral-900 transition-colors p-2 hover:bg-neutral-50 rounded-xl">
               <X className="w-6 h-6" />
             </button>
           </div>
@@ -193,6 +194,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
+                  title="Adjuntar un archivo al apunte"
                   className="flex items-center gap-3 px-6 py-3.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-2xl text-xs font-black transition-all active:scale-95 uppercase tracking-widest shadow-lg shadow-neutral-900/10"
                 >
                   <Paperclip className="w-5 h-5" />
@@ -205,6 +207,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
                     <button 
                       type="button" 
                       onClick={() => setAttachment(undefined)}
+                      title="Quitar archivo adjunto"
                       className="ml-2 p-1 hover:bg-indigo-100 rounded-lg transition-colors"
                     >
                       <X className="w-4 h-4" />
@@ -221,6 +224,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
                     type="button"
                     disabled={isUploading}
                     onClick={() => setShowDeleteConfirm(true)}
+                    title="Eliminar este apunte"
                     className="flex items-center gap-2 px-4 py-2 rounded-xl text-red-500 hover:bg-red-50 transition-all text-xs font-black uppercase tracking-widest disabled:opacity-50"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -236,12 +240,14 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
                     <button
                       type="button"
                       onClick={() => setShowDeleteConfirm(false)}
+                      title="Cancelar eliminación"
                       className="text-xs font-black text-neutral-400 hover:text-neutral-900 transition-colors uppercase tracking-widest"
                     >
                       No
                     </button>
                     <button
                       type="button"
+                      title="Confirmar eliminación del apunte"
                       onClick={async () => {
                         try {
                           await deleteDoc(doc(db, 'notes', noteToEdit!.id!));
@@ -263,6 +269,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
                     type="button"
                     disabled={isUploading}
                     onClick={onClose}
+                    title="Cancelar y cerrar ventana"
                     className="px-6 py-4 text-xs font-black text-neutral-400 hover:text-neutral-900 transition-colors uppercase tracking-widest disabled:opacity-50"
                   >
                     Cancelar
@@ -270,6 +277,7 @@ export function NoteModal({ isOpen, onClose, subjectId, moduleId, noteToEdit }: 
                   <button
                     type="submit"
                     disabled={isUploading}
+                    title="Guardar el apunte"
                     className="px-10 py-4 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-black transition-all shadow-xl shadow-indigo-500/20 active:scale-95 uppercase tracking-widest text-xs disabled:opacity-50 disabled:scale-100 flex items-center gap-2"
                   >
                     {isUploading ? (

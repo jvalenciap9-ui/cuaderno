@@ -4,9 +4,10 @@ import { collection, query, where, orderBy, limit } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthProvider';
 import { BarChart3, UserCheck, UserX, Info, Trophy, TrendingDown } from 'lucide-react';
-import { safeJSONParse, cn } from '../lib/utils';
+import { cn } from '../lib/utils';
 import { SubjectChip } from './SubjectChip';
-import { STORAGE_KEYS, getStorageItem } from '../lib/storageKeys';
+import { calculateStudentGrades } from '../lib/gradeCalculator';
+import { useGradeSettings } from '../contexts/GradeSettingsContext';
 
 interface GradesSummaryProps {
   subjectId?: string;
@@ -50,141 +51,23 @@ export const GradesSummary = memo(function GradesSummary({ subjectId, onNavigate
     : query(modulesRef, where('userId', '==', user?.uid), where('subjectId', '==', selectedSubjectId), limit(500))) : null;
   const [modules = []] = useCustomCollectionData(modulesQuery);
 
-  const parseWeights = (data: string | null) => {
-    const defaultWeights = { 
-      teorica: { name: 'Teórica', value: 30 }, 
-      practica: { name: 'Práctica', value: 60 }, 
-      apreciativa: { name: 'Apreciativa', value: 10 },
-      checkpoint: { name: 'Agregar 4ta Nota', value: 0 }
-    };
-    if (!data) return defaultWeights;
-    try {
-      const parsed: Record<string, unknown> = JSON.parse(data);
-      const output = { ...defaultWeights };
-      (['teorica', 'practica', 'apreciativa', 'checkpoint'] as const).forEach(key => {
-        const val = parsed[key];
-        if (val !== undefined) {
-          if (typeof val === 'number') {
-            output[key].value = val;
-          } else if (typeof val === 'object' && val !== null) {
-            const w = val as { value?: number; name?: string };
-            output[key].value = typeof w.value === 'number' ? w.value : (parseFloat(String(w.value)) || output[key].value);
-            output[key].name = w.name ?? output[key].name;
-          }
-        }
-      });
-      return output;
-    } catch (e) {
-      return defaultWeights;
-    }
-  };
-
-  const [weights, setWeights] = React.useState(() => parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS)));
-  const [useCheckpoint, setUseCheckpoint] = React.useState(() => safeJSONParse(getStorageItem(STORAGE_KEYS.USE_CHECKPOINT), false));
-
-  React.useEffect(() => {
-    const handleStorage = () => {
-      setWeights(parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS)));
-      setUseCheckpoint(safeJSONParse(getStorageItem(STORAGE_KEYS.USE_CHECKPOINT), false));
-    };
-    window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
-  }, []);
-
-  const [viewMode, setViewMode] = React.useState<'categories' | 'modules'>('categories');
-  const [calculationMode, setCalculationMode] = React.useState<'average' | 'sum'>('average');
+  const { viewMode, calculationMode, weights, gradingScale, useCheckpoint, setViewMode, setCalculationMode } = useGradeSettings();
 
   const studentGradesList = React.useMemo(() => {
-    const savedScale = getStorageItem(STORAGE_KEYS.GRADING_SCALE);
-    const gradingScale = safeJSONParse(savedScale, { maxScore: 100, minPassingScore: 71 });
-
     return students.map(student => {
       const studentGrades = allGrades.filter(g => g.studentId === student.id);
-      
-      const categories: { id: string; weight: number }[] = [
-        { id: 'teorica', weight: weights.teorica.value },
-        { id: 'practica', weight: weights.practica.value },
-        { id: 'apreciativa', weight: weights.apreciativa.value }
-      ];
 
-      if (useCheckpoint) {
-        categories.push({ id: 'checkpoint', weight: weights.checkpoint.value });
-      }
-
-      // 1. Calculate General Course Grade (across all modules/evaluations)
-      let globalWeightedSum = 0;
-      let globalTotalWeightUsed = 0;
-      const globalDetails: Record<string, number> = { teorica: 0, practica: 0, apreciativa: 0, checkpoint: 0 };
-      
-      categories.forEach(cat => {
-        const typeEvals = evaluations.filter(e => e.type === cat.id);
-        const activeEvals = typeEvals.filter(ev =>
-          studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
-        );
-        if (activeEvals.length > 0) {
-          globalTotalWeightUsed += cat.weight;
-          let sumPct = 0;
-          activeEvals.forEach(ev => {
-            const grade = studentGrades.find(g => g.evaluationId === ev.id);
-            const score = grade?.score || 0;
-            const max = ev.maxScore || 100;
-            sumPct += (score / max);
-          });
-          const avg = sumPct / activeEvals.length;
-          globalWeightedSum += avg * cat.weight;
-          globalDetails[cat.id as keyof typeof globalDetails] = avg * 100;
-        }
-      });
-      const globalFinalValue = globalTotalWeightUsed > 0 ? (globalWeightedSum / globalTotalWeightUsed) * (gradingScale.maxScore || 100) : 0;
-
-      // 2. Calculate Per-Module Note
-      const moduleNotes: Record<string, number> = {};
-      
-      modules.forEach(mod => {
-        let modWeightedSum = 0;
-        let modTotalWeightUsed = 0;
-        categories.forEach(cat => {
-          const typeEvals = evaluations.filter(e => e.type === cat.id && e.moduleId === mod.id);
-          const activeEvals = typeEvals.filter(ev =>
-            studentGrades.some(g => g.evaluationId === ev.id && typeof g.score === 'number')
-          );
-          if (activeEvals.length > 0) {
-            modTotalWeightUsed += cat.weight;
-            let sumPct = 0;
-            activeEvals.forEach(ev => {
-              const grade = studentGrades.find(g => g.evaluationId === ev.id);
-              const score = grade?.score || 0;
-              const max = ev.maxScore || 100;
-              sumPct += (score / max);
-            });
-            const avg = sumPct / activeEvals.length;
-            modWeightedSum += avg * cat.weight;
-          }
-        });
-        moduleNotes[mod.id!] = modTotalWeightUsed > 0 ? (modWeightedSum / modTotalWeightUsed) * (gradingScale.maxScore || 100) : 0;
-      });
-
-      // Calculate Total Modulo Sum vs Average
-      let finalCalculated = globalFinalValue;
-      if (viewMode === 'modules' && modules.length > 0) {
-        const modValues = Object.values(moduleNotes);
-        const sum = modValues.reduce((a, b) => a + b, 0);
-        if (calculationMode === 'sum') {
-          finalCalculated = sum;
-        } else {
-          finalCalculated = sum / modValues.length;
-        }
-      }
-
-      const grades = {
-        total: Math.round(finalCalculated * 10) / 10,
-        globalBase: Math.round(globalFinalValue * 10) / 10,
-        teorica: Math.round(globalDetails.teorica * 10) / 10,
-        practica: Math.round(globalDetails.practica * 10) / 10,
-        apreciativa: Math.round(globalDetails.apreciativa * 10) / 10,
-        checkpoint: Math.round(globalDetails.checkpoint * 10) / 10,
-        byModule: moduleNotes
-      };
+      const grades = calculateStudentGrades(
+        student.id,
+        studentGrades,
+        evaluations,
+        modules,
+        useCheckpoint,
+        weights,
+        gradingScale,
+        viewMode,
+        calculationMode
+      );
 
       return {
         student,
@@ -193,16 +76,15 @@ export const GradesSummary = memo(function GradesSummary({ subjectId, onNavigate
         subject: subjects.find(s => s.id === student.subjectId)
       };
     }).sort((a, b) => b.grades.total - a.grades.total);
-  }, [students, allGrades, evaluations, subjects, weights, useCheckpoint, modules, viewMode, calculationMode]);
+  }, [students, allGrades, evaluations, subjects, weights, useCheckpoint, modules, viewMode, calculationMode, gradingScale]);
 
   if (students.length === 0 || evaluations.length === 0) return null;
 
   const isDashboard = !subjectId;
-  const top5 = isDashboard ? studentGradesList.slice(0, 5) : [];
-  const bottom5 = isDashboard ? [...studentGradesList].slice(-5).reverse() : [];
-
-  const savedScale = getStorageItem(STORAGE_KEYS.GRADING_SCALE);
-  const gradingScale = safeJSONParse(savedScale, { maxScore: 100, minPassingScore: 71 });
+  const passingStudents = isDashboard ? studentGradesList.filter(s => s.isPassing) : [];
+  const failingStudents = isDashboard ? studentGradesList.filter(s => !s.isPassing) : [];
+  const top5 = passingStudents.slice(0, 5);
+  const bottom5 = failingStudents.slice(0, 5);
 
   return (
     <div className={cn("space-y-8", !subjectId && "mt-0", subjectId && "mt-16 pt-12 border-t border-neutral-200")}>

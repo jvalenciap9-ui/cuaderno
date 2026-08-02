@@ -8,6 +8,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import type { MaterialDoc } from '../types/firestore';
 import { useAuth } from './AuthProvider';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { showToast } from '../hooks/useToast';
 import { trackEvent, ANALYTICS_CATEGORIES, ANALYTICS_ACTIONS } from '../lib/analytics';
 
 type Attachment = {
@@ -134,7 +135,7 @@ export function MaterialModal({ isOpen, onClose, subjectId, moduleId, materialTo
       onClose();
     } catch (error: unknown) {
       setIsUploading(false);
-      alert(`No se pudo guardar: ${error instanceof Error ? error.message : 'Error desconocido'}\nSi estás subiendo archivos y recibes permisos denegados, asegúrate de activar y configurar Firebase Storage correctamente.`);
+      showToast('error', `No se pudo guardar: ${error instanceof Error ? error.message : 'Error desconocido'}. Si subes archivos, verifica Firebase Storage.`);
       handleFirestoreError(error, OperationType.WRITE, 'materials');
     }
   };

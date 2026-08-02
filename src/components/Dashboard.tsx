@@ -171,7 +171,7 @@ export const Dashboard = memo(function Dashboard({ onNavigateToSubject, onNewSub
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-8">
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-4">
-            <img src="/logo.png" alt="Logo" className="w-[90px] h-[90px] object-contain bg-white rounded-xl shadow-sm p-1" onError={(e) => {
+            <img src="/logo.webp" alt="Logo" className="app-logo w-[90px] h-[90px] object-contain bg-white rounded-xl shadow-sm p-1" style={{ filter: 'none', backgroundColor: 'transparent' }} onError={(e) => {
               e.currentTarget.style.display = 'none';
             }} />
             <div>
@@ -204,7 +204,7 @@ export const Dashboard = memo(function Dashboard({ onNavigateToSubject, onNewSub
         <div className="bg-white border border-neutral-200 p-8 rounded-[2.5rem] shadow-sm hover:shadow-2xl hover:-translate-y-1 transition-all duration-500 group">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-[1.5rem] flex items-center justify-center border border-indigo-100 group-hover:scale-110 transition-transform duration-500">
-              <BookOpen className="w-8 h-8" />
+              <img src="/logo.webp" alt="Logo" className="app-logo w-8 h-8 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
             </div>
             <div>
               <p className="text-neutral-400 text-[10px] font-black uppercase tracking-[0.2em]">Asignaturas</p>

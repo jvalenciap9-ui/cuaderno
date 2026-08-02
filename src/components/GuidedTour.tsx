@@ -125,6 +125,17 @@ export function GuidedTour({
         before: async () => { await wait(MIN_STEP_MS); },
       },
       {
+        target: '#add-note-btn' as const,
+        content: 'Desde aquí puedes ingresar tu plan semanal. La IA Magic lo analiza y la información aparecerá en el Dashboard y Calificaciones.',
+        placement: 'top' as const,
+        title: '📝 Ingresar Apuntes',
+        skipBeacon: true,
+        targetWaitTimeout: 5000,
+        before: async () => {
+          await wait(MIN_STEP_MS);
+        },
+      },
+      {
         target: '#tab-students' as const,
         content: 'Aquí gestionas los participantes de tu clase. Puedes agregarlos manualmente o importarlos desde un archivo Excel o PDF.',
         placement: 'bottom' as const,

@@ -10,47 +10,66 @@ import { format, isSameDay, parseISO } from 'date-fns';
 import { es } from 'date-fns/locale';
 import { Calendar as CalendarIcon, Clock, MapPin, GraduationCap, FolderOpen, ClipboardList, Paperclip, FileText, Sparkles, Trash2, StopCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
+import type { CalendarEventDoc, NoteDoc, EvaluationDoc, MaterialDoc, SubjectDoc, SubjectModuleDoc } from '../types/firestore';
+
+interface CalendarItem {
+  id: string;
+  subjectId: string;
+  title: string;
+  date: string;
+  type: 'class' | 'exam' | 'deadline' | 'other';
+  eventType: string;
+  startTime?: string;
+  endTime?: string;
+  topic?: string;
+  description?: string;
+  order?: number;
+  color?: string;
+  maxScore?: number;
+  observations?: string;
+  moduleId?: string;
+}
 
 export const CalendarSection = memo(function CalendarSection({ subjectId }: { subjectId?: string | 'all' }) {
   const { user } = useAuth();
   
   const subjectsQuery = user?.uid ? query(collection(db, 'subjects'), where('userId', '==', user?.uid), limit(500)) : null;
-  const [subjects = [], loadingSubjects] = useCustomCollectionData(subjectsQuery);
+  const [subjects = [], loadingSubjects] = useCustomCollectionData<SubjectDoc>(subjectsQuery);
 
   const eventsRef = collection(db, 'calendarEvents');
   const eventsQuery = user?.uid ? (subjectId && subjectId !== 'all' 
     ? query(eventsRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500))
     : query(eventsRef, where('userId', '==', user?.uid), limit(500))) : null;
-  const [events = [], loadingEvents] = useCustomCollectionData(eventsQuery);
+  const [events = [], loadingEvents] = useCustomCollectionData<CalendarEventDoc>(eventsQuery);
 
   const modulesRef = collection(db, 'subjectModules');
   const modulesQuery = user?.uid ? (subjectId && subjectId !== 'all'
     ? query(modulesRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500))
     : query(modulesRef, where('userId', '==', user?.uid), limit(500))) : null;
-  const [modules = [], loadingMods] = useCustomCollectionData(modulesQuery);
+  const [modules = [], loadingMods] = useCustomCollectionData<SubjectModuleDoc>(modulesQuery);
 
   const evalsRef = collection(db, 'evaluations');
   const evalsQuery = user?.uid ? (subjectId && subjectId !== 'all'
     ? query(evalsRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500))
     : query(evalsRef, where('userId', '==', user?.uid), limit(500))) : null;
-  const [evaluations = [], loadingEvals] = useCustomCollectionData(evalsQuery);
+  const [evaluations = [], loadingEvals] = useCustomCollectionData<EvaluationDoc>(evalsQuery);
 
   const materialsRef = collection(db, 'materials');
   const materialsQuery = user?.uid ? (subjectId && subjectId !== 'all'
     ? query(materialsRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500))
     : query(materialsRef, where('userId', '==', user?.uid), limit(500))) : null;
-  const [materials = [], loadingMats] = useCustomCollectionData(materialsQuery);
+  const [materials = [], loadingMats] = useCustomCollectionData<MaterialDoc>(materialsQuery);
 
   const notesRef = collection(db, 'notes');
   const notesQuery = user?.uid ? (subjectId && subjectId !== 'all'
     ? query(notesRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500))
     : query(notesRef, where('userId', '==', user?.uid), limit(500))) : null;
-  const [notes = [], loadingNotes] = useCustomCollectionData(notesQuery);
+  const [notes = [], loadingNotes] = useCustomCollectionData<NoteDoc>(notesQuery);
 
   const [selectedDate, setSelectedDate] = React.useState<Date>(new Date());
   const [confirmingEventId, setConfirmingEventId] = React.useState<string | null>(null);
 
-  const allEvents = [
+  const allEvents: CalendarItem[] = [
     ...events.filter(e => subjects.some(s => s.id === e.subjectId)).map(e => ({ ...e, id: `event-${e.id}`, eventType: 'calendar' as const })),
     ...notes.filter(n => subjects.some(s => s.id === n.subjectId)).map(n => ({
       id: `note-${n.id}`,
@@ -66,10 +85,12 @@ export const CalendarSection = memo(function CalendarSection({ subjectId }: { su
     ...evaluations.filter(ev => subjects.some(s => s.id === ev.subjectId)).map(ev => ({ 
       id: `eval-${ev.id}`, 
       subjectId: ev.subjectId, 
-      title: `Evaluación: ${ev.title}`, 
+      title: `${ev.title}`,
       date: ev.date, 
       type: 'exam' as const,
-      eventType: 'evaluation' as const
+      eventType: 'evaluation' as const,
+      maxScore: ev.maxScore,
+      moduleId: ev.moduleId
     })),
     ...materials.filter(m => m.date && subjects.some(s => s.id === m.subjectId)).map(m => ({
       id: `mat-${m.id}`,
@@ -244,7 +265,7 @@ export const CalendarSection = memo(function CalendarSection({ subjectId }: { su
                 if (dayEvents.length > 0) {
                   // Get unique colors for the day's events
                   const eventColors = Array.from(new Set(dayEvents.map(e => {
-                    if (e.eventType === 'extracted') return (e).color;
+                    if (e.eventType === 'extracted') return e.color;
                     const subject = subjects.find(s => s.id === e.subjectId);
                     return subject?.color || '#4f46e5';
                   }))).slice(0, 3); // Max 3 dots per day to fit
@@ -281,85 +302,100 @@ export const CalendarSection = memo(function CalendarSection({ subjectId }: { su
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {dayEvents.map((ev, idx) => {
-                    const subject = (subjects || []).find(s => s.id === ev.subjectId);
-                    const color = (ev).color || subject?.color || '#3b82f6';
-                    const time = (ev).startTime || '';
-                    const typeLabels: Record<string, string> = {
-                      calendar: 'Calendario',
-                      module_start: 'Inicio Módulo',
-                      module_end: 'Fin Módulo',
-                      subject_start: 'Inicio Asignatura',
-                      subject_end: 'Fin Asignatura',
-                      extracted: 'AI Mágica'
-                    };
-                    const typeLabel = typeLabels[ev.eventType] || 'Evento';
-                    
+                  {(() => {
+                    const subjectMap = new Map<string, { id: string; name: string; color: string }>();
+                    dayEvents.forEach(e => {
+                      if (!e.subjectId) return;
+                      if (subjectMap.has(e.subjectId)) return;
+                      const sub = (subjects || []).find(s => s.id === e.subjectId);
+                      if (sub) subjectMap.set(sub.id, { id: sub.id, name: sub.name, color: sub.color });
+                    });
+                    const daySubjects = [...subjectMap.values()];
+                    const dayTopics = [...new Set(dayEvents.map(e => e.topic).filter(Boolean))];
+                    const sorted = [...dayEvents].sort((a, b) => {
+                      const aIsEval = a.eventType === 'evaluation' ? -1 : 1;
+                      const bIsEval = b.eventType === 'evaluation' ? -1 : 1;
+                      if (aIsEval !== bIsEval) return aIsEval - bIsEval;
+                      const aOrder = a.order ?? 99;
+                      const bOrder = b.order ?? 99;
+                      if (aOrder !== bOrder) return aOrder - bOrder;
+                      const aTime = a.startTime || '';
+                      const bTime = b.startTime || '';
+                      return aTime.localeCompare(bTime);
+                    });
                     return (
-                      <div 
-                        key={ev.id || idx} 
-                        className="group relative flex flex-col p-4 bg-white border border-neutral-200 hover:border-neutral-300 rounded-2xl transition-all shadow-sm hover:shadow-md"
-                      >
-                        {/* Indicador de Color */}
-                        <div 
-                          className="absolute -left-px top-4 bottom-4 w-1 rounded-r opacity-70"
-                          style={{ backgroundColor: color }}
-                        />
-                        
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="flex flex-col min-w-0 flex-1 pl-2">
-                            <span className="text-[10px] font-black uppercase tracking-widest text-neutral-400 mb-1">
-                              {typeLabel} {time ? `• ${time}` : ''}
-                            </span>
-                            <span className="font-bold text-neutral-900 leading-tight">
-                              {ev.title}
-                            </span>
-                          </div>
-                          
-                          {(['calendar', 'extracted', 'evaluation', 'material', 'note'].includes(ev.eventType)) && (
-                            confirmingEventId === ev.id ? (
-                              <div className="flex items-center gap-2">
-                                <button
-                                  onClick={() => setConfirmingEventId(null)}
-                                  className="text-[10px] font-bold text-neutral-500 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 px-3 py-1.5 rounded-lg transition-colors"
-                                >
-                                  Cancelar
-                                </button>
-                                <button
-                                  onClick={async () => {
-                                    const actualId = (ev.id as string).split('-').slice(1).join('-');
-                                    if (ev.eventType === 'calendar') {
-                                      await deleteDoc(doc(db, 'calendarEvents', actualId));
-                                    } else if (ev.eventType === 'extracted') {
-                                      // kept for backwards compat
-                                    } else if (ev.eventType === 'evaluation') {
-                                      await deleteDoc(doc(db, 'evaluations', actualId));
-                                    } else if (ev.eventType === 'material') {
-                                      await deleteDoc(doc(db, 'materials', actualId));
-                                    } else if (ev.eventType === 'note') {
-                                      await deleteDoc(doc(db, 'notes', actualId));
-                                    }
-                                    setConfirmingEventId(null);
-                                  }}
-                                  className="text-[10px] font-bold text-white hover:bg-red-700 bg-red-600 px-3 py-1.5 rounded-lg transition-colors"
-                                >
-                                  Borrar
-                                </button>
+                      <>
+                        {(daySubjects.length > 0 || dayTopics.length > 0) && (
+                          <div className="p-4 bg-gradient-to-br from-indigo-50 to-purple-50 border border-indigo-100 rounded-2xl">
+                            {daySubjects.map(s => s && (
+                              <div key={s.id} className="flex items-center gap-2 mb-1">
+                                <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: s.color }} />
+                                <span className="text-xs font-bold text-neutral-700 uppercase tracking-wider">{s.name}</span>
                               </div>
-                            ) : (
-                              <button
-                                onClick={() => setConfirmingEventId(ev.id)}
-                                className="p-2 text-red-400 opacity-0 group-hover:opacity-100 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all shrink-0"
-                                title="Eliminar evento"
-                              >
-                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
-                              </button>
-                            )
-                          )}
+                            ))}
+                            {dayTopics.map((t, i) => (
+                              <span key={i} className="inline-block text-[10px] font-bold text-indigo-600 bg-indigo-100 px-2.5 py-1 rounded-full mr-1.5 mb-1">
+                                {t}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        <div className="space-y-4">
+                          {sorted.map((ev, idx) => {
+                            const subject = (subjects || []).find(s => s.id === ev.subjectId);
+                            const color = ev.color || subject?.color || (ev.eventType === 'evaluation' ? '#dc2626' : '#3b82f6');
+                            const time = ev.startTime || '';
+                            const topic = ev.topic || '';
+                            const description = ev.description || '';
+                            const typeLabels: Record<string, string> = {
+                              calendar: 'Calendario',
+                              module_start: 'Inicio Módulo',
+                              module_end: 'Fin Módulo',
+                              subject_start: 'Inicio Asignatura',
+                              subject_end: 'Fin Asignatura',
+                              extracted: 'AI Mágica',
+                              evaluation: '📝 Evaluación'
+                            };
+                            const typeLabel = typeLabels[ev.eventType] || 'Evento';
+                            return (
+                              <div key={ev.id || idx} className="group relative flex flex-col p-4 bg-white border border-neutral-200 hover:border-neutral-300 rounded-2xl transition-all shadow-sm hover:shadow-md">
+                                <div className="absolute -left-px top-4 bottom-4 w-1 rounded-r opacity-70" style={{ backgroundColor: color }} />
+                                <div className="flex items-start justify-between gap-4">
+                                  <div className="flex flex-col min-w-0 flex-1 pl-2">
+                                    <span className="text-[10px] font-black uppercase tracking-widest text-neutral-400 mb-1">{typeLabel} {time ? `• ${time}` : ''}</span>
+                                    {topic && <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider mb-0.5">{topic}</span>}
+                                    <span className="font-bold text-neutral-900 leading-tight">{ev.title}</span>
+                                    {ev.maxScore && <span className="text-[10px] font-bold text-red-600 uppercase tracking-wider mt-0.5">Puntaje máximo: {ev.maxScore} pts</span>}
+                                    {description && <span className="text-xs text-neutral-500 mt-1 leading-relaxed">{description}</span>}
+                                  </div>
+                                  {(['calendar', 'extracted', 'evaluation', 'material', 'note'].includes(ev.eventType)) && (
+                                    confirmingEventId === ev.id ? (
+                                      <div className="flex items-center gap-2 shrink-0">
+                                        <button onClick={() => setConfirmingEventId(null)} className="text-[10px] font-bold text-neutral-500 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 px-3 py-1.5 rounded-lg transition-colors">Cancelar</button>
+                                        <button onClick={async () => {
+                                          const actualId = (ev.id as string).split('-').slice(1).join('-');
+                                          if (ev.eventType === 'calendar') await deleteDoc(doc(db, 'calendarEvents', actualId));
+                                          else if (ev.eventType === 'extracted') {}
+                                          else if (ev.eventType === 'evaluation') await deleteDoc(doc(db, 'evaluations', actualId));
+                                          else if (ev.eventType === 'material') await deleteDoc(doc(db, 'materials', actualId));
+                                          else if (ev.eventType === 'note') await deleteDoc(doc(db, 'notes', actualId));
+                                          setConfirmingEventId(null);
+                                        }} className="text-[10px] font-bold text-white hover:bg-red-700 bg-red-600 px-3 py-1.5 rounded-lg transition-colors">Borrar</button>
+                                      </div>
+                                    ) : (
+                                      <button onClick={() => setConfirmingEventId(ev.id)} className="p-2 text-red-400 opacity-0 group-hover:opacity-100 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all shrink-0" title="Eliminar evento">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+                                      </button>
+                                    )
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
-                      </div>
+                      </>
                     );
-                  })}
+                  })()}
                 </div>
               )}
             </div>
