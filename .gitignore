@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Secretos / config sensible — nunca commitear
+firebase-applet-config.json
+firebase-applet-config.rar
+gemini_key.txt
+.firebase/
+firebase functions.json
+"firebase init functions.js"
