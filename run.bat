@@ -11,5 +11,5 @@ echo Ejecutando TypeScript check...
 call npm run lint
 echo.
 echo Iniciando servidor de desarrollo...
-call npm run dev
+call npm run dev:full
 pause

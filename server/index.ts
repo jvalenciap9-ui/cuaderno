@@ -86,8 +86,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // ── Validar que la API Key existe ────────────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 if (!GEMINI_API_KEY) {
-  console.error('❌ ERROR: GEMINI_API_KEY no está configurada en .env.local');
-  console.error('   Crea el archivo .env.local con: GEMINI_API_KEY=tu_key_aqui');
+  console.error('❌ ERROR: GEMINI_API_KEY no está configurada en .env');
+  console.error('   Crea el archivo .env con: GEMINI_API_KEY=tu_key_aqui');
 }
 
 // ── Health check ─────────────────────────────────────────────────────────────

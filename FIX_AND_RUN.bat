@@ -21,5 +21,5 @@ if errorlevel 1 (
 )
 echo.
 echo [4/4] Starting development server on http://localhost:3000...
-call npm run dev
+call npm run dev:full
 pause
