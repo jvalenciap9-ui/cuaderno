@@ -13,6 +13,8 @@ import { useAuth } from '../components/AuthProvider';
 
 export type PlanType = 'free' | 'pro' | 'school';
 
+export type UserRole = 'teacher' | 'admin';
+
 export interface UserProfile {
   plan: PlanType;
   email: string | null;
@@ -21,12 +23,19 @@ export interface UserProfile {
   createdAt: unknown;
   aiCallsThisMonth: number;
   aiCallsResetAt: number;
+  role?: UserRole;
+  institutionId?: string;
+  institutionName?: string;
+  lastLoginAt?: number;
   paymentProvider?: string;
   paymentSessionId?: string;
   paymentAmount?: number;
   subscriptionId?: string;
   expiresAt?: number;
   updatedAt?: unknown;
+  isTrial?: boolean;
+  trialEndsAt?: number;
+  trialUsed?: boolean;
 }
 
 export const PLAN_LIMITS: Record<PlanType, { maxSubjects: number; aiCallsPerMonth: number; label: string }> = {
@@ -90,13 +99,23 @@ export function usePlan() {
     return () => unsubscribe();
   }, [user]);
 
-  const plan = profile?.plan || 'free';
+  // MEDIUM-6: espejo de HR-01 en el cliente — un trial expirado cuenta como
+  // free a efectos de límites (el 'pro' prestado por la prueba no se mantiene),
+  // salvo que el usuario haya pagado (paymentProvider != 'trial').
+  const rawPlan = profile?.plan || 'free';
+  const now = Date.now();
+  const paidUser = !!profile?.paymentProvider && profile.paymentProvider !== 'trial';
+  const trialExpired = profile?.isTrial === true
+    && !paidUser
+    && typeof profile.trialEndsAt === 'number'
+    && profile.trialEndsAt <= now;
+  const plan: PlanType = trialExpired ? 'free' : rawPlan;
   const limits = PLAN_LIMITS[plan];
+  const isAdmin = profile?.role === 'admin';
 
   const canUseAI = () => {
     if (!profile) return false;
     // Verificar si hay que resetear el contador mensual
-    const now = Date.now();
     const resetAt = profile.aiCallsResetAt || 0;
     const oneMonth = 30 * 24 * 60 * 60 * 1000;
     if (now - resetAt > oneMonth) return true; // Se reseteará en el servidor
@@ -116,5 +135,6 @@ export function usePlan() {
     canCreateSubject,
     isPro: plan === 'pro' || plan === 'school',
     isSchool: plan === 'school',
+    isAdmin,
   };
 }

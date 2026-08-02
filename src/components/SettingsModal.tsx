@@ -1,47 +1,186 @@
 import { format } from 'date-fns';
 import React, { useState } from 'react';
-import { X, Settings, Shield, Zap, CreditCard, Bell, Database, Trash2, Download, FileText, BarChart3, Info } from 'lucide-react';
+import { X, Settings, Shield, Zap, CreditCard, Bell, Database, Trash2, Download, FileText, BarChart3, Info, Heart, Key, AlertCircle, Loader2, Check, Layers } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { db, auth } from '../lib/firebase';
-import { collection, query, where, getDocs, writeBatch, doc, limit } from 'firebase/firestore';
+import { collection, query, where, getDocs, writeBatch, doc, limit, orderBy, startAfter, setDoc, getDoc } from 'firebase/firestore';
+import { db as dexieDb } from '../lib/db';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { getFunctions, httpsCallable } from 'firebase/functions';
+import { usePlan } from '../hooks/usePlan';
+import { showToast } from '../hooks/useToast';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  initialTab?: 'general' | 'advanced' | 'billing';
 }
 
 import { safeJSONParse } from '../lib/utils';
 import { STORAGE_KEYS, getStorageItem, setStorageItem } from '../lib/storageKeys';
+import { useGradeSettings } from '../contexts/GradeSettingsContext';
+import { parseWeights, calculateStudentGrades } from '../lib/gradeCalculator';
+import { addSubjectCounterOp } from '../lib/subjectCounter';
 
-export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<'general' | 'advanced' | 'billing'>('general');
+export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProps) {
+  const { plan: dbPlan, profile, limits } = usePlan();
+  const [activeTab, setActiveTab] = useState<'general' | 'advanced' | 'billing'>(initialTab || 'general');
+  
+  const [sandboxMode, setSandboxMode] = useState<boolean>(() => {
+    return getStorageItem('ediagil_sandbox_mode') === 'true';
+  });
+
   const [activeSubscription, setActiveSubscription] = useState<'free' | 'pro' | 'school'>(() => {
     return (getStorageItem(STORAGE_KEYS.ACTIVE_SUBSCRIPTION) as 'free' | 'pro' | 'school') || 'free';
   });
+
+  // Mantener sincronizado el estado local con la base de datos si NO estamos en sandbox mode
+  React.useEffect(() => {
+    if (!sandboxMode && dbPlan) {
+      setActiveSubscription(dbPlan);
+    }
+  }, [dbPlan, sandboxMode]);
+
+  const functions = getFunctions();
+  const profileAny = profile as unknown as { isTrial?: boolean; trialEndsAt?: number; trialUsed?: boolean };
+  // WR-01: isTrial derivado del perfil RAW (no de dbPlan derivado), para que un
+  // trial expirado (cuyo plan derivado ya es 'free') pueda resolverse.
+  const isTrial = profileAny?.isTrial === true && dbPlan === 'pro';
+  const rawTrial = profileAny?.isTrial === true;
+  const trialEndsAt = typeof profileAny?.trialEndsAt === 'number' ? profileAny.trialEndsAt : undefined;
+  const trialDaysLeft = trialEndsAt !== undefined ? Math.ceil((trialEndsAt - Date.now()) / 86400000) : 0;
 
   const handleSelectPlan = (plan: 'free' | 'pro' | 'school') => {
     setActiveSubscription(plan);
     setStorageItem(STORAGE_KEYS.ACTIVE_SUBSCRIPTION, plan);
     window.dispatchEvent(new Event('subscription_change'));
   };
+
+  const handleToggleSandbox = (val: boolean) => {
+    setSandboxMode(val);
+    setStorageItem('ediagil_sandbox_mode', String(val));
+    if (!val && dbPlan) {
+      handleSelectPlan(dbPlan);
+    }
+  };
+
+  const [licenseKey, setLicenseKey] = useState('');
+  const [licenseLoading, setLicenseLoading] = useState(false);
+  const [licenseStatus, setLicenseStatus] = useState<{ type: 'success' | 'error' | '', message: string }>({ type: '', message: '' });
+  const [checkoutLoading, setCheckoutLoading] = useState<'pro' | 'school' | null>(null);
+  const [trialLoading, setTrialLoading] = useState(false);
+  const [portalLoading, setPortalLoading] = useState(false);
+  const [institutionName, setInstitutionName] = useState('');
+
+  const handleManageSubscription = async () => {
+    setPortalLoading(true);
+    try {
+      const user = auth.currentUser;
+      if (!user) throw new Error('Debes iniciar sesión');
+      const token = await user.getIdToken();
+      const res = await fetch('/api/create-portal', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error al abrir portal');
+      if (data.url) window.open(data.url, '_blank');
+    } catch (err: any) {
+      showToast('error', err?.message || 'Error al abrir el portal de suscripción');
+    } finally {
+      setPortalLoading(false);
+    }
+  };
+
+  const handleCheckout = async (plan: 'pro' | 'school') => {
+    setCheckoutLoading(plan);
+    try {
+      const user = auth.currentUser;
+      if (!user) throw new Error('Debes iniciar sesión');
+      const token = await user.getIdToken();
+
+      const res = await fetch('/api/create-checkout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ plan, ...(plan === 'school' && institutionName.trim() ? { institutionName: institutionName.trim() } : {}) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error del servidor');
+      if (data.url) window.location.href = data.url;
+    } catch (err: any) {
+      console.error('❌ Checkout error:', err);
+      showToast('error', err?.message || 'Error al iniciar el pago. Intenta de nuevo.');
+    } finally {
+      setCheckoutLoading(null);
+    }
+  };
+
+  const handleActivateTrial = async () => {
+    setTrialLoading(true);
+    try {
+      const fn = httpsCallable(functions, 'activateTrial');
+      await fn();
+      showToast('success', '¡Tu prueba gratuita de Premium Pro (14 días) está activa!');
+    } catch (err: any) {
+      console.error('❌ Error activando prueba gratuita:', err);
+      showToast('error', err?.message || 'No se pudo activar la prueba gratuita. Intenta de nuevo.');
+    } finally {
+      setTrialLoading(false);
+    }
+  };
+
+  const resolveExpiredTrial = async () => {
+    try {
+      const fn = httpsCallable(functions, 'resolveTrialExpiry');
+      await fn();
+    } catch {}
+  };
+
+  React.useEffect(() => {
+    if (!sandboxMode && rawTrial && trialEndsAt !== undefined && trialEndsAt < Date.now()) {
+      resolveExpiredTrial();
+    }
+  }, [sandboxMode, rawTrial, trialEndsAt]);
+
+  const handleRedeemKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!licenseKey.trim()) return;
+    setLicenseLoading(true);
+    setLicenseStatus({ type: '', message: '' });
+
+    try {
+      const redeemKeyFn = httpsCallable<{ key: string }, { success: boolean; plan: 'free' | 'pro' | 'school'; message: string }>(functions, 'redeemLicenseKey');
+      const result = await redeemKeyFn({ key: licenseKey });
+      
+      if (result.data?.success) {
+        setLicenseStatus({ type: 'success', message: result.data.message });
+        setLicenseKey('');
+        handleSelectPlan(result.data.plan);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setLicenseStatus({ 
+        type: 'error', 
+        message: err?.message || 'Error al canjear el código. Verifica que sea correcto.' 
+      });
+    } finally {
+      setLicenseLoading(false);
+    }
+  };
+
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  const [weights, setWeights] = useState({
-    teorica: { name: 'Teórica', value: 30 },
-    practica: { name: 'Práctica', value: 60 },
-    apreciativa: { name: 'Apreciativa', value: 10 },
-    checkpoint: { name: 'Agregar 4ta Nota', value: 0 }
-  });
-  const [useCheckpoint, setUseCheckpoint] = useState(false);
   const [isConfirmingClear, setIsConfirmingClear] = useState(false);
   const [isConfirmingClearCalendar, setIsConfirmingClearCalendar] = useState(false);
   const [isConfirmingClearEvaluations, setIsConfirmingClearEvaluations] = useState(false);
   const [importData, setImportData] = useState<any>(null);
-  const [gradingScale, setGradingScale] = useState({
-    maxScore: 100,
-    minPassingScore: 71
-  });
+  const { viewMode, calculationMode, weights, gradingScale, useCheckpoint, setViewMode, setCalculationMode, setWeights, setGradingScale, setUseCheckpoint } = useGradeSettings();
 
   const handleUpdateWeight = (type: keyof typeof weights, field: 'name' | 'value', value: string) => {
     const newWeights = { ...weights };
@@ -51,80 +190,80 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       newWeights[type].name = value;
     }
     setWeights(newWeights);
-    setStorageItem(STORAGE_KEYS.GRADING_WEIGHTS, JSON.stringify(newWeights));
-    // Dispatch storage event so other components can update
-    window.dispatchEvent(new Event('storage'));
   };
 
-  React.useEffect(() => {
-    const saved = getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS);
-    if (saved) {
-      const parsed = safeJSONParse<any>(saved, null);
-      if (parsed) {
-        const migratedWeights = { ...weights };
-        let needsMigration = false;
-
-        (['teorica', 'practica', 'apreciativa', 'checkpoint'] as const).forEach(key => {
-          if (parsed[key] !== undefined) {
-            if (typeof parsed[key] === 'number') {
-              migratedWeights[key].value = parsed[key];
-              needsMigration = true;
-            } else if (typeof parsed[key] === 'object' && parsed[key] !== null) {
-              migratedWeights[key].value = typeof parsed[key].value === 'number' ? parsed[key].value : (parseFloat(String(parsed[key].value)) || migratedWeights[key].value);
-              migratedWeights[key].name = parsed[key].name ?? migratedWeights[key].name;
-            }
-          }
-        });
-
-        setWeights(migratedWeights);
-        if (needsMigration) {
-          setStorageItem(STORAGE_KEYS.GRADING_WEIGHTS, JSON.stringify(migratedWeights));
-        }
-      }
-    }
-    
-    const savedCheckpoint = getStorageItem(STORAGE_KEYS.USE_CHECKPOINT);
-    if (savedCheckpoint) setUseCheckpoint(safeJSONParse(savedCheckpoint, false));
-
-    const savedScale = getStorageItem(STORAGE_KEYS.GRADING_SCALE);
-    if (savedScale) setGradingScale(safeJSONParse(savedScale, { maxScore: 100, minPassingScore: 71 }));
-  }, []);
-
   const toggleCheckpoint = () => {
-    const newValue = !useCheckpoint;
-    setUseCheckpoint(newValue);
-    setStorageItem(STORAGE_KEYS.USE_CHECKPOINT, JSON.stringify(newValue));
-    window.dispatchEvent(new Event('storage'));
+    setUseCheckpoint(!useCheckpoint);
   };
 
   const handleUpdateScale = (field: 'maxScore' | 'minPassingScore', value: string) => {
     const newScale = { ...gradingScale, [field]: parseFloat(value) || 0 };
     setGradingScale(newScale);
-    setStorageItem(STORAGE_KEYS.GRADING_SCALE, JSON.stringify(newScale));
+  };
+
+  const getAllDocsForUser = async (colName: string, subjectId?: string) => {
+    if (!auth.currentUser) return [];
+    const uid = auth.currentUser.uid;
+    const allDocs: Record<string, any>[] = [];
+    let lastDoc: any = null;
+    for (;;) {
+      let q = query(collection(db, colName), where('userId', '==', uid));
+      if (subjectId) q = query(q, where('subjectId', '==', subjectId));
+      q = query(q, orderBy('__name__', 'asc'));
+      if (lastDoc) q = query(q, startAfter(lastDoc));
+      const snaps = await getDocs(q);
+      if (snaps.docs.length === 0) break;
+      allDocs.push(...snaps.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      lastDoc = snaps.docs[snaps.docs.length - 1];
+    }
+    return allDocs;
   };
 
   const getDocsForUser = async (colName: string) => {
-    if (!auth.currentUser) return [];
-    const q = query(collection(db, colName), where('userId', '==', auth.currentUser.uid), limit(500));
-    const snaps = await getDocs(q);
-    return snaps.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    return getAllDocsForUser(colName);
   };
 
   const clearCollection = async (colName: string) => {
     if (!auth.currentUser) return;
-    const q = query(collection(db, colName), where('userId', '==', auth.currentUser.uid), limit(500));
-    const snaps = await getDocs(q);
-    let batch = writeBatch(db);
-    let count = 0;
-    for (const d of snaps.docs) {
-      batch.delete(d.ref);
-      count++;
-      if (count % 400 === 0) {
-        await batch.commit();
-        batch = writeBatch(db);
+    const uid = auth.currentUser.uid;
+    let lastDoc: any = null;
+    for (;;) {
+      let q = query(collection(db, colName), where('userId', '==', uid), orderBy('__name__', 'asc'));
+      if (lastDoc) q = query(q, startAfter(lastDoc));
+      const snaps = await getDocs(q);
+      if (snaps.docs.length === 0) break;
+      let batch = writeBatch(db);
+      let count = 0;
+      for (const d of snaps.docs) {
+        batch.delete(d.ref);
+        count++;
+        if (count % 400 === 0) {
+          await batch.commit();
+          batch = writeBatch(db);
+        }
       }
+      if (count % 400 !== 0) await batch.commit();
+      lastDoc = snaps.docs[snaps.docs.length - 1];
     }
-    if (count % 400 !== 0) await batch.commit();
+    if (colName === 'subjects') {
+      const resetRef = doc(db, 'userCounters', uid);
+      const now = Date.now();
+      const existingCounter = await getDoc(resetRef);
+      let writes = 1;
+      let writeWindowStart = now;
+      const prev = existingCounter.exists() ? existingCounter.data() : null;
+      if (prev && typeof prev.writeWindowStart === 'number' && prev.writeWindowStart + 60000 > now && typeof prev.writes === 'number') {
+        writes = prev.writes + 1;
+        writeWindowStart = prev.writeWindowStart;
+      }
+      // C8: el reset a 0 preserva el cupo del año (createdThisYear/yearKey),
+      // coherente con "borrar una asignatura NO libera cupo del año".
+      const year = String(new Date().getFullYear());
+      const createdThisYear = prev && typeof prev.createdThisYear === 'number' && prev.createdThisYear >= 0
+        ? prev.createdThisYear : 0;
+      const yearKey = prev && typeof prev.yearKey === 'string' && prev.yearKey.length > 0 ? prev.yearKey : year;
+      await setDoc(resetRef, { subjectCount: 0, createdThisYear, yearKey, updatedAt: now, writes, writeWindowStart }, { merge: true });
+    }
   };
 
   const triggerAllQueries = async () => {
@@ -159,12 +298,26 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         }
       }
     }
-    alert('Diagnóstico completado. Revisa la consola del navegador. Si hace falta crear algún Índice Compuesto, Firestore habrá impreso allí los enlaces directos correspondientes. ¡Presiónalos todos para solucionarlo de inmediato!');
+    showToast('success', 'Diagnóstico completado. Revisa la consola del navegador. Si hay índices compuestos pendientes, Firestore mostrará los enlaces en la consola.');
   };
 
-  const handleExportData = async () => {
-    if (!auth.currentUser) return;
-    const data = {
+  const buildExportData = async () => {
+    const settings = {
+      gradingWeights: parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS)),
+      gradingScale: safeJSONParse(getStorageItem(STORAGE_KEYS.GRADING_SCALE), { maxScore: 100, minPassingScore: 71 }),
+      useCheckpoint: safeJSONParse(getStorageItem(STORAGE_KEYS.USE_CHECKPOINT), false),
+      viewMode: (getStorageItem(STORAGE_KEYS.GRADING_VIEW_MODE) || 'categories') as string,
+      calculationMode: (getStorageItem(STORAGE_KEYS.GRADING_CALCULATION_MODE) || 'average') as string,
+    };
+
+    const [extractedEvents, uploadedDocs] = await Promise.all([
+      dexieDb.extractedEvents.toArray(),
+      dexieDb.uploadedDocs.toArray(),
+    ]);
+
+    return {
+      version: '2.0',
+      exportedAt: new Date().toISOString(),
       subjects: await getDocsForUser('subjects'),
       notes: await getDocsForUser('notes'),
       students: await getDocsForUser('students'),
@@ -173,16 +326,32 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       attendance: await getDocsForUser('attendance'),
       materials: await getDocsForUser('materials'),
       modules: await getDocsForUser('subjectModules'),
-      calendarEvents: await getDocsForUser('calendarEvents')
+      calendarEvents: await getDocsForUser('calendarEvents'),
+      extractedEvents,
+      uploadedDocs,
+      settings,
     };
-    
+  };
+
+  const triggerJSONDownload = (data: unknown, filename: string) => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `mi-cuaderno-backup-${format(new Date(), 'yyyy-MM-dd')}.json`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const handleExportData = async () => {
+    if (!auth.currentUser) return;
+    const data = await buildExportData();
+    triggerJSONDownload(data, `mi-cuaderno-backup-${format(new Date(), 'yyyy-MM-dd')}.json`);
+  };
+
+  const autoBackupBeforeImport = async () => {
+    const data = await buildExportData();
+    triggerJSONDownload(data, `respaldo-automatico-pre-import-${format(new Date(), 'yyyy-MM-dd')}.json`);
   };
 
   const handleImportData = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -203,11 +372,85 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const applySettings = async (settings: any) => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+
+    if (settings.gradingWeights !== undefined) setStorageItem(STORAGE_KEYS.GRADING_WEIGHTS, JSON.stringify(settings.gradingWeights));
+    if (settings.gradingScale !== undefined) setStorageItem(STORAGE_KEYS.GRADING_SCALE, JSON.stringify(settings.gradingScale));
+    if (settings.useCheckpoint !== undefined) setStorageItem(STORAGE_KEYS.USE_CHECKPOINT, JSON.stringify(settings.useCheckpoint));
+    if (settings.viewMode !== undefined) setStorageItem(STORAGE_KEYS.GRADING_VIEW_MODE, String(settings.viewMode));
+    if (settings.calculationMode !== undefined) setStorageItem(STORAGE_KEYS.GRADING_CALCULATION_MODE, String(settings.calculationMode));
+
+    const fsDoc: Record<string, unknown> = {};
+    if (settings.viewMode !== undefined) fsDoc.gradingViewMode = settings.viewMode;
+    if (settings.calculationMode !== undefined) fsDoc.gradingCalculationMode = settings.calculationMode;
+    if (settings.gradingWeights !== undefined) fsDoc.weights = settings.gradingWeights;
+    if (settings.gradingScale !== undefined) fsDoc.gradingScale = settings.gradingScale;
+    if (settings.useCheckpoint !== undefined) fsDoc.useCheckpoint = settings.useCheckpoint;
+
+    try {
+      if (Object.keys(fsDoc).length > 0) {
+        await setDoc(doc(db, 'userSettings', uid), fsDoc, { merge: true });
+      }
+    } catch (e) {
+      console.warn('Error saving settings to Firestore:', e);
+    }
+    window.dispatchEvent(new Event('storage'));
+  };
+
+  const restoreLocalTables = async (data: any) => {
+    const convertDateFields = (records: any[], fields: string[]) =>
+      (records || []).map((r: any) => {
+        const out = { ...r };
+        for (const f of fields) {
+          if (typeof out[f] === 'string' && out[f] && !isNaN(Date.parse(out[f]))) {
+            out[f] = new Date(out[f]);
+          }
+        }
+        return out;
+      });
+
+    if (Array.isArray(data.extractedEvents)) {
+      try {
+        await dexieDb.extractedEvents.bulkPut(convertDateFields(data.extractedEvents, ['startDate', 'endDate']));
+      } catch (e) {
+        console.warn('Error restoring extractedEvents:', e);
+      }
+    }
+    if (Array.isArray(data.uploadedDocs)) {
+      try {
+        await dexieDb.uploadedDocs.bulkPut(convertDateFields(data.uploadedDocs, ['processedAt']));
+      } catch (e) {
+        console.warn('Error restoring uploadedDocs:', e);
+      }
+    }
+  };
+
   const confirmImport = async () => {
     if (!importData || !auth.currentUser) return;
     try {
+      const data = importData;
+
+      if (!data || typeof data !== 'object') {
+        showToast('error', 'El archivo no tiene un formato de respaldo válido.');
+        setImportData(null);
+        return;
+      }
+
+      const hasModules = Array.isArray(data.modules) || Array.isArray(data.subjectModules);
+      const requiredKeys = ['subjects', 'notes', 'students', 'evaluations', 'grades', 'attendance', 'materials', 'calendarEvents'];
+      const validStructure = hasModules && requiredKeys.every(key => Array.isArray(data[key]));
+      if (!validStructure) {
+        showToast('error', 'El archivo no tiene un formato de respaldo válido de EdiAgil.');
+        setImportData(null);
+        return;
+      }
+
+      await autoBackupBeforeImport();
+      showToast('info', 'Se descargó un respaldo automático antes de importar. Guárdalo por seguridad.');
+
       const collections = ['subjects', 'notes', 'students', 'evaluations', 'grades', 'attendance', 'materials', 'subjectModules', 'calendarEvents'];
-      
       await Promise.all(collections.map(col => clearCollection(col)));
 
       const importCol = async (dataList: Record<string, unknown>[], colName: string) => {
@@ -230,20 +473,42 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         if (count % 400 !== 0) await batch.commit();
       };
 
-      if (importData.subjects) await importCol(importData.subjects, 'subjects');
-      if (importData.notes) await importCol(importData.notes, 'notes');
-      if (importData.students) await importCol(importData.students, 'students');
-      if (importData.evaluations) await importCol(importData.evaluations, 'evaluations');
-      if (importData.grades) await importCol(importData.grades, 'grades');
-      if (importData.attendance) await importCol(importData.attendance, 'attendance');
-      if (importData.materials) await importCol(importData.materials, 'materials');
-      if (importData.modules) await importCol(importData.modules, 'subjectModules');
-      if (importData.calendarEvents) await importCol(importData.calendarEvents, 'calendarEvents');
+      // Las asignaturas se importan una a la vez: la regla de seguridad exige que
+      // el contador `userCounters/{uid}` se incremente exactamente +1 por asignatura
+      // en el mismo batch, así que no se pueden importar varias en un único batch.
+      if (data.subjects) {
+        for (const subject of data.subjects) {
+          const docId = typeof subject.id === 'string' ? subject.id : undefined;
+          const { id, ...subjectToSave } = subject;
+          subjectToSave.userId = auth.currentUser!.uid;
+          const subjRef = docId ? doc(db, 'subjects', docId) : doc(collection(db, 'subjects'));
+          const subjBatch = writeBatch(db);
+          subjBatch.set(subjRef, subjectToSave);
+          await addSubjectCounterOp(subjBatch, auth.currentUser!.uid, +1);
+          await subjBatch.commit();
+        }
+      }
+      if (data.notes) await importCol(data.notes, 'notes');
+      if (data.students) await importCol(data.students, 'students');
+      if (data.evaluations) await importCol(data.evaluations, 'evaluations');
+      if (data.grades) await importCol(data.grades, 'grades');
+      if (data.attendance) await importCol(data.attendance, 'attendance');
+      if (data.materials) await importCol(data.materials, 'materials');
+      if (data.modules) await importCol(data.modules, 'subjectModules');
+      else if (data.subjectModules) await importCol(data.subjectModules, 'subjectModules');
+      if (data.calendarEvents) await importCol(data.calendarEvents, 'calendarEvents');
+
+      if (data.settings) {
+        await applySettings(data.settings);
+      }
+
+      await restoreLocalTables(data);
 
       window.location.reload();
     } catch (error) {
       console.error('Error importing data:', error);
       handleFirestoreError(error, OperationType.WRITE, 'import');
+      showToast('error', 'La importación falló. Usa el respaldo automático descargado (respaldo-automatico-pre-import-*.json) para restaurar tus datos.');
       setImportData(null);
     }
   };
@@ -251,16 +516,11 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const handleExportDetailedSummary = async () => {
     const { utils, writeFile } = await import('xlsx');
     if (!auth.currentUser) return;
-    const userId = auth.currentUser.uid;
     const getDocsForUserSubject = async (colName: string, subjectId: string) => {
-      const q = query(collection(db, colName), where('userId', '==', userId), where('subjectId', '==', subjectId), limit(500));
-      const snaps = await getDocs(q);
-      return snaps.docs.map(d => ({ id: d.id, ...d.data() as any }));
+      return getAllDocsForUser(colName, subjectId);
     };
 
-    const subjectsQ = query(collection(db, 'subjects'), where('userId', '==', userId), limit(500));
-    const subjectsSnap = await getDocs(subjectsQ);
-    const subjects = subjectsSnap.docs.map(d => ({ id: d.id, ...d.data() as any }));
+    const subjects = await getAllDocsForUser('subjects');
     
     const wb = utils.book_new();
 
@@ -289,14 +549,23 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       utils.book_append_sheet(wb, wsSummary, `${subject.name.substring(0, 20)} - Resumen`);
 
       // Grades Sheet
+      const weights = parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS));
+      const savedScale = getStorageItem(STORAGE_KEYS.GRADING_SCALE);
+      const gradingScale = safeJSONParse(savedScale, { maxScore: 100, minPassingScore: 71 });
+      const useCheckpoint = safeJSONParse(getStorageItem(STORAGE_KEYS.USE_CHECKPOINT), false);
+
       const gradesHeader = ['Estudiante', ...evaluations.map(e => e.title), 'Promedio Final'];
       const gradesRows = students.map(s => {
-        const studentGrades = evaluations.map(e => {
+        const studentGrades = grades.filter(g => g.studentId === s.id);
+        const calculated = calculateStudentGrades(
+          s.id, studentGrades, evaluations, modules,
+          useCheckpoint, weights, gradingScale, 'categories', 'average'
+        );
+        const evalScores = evaluations.map(e => {
           const g = grades.find(grade => grade.studentId === s.id && grade.evaluationId === e.id);
           return g ? g.score : 0;
         });
-        const avg = studentGrades.length > 0 ? studentGrades.reduce((a, b) => a + b, 0) / studentGrades.length : 0;
-        return [`${s.lastName}, ${s.firstName}`, ...studentGrades, avg.toFixed(2)];
+        return [`${s.lastName}, ${s.firstName}`, ...evalScores, calculated.total.toFixed(2)];
       });
       const wsGrades = utils.aoa_to_sheet([gradesHeader, ...gradesRows]);
       utils.book_append_sheet(wb, wsGrades, `${subject.name.substring(0, 20)} - Notas`);
@@ -348,6 +617,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 ].map(tab => (
                   <button
                     key={tab.id}
+                    title={`Sección de ${tab.label}`}
                     onClick={() => setActiveTab(tab.id as any)}
                     className={`w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all font-black text-xs uppercase tracking-widest ${
                       activeTab === tab.id 
@@ -372,6 +642,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   </p>
                   <button 
                     onClick={() => setActiveTab('billing')}
+                    title="Ir a gestión de suscripción"
                     className={`mt-4 w-full py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 ${
                       activeSubscription !== 'free'
                         ? 'bg-white text-emerald-600 border border-emerald-200 hover:bg-emerald-100' 
@@ -392,7 +663,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   {activeTab === 'advanced' && 'Funciones Avanzadas'}
                   {activeTab === 'billing' && 'Gestión de Suscripción'}
                 </h4>
-                <button onClick={onClose} className="text-neutral-400 hover:text-neutral-900 transition-colors">
+                <button onClick={onClose} title="Cerrar ventana" className="text-neutral-400 hover:text-neutral-900 transition-colors">
                   <X className="w-6 h-6" />
                 </button>
               </div>
@@ -422,7 +693,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                       <h5 className="text-lg font-black text-neutral-900">Datos y Privacidad</h5>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <button 
+                          id="export-btn"
                           onClick={handleExportData}
+                          title="Exportar respaldo completo en JSON"
                           className="flex items-center gap-4 p-4 bg-neutral-50 rounded-2xl border border-neutral-100 hover:bg-white hover:border-indigo-100 transition-all text-left group"
                         >
                           <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center border border-neutral-200 shadow-sm group-hover:scale-110 transition-transform">
@@ -441,12 +714,14 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             <div className="flex items-center gap-3 mt-1">
                               <button 
                                 onClick={() => setImportData(null)}
+                                title="Cancelar importación"
                                 className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-2 rounded-xl text-xs transition-colors border border-neutral-200"
                               >
                                 Cancelar
                               </button>
                               <button 
                                 onClick={confirmImport}
+                                title="Confirmar importación de datos"
                                 className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 rounded-xl text-xs transition-colors shadow-sm"
                               >
                                 Importar
@@ -456,6 +731,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         ) : (
                           <button 
                             onClick={() => fileInputRef.current?.click()}
+                            title="Seleccionar archivo JSON para importar"
                             className="flex items-center gap-4 p-4 bg-neutral-50 rounded-2xl border border-neutral-100 hover:bg-white hover:border-indigo-100 transition-all text-left group"
                           >
                             <input 
@@ -483,12 +759,14 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             <div className="flex items-center gap-3 mt-1">
                               <button 
                                 onClick={() => setIsConfirmingClear(false)}
+                                title="Cancelar eliminación de datos"
                                 className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-2 rounded-xl text-xs transition-colors border border-neutral-200"
                               >
                                 Cancelar
                               </button>
                               <button 
                                 onClick={handleClearData}
+                                title="Confirmar eliminación de todos los datos"
                                 className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-xl text-xs transition-colors shadow-sm"
                               >
                                 Sí, borrar
@@ -498,6 +776,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         ) : (
                           <button 
                             onClick={() => setIsConfirmingClear(true)}
+                            title="Eliminar todos los datos de la aplicación"
                             className="flex items-center gap-4 p-4 bg-neutral-50 rounded-2xl border border-neutral-100 hover:bg-red-50 hover:border-red-100 transition-all text-left group"
                           >
                             <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center border border-neutral-200 shadow-sm group-hover:scale-110 transition-transform">
@@ -516,7 +795,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                 {activeTab === 'advanced' && (
                   <div className="space-y-10">
-                    <section className="space-y-6">
+                    <section id="weightings-section" className="space-y-6">
                       <div className="flex items-center gap-4">
                         <div className="w-10 h-10 bg-indigo-50 rounded-xl flex items-center justify-center border border-indigo-100">
                           <BarChart3 className="w-5 h-5 text-indigo-600" />
@@ -568,10 +847,91 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                           </div>
                           <button 
                             onClick={toggleCheckpoint}
+                            title={useCheckpoint ? 'Deshabilitar cuarta nota' : 'Habilitar cuarta nota'}
                             className={`w-12 h-6 rounded-full transition-all relative ${useCheckpoint ? 'bg-indigo-600' : 'bg-neutral-200'}`}
                           >
                             <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${useCheckpoint ? 'left-7' : 'left-1'}`} />
                           </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                        <div className="p-6 bg-neutral-50 border border-neutral-100 rounded-3xl space-y-4">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center border border-neutral-200 shadow-sm">
+                                <Layers className="w-4 h-4 text-indigo-600" />
+                              </div>
+                              <div>
+                                <p className="font-bold text-neutral-900 text-sm">Método de Evaluación</p>
+                                <p className="text-[9px] text-neutral-500 uppercase tracking-widest font-bold font-medium">Por tipo de nota o por módulos</p>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 bg-neutral-200/40 p-1.5 rounded-2xl w-full">
+                            <button
+                              type="button"
+                              onClick={() => setViewMode('categories')}
+                              className={`flex-1 px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                                viewMode === 'categories'
+                                  ? 'bg-white text-indigo-600 shadow-sm border border-neutral-200/50'
+                                  : 'text-neutral-500 hover:text-neutral-700'
+                              }`}
+                            >
+                              Por Tipo
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setViewMode('modules')}
+                              className={`flex-1 px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                                viewMode === 'modules'
+                                  ? 'bg-white text-indigo-600 shadow-sm border border-neutral-200/50'
+                                  : 'text-neutral-500 hover:text-neutral-700'
+                              }`}
+                            >
+                              Por Módulos
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className={`p-6 bg-neutral-50 border border-neutral-100 rounded-3xl space-y-4 transition-all duration-300 ${viewMode === 'modules' ? 'opacity-100 scale-100' : 'opacity-40 pointer-events-none'}`}>
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center border border-neutral-200 shadow-sm">
+                                <BarChart3 className="w-4 h-4 text-indigo-600" />
+                              </div>
+                              <div>
+                                <p className="font-bold text-neutral-900 text-sm">Cálculo Modular</p>
+                                <p className="text-[9px] text-neutral-500 uppercase tracking-widest font-bold font-medium">Cómo combinar las notas de módulos</p>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 bg-neutral-200/40 p-1.5 rounded-2xl w-full">
+                            <button
+                              type="button"
+                              disabled={viewMode !== 'modules'}
+                              onClick={() => setCalculationMode('average')}
+                              className={`flex-1 px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                                calculationMode === 'average' && viewMode === 'modules'
+                                  ? 'bg-white text-indigo-600 shadow-sm border border-neutral-200/50'
+                                  : 'text-neutral-500 hover:text-neutral-700'
+                              }`}
+                            >
+                              Promediar
+                            </button>
+                            <button
+                              type="button"
+                              disabled={viewMode !== 'modules'}
+                              onClick={() => setCalculationMode('sum')}
+                              className={`flex-1 px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                                calculationMode === 'sum' && viewMode === 'modules'
+                                  ? 'bg-white text-indigo-600 shadow-sm border border-neutral-200/50'
+                                  : 'text-neutral-500 hover:text-neutral-700'
+                              }`}
+                            >
+                              Sumar
+                            </button>
+                          </div>
                         </div>
                       </div>
 
@@ -625,6 +985,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             <div className="flex items-center gap-3">
                               <button 
                                 onClick={() => setIsConfirmingClearCalendar(false)}
+                                title="Cancelar limpieza de eventos"
                                 className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-2 rounded-xl text-xs transition-colors border border-neutral-200"
                               >
                                 Cancelar
@@ -638,6 +999,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     console.error(error);
                                   }
                                 }}
+                                title="Confirmar eliminación de eventos"
                                 className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-xl text-xs transition-colors shadow-sm"
                               >
                                 Sí, borrar
@@ -647,6 +1009,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         ) : (
                           <button
                             onClick={() => setIsConfirmingClearCalendar(true)}
+                            title="Eliminar todos los eventos generados por IA"
                             className="mt-2 w-full bg-red-50 hover:bg-red-100 text-red-600 font-bold py-3 px-4 rounded-xl text-sm transition-colors text-left flex items-center gap-2"
                           >
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
@@ -662,6 +1025,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             <div className="flex items-center gap-3">
                               <button 
                                 onClick={() => setIsConfirmingClearEvaluations(false)}
+                                title="Cancelar limpieza de evaluaciones"
                                 className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-2 rounded-xl text-xs transition-colors border border-neutral-200"
                               >
                                 Cancelar
@@ -675,6 +1039,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     console.error(error);
                                   }
                                 }}
+                                title="Confirmar eliminación de evaluaciones"
                                 className="flex-1 bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 rounded-xl text-xs transition-colors shadow-sm"
                               >
                                 Sí, borrar
@@ -684,6 +1049,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         ) : (
                           <button
                             onClick={() => setIsConfirmingClearEvaluations(true)}
+                            title="Eliminar todas las evaluaciones del sistema"
                             className="mt-2 w-full bg-orange-50 hover:bg-orange-100 text-orange-600 font-bold py-3 px-4 rounded-xl text-sm transition-colors text-left flex items-center gap-2"
                           >
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
@@ -701,6 +1067,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                           </p>
                           <button
                             onClick={triggerAllQueries}
+                            title="Generar enlaces para crear índices compuestos en Firebase"
                             className="w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-600 font-bold py-3 px-4 rounded-xl text-sm transition-colors text-left flex items-center gap-2"
                           >
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>
@@ -713,55 +1080,357 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 )}
 
                 {activeTab === 'billing' && (
-                  <div className="space-y-10">
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                      <div className={`cursor-pointer p-8 rounded-[2.5rem] border-2 transition-all ${activeSubscription === 'free' ? 'border-indigo-600 bg-indigo-50/50' : 'border-neutral-100 bg-white hover:border-indigo-200 hover:bg-neutral-50'}`} onClick={() => handleSelectPlan('free')}>
-                        <h6 className="text-xl font-black text-neutral-900 mb-2">Gratis</h6>
-                        <p className="text-4xl font-black text-neutral-900 mb-6">$0<span className="text-sm text-neutral-400">/mes</span></p>
-                        <ul className="space-y-3 mb-8">
-                          {['Hasta 3 asignaturas', 'Apuntes locales', 'IA básica', 'Soporte comunitario'].map(feat => (
-                            <li key={feat} className="flex items-center gap-2 text-xs font-bold text-neutral-500">
-                              <CheckCircle className="w-4 h-4 text-indigo-500" />
-                              {feat}
-                            </li>
-                          ))}
-                        </ul>
-                        {activeSubscription === 'free' && <div className="text-center py-2 bg-indigo-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest">Plan Actual</div>}
+                  <div className="space-y-8">
+                    {import.meta.env.DEV && (
+                    <div className="p-6 bg-neutral-50 rounded-3xl border border-neutral-100 flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center border transition-all ${sandboxMode ? 'bg-amber-50 border-amber-100 text-amber-600' : 'bg-neutral-100 border-neutral-200 text-neutral-400'}`}>
+                          <Zap className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <p className="font-bold text-neutral-900">Modo de Prueba (Sandbox)</p>
+                          <p className="text-xs text-neutral-500 font-medium">Permite alternar planes localmente con un clic para desarrollo</p>
+                        </div>
+                      </div>
+                      <button 
+                        onClick={() => handleToggleSandbox(!sandboxMode)}
+                        title={sandboxMode ? 'Desactivar modo de prueba' : 'Activar modo de prueba'}
+                        className={`w-12 h-6 rounded-full transition-all relative ${sandboxMode ? 'bg-amber-500' : 'bg-neutral-200'}`}
+                      >
+                        <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${sandboxMode ? 'left-7' : 'left-1'}`} />
+                      </button>
+                    </div>
+                    )}
+
+                     {/* Banner de Suscripción Real en Prod */}
+                     {licenseStatus?.type === 'error' && (
+                       <div className="p-4 mt-2 bg-red-50 border border-red-100 rounded">
+                         <p className="text-sm text-red-800">{licenseStatus.message}</p>
+                         <button
+                            onClick={() => window.location.reload()}
+                            title="Recargar la página para aplicar cambios"
+                            className="mt-2 px-3 py-1 bg-red-600 text-white rounded text-xs"
+                          >
+                            Recargar
+                          </button>
+                       </div>
+                     )}
+                    {!sandboxMode && dbPlan !== 'free' && profile && (
+                      <div className="p-6 bg-emerald-50 rounded-3xl border border-emerald-100 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div>
+                          <p className="text-[10px] font-black uppercase tracking-widest text-emerald-800 mb-1">Suscripción Activa y Sincronizada</p>
+                          <h6 className="text-lg font-black text-emerald-950">
+                            {profile.plan === 'pro' ? 'Premium Pro' : 'Plan Institucional'}
+                          </h6>
+                          <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-xs text-emerald-700/80 font-medium">
+                            {profile.paymentProvider && (
+                              <span>Proveedor: <strong className="uppercase">{profile.paymentProvider.replace('_', ' ')}</strong></span>
+                            )}
+                            {profile.subscriptionId && (
+                              <span>ID: <strong>{profile.subscriptionId.substring(0, 16)}...</strong></span>
+                            )}
+                          </div>
+                        </div>
+                        {profile.expiresAt ? (
+                          <div className="bg-emerald-600 text-white px-5 py-3 rounded-2xl text-xs font-black uppercase tracking-widest shadow-md shrink-0 text-center">
+                            Expiración: {new Date(profile.expiresAt as number).toLocaleDateString()}
+                          </div>
+                        ) : (
+                          <div className="bg-emerald-600 text-white px-5 py-3 rounded-2xl text-xs font-black uppercase tracking-widest shadow-md shrink-0 text-center">
+                            Suscripción Activa
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {!sandboxMode && dbPlan !== 'free' && (
+                      <div className="p-6 bg-white rounded-3xl border border-neutral-200 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-indigo-50 rounded-xl flex items-center justify-center border border-indigo-100">
+                            <CreditCard className="w-5 h-5 text-indigo-600" />
+                          </div>
+                          <div>
+                            <p className="font-bold text-neutral-900">Gestionar Suscripción</p>
+                            <p className="text-xs text-neutral-500 font-medium">Administra tu plan, facturación o cancela cuando quieras</p>
+                          </div>
+                        </div>
+                        <button
+                          onClick={handleManageSubscription}
+                          disabled={portalLoading}
+                          title="Abrir portal de gestión de suscripción"
+                          className="flex items-center gap-2 px-6 py-3 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-400 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-lg"
+                        >
+                          {portalLoading ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            'Gestionar'
+                          )}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Planes Grid */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                      {/* Plan Gratis */}
+                      <div
+                        className={`p-8 rounded-[2.5rem] border-2 transition-all flex flex-col justify-between ${
+                          activeSubscription === 'free'
+                            ? 'border-indigo-600 bg-indigo-50/20'
+                            : 'border-neutral-100 bg-white hover:border-indigo-200 hover:bg-neutral-50/50'
+                        }`}
+                        onClick={() => sandboxMode && handleSelectPlan('free')}
+                      >
+                        <div>
+                          <h6 className="text-xl font-black text-neutral-900 mb-1">Gratis</h6>
+                          <p className="text-4xl font-black text-neutral-900 mb-1">$0<span className="text-sm text-neutral-400">/mes</span></p>
+                          <p className="text-[11px] text-neutral-400 font-semibold mb-6">Para siempre, sin tarjeta</p>
+                          <ul className="space-y-2.5 mb-8">
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Estudiantes ilimitados</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Hasta 2 cursos</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Calificaciones básicas</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Registro de asistencia</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-400"><X className="w-3.5 h-3.5 text-neutral-300 shrink-0" />Informes IA</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-400"><X className="w-3.5 h-3.5 text-neutral-300 shrink-0" />Exportar PDF/Excel</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-400"><X className="w-3.5 h-3.5 text-neutral-300 shrink-0" />Syllabus AI</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Apuntes locales</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />15 consultas IA/mes</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Copias de seguridad</li>
+                          </ul>
+                        </div>
+                        {activeSubscription === 'free' ? (
+                          <div className="space-y-2">
+                            <div className="text-center py-3.5 bg-indigo-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-indigo-500/20">Plan Actual</div>
+                            {!isTrial && !profile?.trialUsed && (
+                              <p className="text-[9px] text-neutral-400 font-medium text-center">14 días de Pro gratis disponibles</p>
+                            )}
+                          </div>
+                        ) : sandboxMode ? (
+                          <button className="w-full py-3.5 bg-neutral-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-neutral-800 transition-all" title="Cambiar al plan Gratis (modo prueba)">Seleccionar</button>
+                        ) : (
+                          <div className="text-center py-3 border border-neutral-200 text-neutral-400 rounded-2xl text-[10px] font-black uppercase tracking-widest leading-tight">
+                            Comenzar Gratis<br />
+                            <span className="text-[9px] font-bold text-neutral-300 normal-case tracking-normal">Sin tarjeta de crédito requerida</span>
+                          </div>
+                        )}
                       </div>
 
-                      <div className={`cursor-pointer p-8 rounded-[2.5rem] border-2 transition-all relative overflow-hidden ${activeSubscription === 'pro' ? 'border-emerald-600 bg-emerald-50/50' : 'border-neutral-100 bg-white hover:border-emerald-200 hover:bg-neutral-50'}`} onClick={() => handleSelectPlan('pro')}>
-                        <div className="absolute top-4 right-4 bg-amber-400 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">Popular</div>
-                        <h6 className="text-xl font-black text-neutral-900 mb-2">Premium Pro</h6>
-                        <p className="text-4xl font-black text-neutral-900 mb-6">$4.99<span className="text-sm text-neutral-400">/mes</span></p>
-                        <ul className="space-y-3 mb-8">
-                          {['Asignaturas ilimitadas', 'IA avanzada ilimitada', 'Sincronización Cloud', 'Soporte prioritario'].map(feat => (
-                            <li key={feat} className="flex items-center gap-2 text-xs font-bold text-neutral-500">
-                              <CheckCircle className={`w-4 h-4 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'}`} />
-                              {feat}
-                            </li>
-                          ))}
-                        </ul>
-                        {activeSubscription === 'pro' && <div className="text-center py-2 bg-emerald-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest">Plan Actual</div>}
+                      {/* Plan Premium Pro */}
+                      <div
+                        className={`p-8 rounded-[2.5rem] border-2 transition-all relative overflow-hidden flex flex-col justify-between ${
+                          activeSubscription === 'pro'
+                            ? 'border-emerald-600 bg-emerald-50/20'
+                            : 'border-neutral-100 bg-white hover:border-emerald-200 hover:bg-neutral-50/50'
+                        }`}
+                        onClick={() => sandboxMode && handleSelectPlan('pro')}
+                      >
+                        <div className="absolute top-4 right-4 bg-amber-400 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">MÁS POPULAR</div>
+                        <div>
+                          <h6 className="text-xl font-black text-neutral-900 mb-1">Premium Pro</h6>
+                          <p className="text-4xl font-black text-neutral-900 mb-1">$4.99<span className="text-sm text-neutral-400">/año</span></p>
+                          <p className="text-[11px] text-amber-500 font-black mb-1">🔥 Ahorro masivo — ¡Solo $0.42/mes!</p>
+                          <p className="text-[10px] text-neutral-400 font-medium mb-6">Facturación anual · Cancelas cuando quieras</p>
+                          <ul className="space-y-2.5 mb-8">
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 estudiantes</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 cursos</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Calificaciones avanzadas con pesos</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Asistencia con alertas inteligentes</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />2.000 consultas IA/mes</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Exportar PDF/Excel</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Syllabus AI</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Sincronización en la nube</li>
+                          </ul>
+                        </div>
+                        {activeSubscription === 'pro' ? (
+                          isTrial ? (
+                            <div className="text-center py-3.5 bg-amber-500 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-amber-500/20">
+                              {trialDaysLeft > 0 ? `Plan de prueba — quedan ${trialDaysLeft} días` : 'Plan de prueba'}
+                            </div>
+                          ) : (
+                            <div className="text-center py-3.5 bg-emerald-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-emerald-500/20">Plan Actual</div>
+                          )
+                        ) : sandboxMode ? (
+                          <button className="w-full py-3.5 bg-neutral-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-neutral-800 transition-all">Seleccionar</button>
+                        ) : (
+                          <div className="space-y-2 mt-auto w-full">
+                            {/* WR-02: el botón de prueba solo si aún no la usó */}
+                            {activeSubscription === 'free' && !profileAny?.trialUsed && (
+                              <button
+                                onClick={handleActivateTrial}
+                                disabled={trialLoading}
+                                title="Activar prueba gratuita de Premium Pro durante 14 días"
+                                className="w-full flex items-center justify-center gap-2 py-3 bg-amber-500 hover:bg-amber-400 disabled:bg-amber-300 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 active:scale-95 transition-all"
+                              >
+                                {trialLoading ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <Zap className="w-4 h-4" />
+                                )}
+                                {trialLoading ? 'Activando...' : 'Probar Premium 14 días gratis'}
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleCheckout('pro')}
+                              disabled={checkoutLoading === 'pro'}
+                              title="Adquirir plan Premium Pro"
+                              className="w-full flex items-center justify-center gap-2 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-400 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-emerald-500/10 hover:shadow-emerald-500/30 active:scale-95 transition-all"
+                            >
+                              {checkoutLoading === 'pro' ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <CreditCard className="w-4 h-4" />
+                              )}
+                              {checkoutLoading === 'pro' ? 'Redirigiendo...' : 'Obtener Premium Pro'}
+                            </button>
+                            <a
+                              href="https://github.com/sponsors/jvalenciap9"
+                              target="_blank"
+                              rel="noreferrer"
+                              className="w-full flex items-center justify-center gap-2 py-3 bg-pink-600 hover:bg-pink-500 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-pink-500/10 hover:shadow-pink-500/30 active:scale-95 transition-all"
+                            >
+                              <Heart className="w-4 h-4 fill-white" />
+                              GitHub Sponsors
+                            </a>
+                            <p className="text-[9px] text-neutral-400 font-medium text-center">Pago seguro procesado por Lemon Squeezy</p>
+                          </div>
+                        )}
                       </div>
 
-                      <div className={`cursor-pointer p-8 rounded-[2.5rem] border-2 transition-all relative overflow-hidden ${activeSubscription === 'school' ? 'border-blue-600 bg-blue-50/50' : 'border-neutral-100 bg-white hover:border-blue-200 hover:bg-neutral-50'}`} onClick={() => handleSelectPlan('school')}>
-                        <div className="absolute top-4 right-4 bg-blue-600 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">Colegios</div>
-                        <h6 className="text-xl font-black text-neutral-900 mb-2">Institucional</h6>
-                        <p className="text-4xl font-black text-neutral-900 mb-6">$99.99<span className="text-sm text-neutral-400">/año</span></p>
-                        <ul className="space-y-3 mb-8">
-                          {['30 suscripciones anuales', 'Panel administrativo', 'Sincronización Cloud', 'Soporte 24/7'].map(feat => (
-                            <li key={feat} className="flex items-center gap-2 text-xs font-bold text-neutral-500">
-                              <CheckCircle className={`w-4 h-4 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'}`} />
-                              {feat}
-                            </li>
-                          ))}
-                        </ul>
-                        {activeSubscription === 'school' && <div className="text-center py-2 bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest">Plan Actual</div>}
+                      {/* Plan Institucional */}
+                      <div
+                        className={`p-8 rounded-[2.5rem] border-2 transition-all relative overflow-hidden flex flex-col justify-between ${
+                          activeSubscription === 'school'
+                            ? 'border-blue-600 bg-blue-50/20'
+                            : 'border-neutral-100 bg-white hover:border-blue-200 hover:bg-neutral-50/50'
+                        }`}
+                        onClick={() => sandboxMode && handleSelectPlan('school')}
+                      >
+                        <div className="absolute top-4 right-4 bg-blue-600 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">🏫 Colegios</div>
+                        <div>
+                          <h6 className="text-xl font-black text-neutral-900 mb-1">Institucional</h6>
+                          <p className="text-4xl font-black text-neutral-900 mb-1">$99.99<span className="text-sm text-neutral-400">/año</span></p>
+                          <p className="text-[11px] text-blue-600 font-black mb-1">💰 Ahorra +70% en planes grupales</p>
+                          <p className="text-[10px] text-neutral-400 font-medium mb-6">Para centros educativos y departamentos</p>
+                          <ul className="space-y-2.5 mb-8">
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 estudiantes</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 cursos</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />9.999 consultas IA/mes</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Panel administrativo</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Sincronización Cloud</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Copias de seguridad</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Todo lo de Premium Pro incluido</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Onboarding personalizado</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Reportes institucionales</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Facturación centralizada</li>
+                          </ul>
+                        </div>
+                        {activeSubscription === 'school' ? (
+                          <div className="text-center py-3.5 bg-blue-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-blue-500/20">Plan Actual</div>
+                        ) : sandboxMode ? (
+                          <button className="w-full py-3.5 bg-neutral-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-neutral-800 transition-all" title="Cambiar al plan Institucional (modo prueba)">Seleccionar</button>
+                        ) : (
+                          <div className="space-y-2 mt-auto w-full">
+                            <input
+                              type="text"
+                              value={institutionName}
+                              onChange={(e) => setInstitutionName(e.target.value)}
+                              placeholder="Nombre de tu institución"
+                              maxLength={200}
+                              disabled={checkoutLoading === 'school'}
+                              className="w-full bg-neutral-50 border border-neutral-200 rounded-2xl px-4 py-2.5 text-xs text-neutral-900 outline-none focus:bg-white focus:border-blue-500 focus:ring-4 focus:ring-blue-500/5 transition-all placeholder:text-neutral-400"
+                            />
+                            <button
+                              onClick={() => handleCheckout('school')}
+                              disabled={checkoutLoading === 'school'}
+                              title="Comprar el plan Institucional"
+                              className="w-full flex items-center justify-center gap-2 py-3.5 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-400 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-blue-500/10 hover:shadow-blue-500/30 active:scale-95 transition-all"
+                            >
+                              {checkoutLoading === 'school' ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <Layers className="w-4 h-4" />
+                              )}
+                              {checkoutLoading === 'school' ? 'Redirigiendo...' : 'Comprar Institucional'}
+                            </button>
+                            <p className="text-[9px] text-neutral-400 font-medium text-center">Pago seguro procesado por Lemon Squeezy</p>
+                          </div>
+                        )}
                       </div>
+                    </div>
+
+                    {/* Canje de Licencias */}
+                    <div className="p-8 rounded-[2.5rem] border border-neutral-200 bg-white shadow-sm space-y-6">
+                      <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center border border-indigo-100 shadow-sm shrink-0">
+                          <Key className="w-6 h-6" />
+                        </div>
+                        <div>
+                          <h6 className="text-lg font-black text-neutral-900">¿Tienes un código de licencia premium?</h6>
+                          <p className="text-xs text-neutral-500 font-medium">Ingresa el código que te entregó el administrador para activar tu plan Pro o Institucional.</p>
+                        </div>
+                      </div>
+
+                      <form onSubmit={handleRedeemKey} className="flex flex-col sm:flex-row gap-4 mt-2">
+                        <div className="flex-1 relative">
+                          <input 
+                            type="text" 
+                            value={licenseKey}
+                            onChange={(e) => setLicenseKey(e.target.value)}
+                            placeholder="EJ. PRO-XXXX-XXXX-XXXX"
+                            disabled={licenseLoading}
+                            className="w-full bg-neutral-50 border border-neutral-200 rounded-2xl px-5 py-3.5 text-neutral-900 outline-none focus:bg-white focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/5 transition-all font-mono font-bold tracking-widest"
+                          />
+                        </div>
+                        <button 
+                          type="submit"
+                          disabled={licenseLoading || !licenseKey.trim()}
+                          title="Canjear código de licencia premium"
+                          className="px-8 py-3.5 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-200 text-white disabled:text-neutral-400 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95 flex items-center justify-center gap-2 shadow-lg"
+                        >
+                          {licenseLoading ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              Validando...
+                            </>
+                          ) : (
+                            'Canjear Código'
+                          )}
+                        </button>
+                      </form>
+
+                      {/* Notificaciones de Estado */}
+                      <AnimatePresence>
+                        {licenseStatus.type === 'success' && (
+                          <motion.div 
+                            initial={{ opacity: 0, y: -10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -10 }}
+                            className="p-4 bg-emerald-50 border border-emerald-100 rounded-2xl flex items-start gap-3"
+                          >
+                            <Check className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />
+                            <p className="text-xs text-emerald-950 font-bold leading-relaxed">{licenseStatus.message}</p>
+                          </motion.div>
+                        )}
+                        {licenseStatus.type === 'error' && (
+                          <motion.div 
+                            initial={{ opacity: 0, y: -10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -10 }}
+                            className="p-4 bg-red-50 border border-red-100 rounded-2xl flex items-start gap-3"
+                          >
+                            <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+                            <p className="text-xs text-red-950 font-bold leading-relaxed">{licenseStatus.message}</p>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   </div>
                 )}
+              <div className="flex items-center justify-center gap-4 pt-4 pb-2 border-t border-neutral-100">
+                <a href="/terminos.html" target="_blank" rel="noopener noreferrer" className="text-[11px] text-neutral-400 hover:text-indigo-600 font-medium transition-colors">Términos de Servicio</a>
+                <span className="text-neutral-300 text-[11px]">·</span>
+                <a href="/privacidad.html" target="_blank" rel="noopener noreferrer" className="text-[11px] text-neutral-400 hover:text-indigo-600 font-medium transition-colors">Política de Privacidad</a>
               </div>
+            </div>
             </div>
           </motion.div>
         </motion.div>
