@@ -22,7 +22,7 @@ function notify(toasts: Toast[]) {
   listeners.forEach(fn => fn(toasts));
 }
 
-export function showToast(type: ToastType, message: string, duration = 4000) {
+export function showToast(type: ToastType, message: string, duration = 6000) {
   const id = `toast-${Date.now()}-${Math.random()}`;
   const toast: Toast = { id, type, message, duration };
   toastQueue = [...toastQueue, toast];

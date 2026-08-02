@@ -10,6 +10,8 @@ export const STORAGE_KEYS = {
   GRADING_WEIGHTS: `${APP_PREFIX}grading_weights`,
   USE_CHECKPOINT: `${APP_PREFIX}use_checkpoint`,
   GRADING_SCALE: `${APP_PREFIX}grading_scale`,
+  GRADING_VIEW_MODE: `${APP_PREFIX}grading_view_mode`,
+  GRADING_CALCULATION_MODE: `${APP_PREFIX}grading_calculation_mode`,
 } as const;
 
 /**

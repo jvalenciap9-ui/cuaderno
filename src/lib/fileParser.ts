@@ -1,31 +1,31 @@
-export async function extractTextFromFile(dataUrlOrUrl: string, mimeType: string): Promise<string> {
+export async function extractTextFromFile(dataUrlOrUrlOrBuffer: string | ArrayBuffer, mimeType: string): Promise<string> {
   let buffer: ArrayBuffer;
 
-  if (dataUrlOrUrl.startsWith('http')) {
-    try {
-      // Intentar fetch directo primero (puede fallar por CORS)
-      const directResponse = await fetch(dataUrlOrUrl);
-      if (!directResponse.ok) throw new Error('Falló directo');
-      buffer = await directResponse.arrayBuffer();
-    } catch (e) {
-      // Utilizamos corsproxy.io para evitar problemas de CORS de Firebase con archivos binarios.
-      const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(dataUrlOrUrl)}`;
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error('No se pudo descargar el archivo de Firebase Storage ni siquiera con el proxy.');
-      buffer = await response.arrayBuffer();
+  if (dataUrlOrUrlOrBuffer instanceof ArrayBuffer) {
+    buffer = dataUrlOrUrlOrBuffer;
+  } else if (typeof dataUrlOrUrlOrBuffer === 'string') {
+    if (dataUrlOrUrlOrBuffer.startsWith('http')) {
+      try {
+        // Intentar fetch directo primero (puede fallar por CORS)
+        const directResponse = await fetch(dataUrlOrUrlOrBuffer);
+        if (!directResponse.ok) throw new Error('Falló directo');
+        buffer = await directResponse.arrayBuffer();
+      } catch (e) {
+        // Utilizamos corsproxy.io para evitar problemas de CORS de Firebase con archivos binarios.
+        const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(dataUrlOrUrlOrBuffer)}`;
+        const response = await fetch(proxyUrl);
+        if (!response.ok) throw new Error('No se pudo descargar el archivo de Firebase Storage ni siquiera con el proxy.');
+        buffer = await response.arrayBuffer();
+      }
+    } else if (dataUrlOrUrlOrBuffer.includes(',')) {
+      // Es un Data URL base64, usar fetch para convertir base64 a blob (más eficiente en memoria)
+      const fetchResponse = await fetch(dataUrlOrUrlOrBuffer);
+      buffer = await fetchResponse.arrayBuffer();
+    } else {
+      throw new Error('Formato de archivo no reconocido');
     }
-  } else if (dataUrlOrUrl.includes(',')) {
-    // Es un Data URL base64
-    const base64Data = dataUrlOrUrl.split(',')[1];
-    if (!base64Data) throw new Error('Data base64 inválida');
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    buffer = bytes.buffer;
   } else {
-    throw new Error('Formato de archivo no reconocido');
+    throw new Error('Tipo de dato no válido');
   }
 
   try {

@@ -66,6 +66,7 @@ export interface GradeDoc extends FirestoreDoc {
 export interface AttendanceDoc extends FirestoreDoc {
   userId: string;
   subjectId: string;
+  moduleId?: string;
   studentId: string;
   date: string;
   status: 'present' | 'absent' | 'late';
@@ -80,6 +81,9 @@ export interface CalendarEventDoc extends FirestoreDoc {
   startTime?: string;
   endTime?: string;
   type: 'class' | 'exam' | 'deadline' | 'other';
+  topic?: string;
+  description?: string;
+  order?: number;
 }
 
 export interface MaterialDoc extends FirestoreDoc {
@@ -91,6 +95,8 @@ export interface MaterialDoc extends FirestoreDoc {
   description?: string;
   observations?: string;
   date: string;
+  startTime?: string;
+  endTime?: string;
   attachment?: AttachmentDoc;
 }
 
