@@ -15,6 +15,92 @@ service cloud.firestore {
       return existing().userId == request.auth.uid;
     }
 
+    // ── Límite de asignaturas según plan (2 por año natural en el plan free) ──
+    // El cliente escribe un contador en /userCounters/{uid} en el MISMO batch
+    // que crea/borra la asignatura (ver src/lib/subjectCounter.ts). getAfter()
+    // refleja el valor del batch en curso, así las reglas verifican que el
+    // contador suba exactamente +1 y que no supere el límite del plan
+    // (2 gratis, 999 en Pro/Institucional).
+    // Política C8: "2 por año natural" = se cuentan las asignaturas CREADAS en
+    // el año calendario actual (campo createdThisYear + yearKey). Borrar una
+    // asignatura NO libera cupo del año. Un año nuevo resetea el contador a 1.
+    function currentYearKey() { return string(request.time.date().year); }
+
+    function subjectCountWithinLimit() {
+      let planPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      let counterPath = /databases/$(database)/documents/userCounters/$(request.auth.uid);
+      // get()/exists()/existsAfter() son funciones globales de Firestore rules;
+      // Resource no tiene método .exists() (eso es de Realtime Database).
+      let planDoc = get(planPath);
+      // HR-01: si el usuario tiene una prueba que ya expiró, el plan 'pro'
+      // prestado por el trial no cuenta a efectos del límite → se trata como free.
+      // Un usuario que pagó (paymentProvider distinto de 'trial') nunca se degrada.
+      let trialExpired = planDoc != null && planDoc.data.isTrial == true
+        && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial')
+        && planDoc.data.trialEndsAt is number
+        && planDoc.data.trialEndsAt <= request.time.toMillis();
+      let effectivePlan = trialExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);
+      let max = effectivePlan == 'pro' || effectivePlan == 'school' ? 999 : 2;
+      let before = get(counterPath);
+      let after = getAfter(counterPath);
+      let year = currentYearKey();
+      let valid =
+        (before != null && after != null
+          && after.data.subjectCount == before.data.subjectCount + 1
+          && after.data.subjectCount <= max
+          && after.data.createdThisYear is number
+          && after.data.createdThisYear <= max
+          && after.data.yearKey is string
+          && (
+            // Mismo año calendario: contador de año +1
+            (after.data.yearKey == year
+              && after.data.yearKey == before.data.yearKey
+              && after.data.createdThisYear == before.data.createdThisYear + 1)
+            // Año nuevo: reinicia a 1
+            || (after.data.yearKey == year
+              && after.data.yearKey != before.data.yearKey
+              && after.data.createdThisYear == 1)
+          ))
+        // Primer documento de contador
+        || (before == null && after != null
+          && after.data.subjectCount == 1
+          && after.data.createdThisYear == 1
+          && after.data.yearKey == year);
+      return valid;
+    }
+
+    // ── M1: rate limit de writes al contador (opt-in) ──
+    function MAX_WRITES_PER_WINDOW() { return 120; }
+    function WINDOW_MS() { return 60000; }
+
+    function writesStartWindow() {
+      let now = request.time.toMillis();
+      // Tolerancia de clock-skew: el cliente escribe Date.now() (puede ir
+      // adelantado vs. request.time). Se admite hasta 60s por delante.
+      return request.resource.data.writeWindowStart is number
+        && request.resource.data.writes is number
+        && request.resource.data.writes == 1
+        && request.resource.data.writeWindowStart > now - WINDOW_MS()
+        && request.resource.data.writeWindowStart <= now + WINDOW_MS();
+    }
+
+    function writesWithinLimit() {
+      let now = request.time.toMillis();
+      let windowActive = 'writeWindowStart' in resource.data && 'writes' in resource.data
+        && resource.data.writeWindowStart is number && resource.data.writes is number
+        && resource.data.writeWindowStart + WINDOW_MS() > now;
+      return request.resource.data.writeWindowStart is number
+        && request.resource.data.writes is number
+        && request.resource.data.writes >= 1
+        && request.resource.data.writes <= MAX_WRITES_PER_WINDOW()
+        && (windowActive
+            ? (request.resource.data.writeWindowStart == resource.data.writeWindowStart
+                && request.resource.data.writes == resource.data.writes + 1)
+            : (request.resource.data.writeWindowStart > now - WINDOW_MS()
+                && request.resource.data.writeWindowStart <= now + WINDOW_MS()
+                && request.resource.data.writes == 1));
+    }
+
     // ── subjects ──
     match /subjects/{subjectId} {
       function isValidSubject(data) {
@@ -27,9 +113,66 @@ service cloud.firestore {
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
-      allow create: if isSignedIn() && isValidId(subjectId) && isValidSubject(request.resource.data);
+      allow create: if isSignedIn() && isValidId(subjectId) && isValidSubject(request.resource.data) && subjectCountWithinLimit();
       allow update: if isSignedIn() && isValidId(subjectId) && isExistingOwner() && isValidSubject(request.resource.data);
       allow delete: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
+    }
+
+    // ── userCounters (contador atómico de asignaturas + cuota de writes) ──
+    // C8: el contador lleva además de `subjectCount` los campos
+    // `createdThisYear` y `yearKey` para el límite "2 por año natural" del
+    // plan free. El resto del esquema se mantiene como en C1: el cliente
+    // actualiza este doc en el mismo batch que crea/borra una asignatura y la
+    // regla exige incrementos/decrementos de a 1 (o reset a 0 cuando se borran
+    // todos los datos) para que nadie pueda inflar el contador y eludir el
+    // límite de asignaturas.
+    match /userCounters/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['subjectCount', 'createdThisYear', 'yearKey', 'updatedAt', 'writes', 'writeWindowStart'])
+        && request.resource.data.subjectCount is number
+        && (request.resource.data.subjectCount == 1 || request.resource.data.subjectCount == 0)
+        && request.resource.data.createdThisYear is number
+        && (request.resource.data.createdThisYear == 1 || request.resource.data.createdThisYear == 0)
+        && request.resource.data.yearKey is string
+        && request.resource.data.yearKey == currentYearKey()
+        && ('writes' in request.resource.data ? writesStartWindow() : true);
+      // C1: el reset a 0 (borrar todos los datos) SOLO es válido si va
+      // acompañado de la instrumentación de rate-limit correcta
+      // (writesWithinLimit): así un usuario free no puede resetear el contador
+      // a 0 sin instrumentación legítima y eludir el límite de asignaturas
+      // creando infinitas con el batch permitido.
+      allow update: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['subjectCount', 'createdThisYear', 'yearKey', 'updatedAt', 'writes', 'writeWindowStart'])
+        && request.resource.data.subjectCount is number
+        && request.resource.data.subjectCount >= 0
+        && request.resource.data.createdThisYear is number
+        && request.resource.data.createdThisYear >= 0
+        && request.resource.data.yearKey is string
+        && (
+          // +1: crear asignatura en el mismo año o al arrancar uno nuevo
+          (request.resource.data.subjectCount == resource.data.subjectCount + 1
+            && (
+              (request.resource.data.yearKey == resource.data.yearKey
+                && request.resource.data.yearKey == currentYearKey()
+                && request.resource.data.createdThisYear == resource.data.createdThisYear + 1)
+              || (request.resource.data.yearKey == currentYearKey()
+                && request.resource.data.yearKey != resource.data.yearKey
+                && request.resource.data.createdThisYear == 1)
+            ))
+          // -1: borrar asignatura (NO libera cupo del año)
+          || (request.resource.data.subjectCount == resource.data.subjectCount - 1
+            && request.resource.data.createdThisYear == resource.data.createdThisYear
+            && request.resource.data.yearKey == resource.data.yearKey
+            && writesWithinLimit())
+          // reset a 0: borrar todos los datos (NO libera el cupo del año:
+          // createdThisYear se preserva, solo se vacía subjectCount)
+          || (request.resource.data.subjectCount == 0
+            && request.resource.data.createdThisYear == resource.data.createdThisYear
+            && request.resource.data.yearKey == resource.data.yearKey
+            && writesWithinLimit())
+        );
+      allow delete: if false;
     }
 
     // ── notes ──
@@ -105,9 +248,19 @@ service cloud.firestore {
       allow create: if isSignedIn() && isValidId(gradeId) && isValidGrade(request.resource.data)
         && exists(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId))
         && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.userId == request.auth.uid
-        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore;
+        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.subjectId == request.resource.data.subjectId
+        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore
+        && exists(/databases/$(database)/documents/students/$(request.resource.data.studentId))
+        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.userId == request.auth.uid
+        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.subjectId == request.resource.data.subjectId;
       allow update: if isSignedIn() && isValidId(gradeId) && isExistingOwner() && isValidGrade(request.resource.data)
-        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore;
+        && exists(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId))
+        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.userId == request.auth.uid
+        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.subjectId == request.resource.data.subjectId
+        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore
+        && exists(/databases/$(database)/documents/students/$(request.resource.data.studentId))
+        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.userId == request.auth.uid
+        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.subjectId == request.resource.data.subjectId;
       allow delete: if isSignedIn() && isValidId(gradeId) && isExistingOwner();
     }
 
@@ -178,30 +331,65 @@ service cloud.firestore {
           && data.order is number
           && data.createdAt is number;
       }
-      allow list: if isSignedIn() && isExistingOwner();
-      allow get: if isSignedIn() && isValidId(subjectModuleId) && isExistingOwner();
+      allow list: if isSignedIn() && request.auth.uid == resource.data.userId;
+      allow get: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId;
       allow create: if isSignedIn() && isValidId(subjectModuleId) && isValidSubjectModule(request.resource.data)
         && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
         && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
-      allow update: if isSignedIn() && isValidId(subjectModuleId) && isExistingOwner() && isValidSubjectModule(request.resource.data);
-      allow delete: if isSignedIn() && isValidId(subjectModuleId) && isExistingOwner();
+      allow update: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId && isValidSubjectModule(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId;
+    }
+
+    // ── licenseKeys ──
+    // Ningún cliente puede leer claves directamente (antes cualquiera autenticado
+    // podía leer cualquier clave). El único camino válido es la Cloud Function
+    // `redeemLicenseKey` (bypassa las reglas de forma segura).
+    match /licenseKeys/{keyId} {
+      allow get: if false;
+      allow list, write: if false;
+    }
+
+    // ── userSettings (ponderaciones, escala, etc.) ──
+    match /userSettings/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
     }
 
     // ── users ──
     match /users/{userId} {
       allow read: if isSignedIn() && request.auth.uid == userId;
 
+      // Los campos sensibles (role, institutionId, institutionName, plan) solo
+      // los puede escribir el backend (webhook / Cloud Functions). El cliente
+      // crea su perfil con plan free y role teacher por defecto.
       allow create: if isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.keys().hasAll(['plan', 'email', 'createdAt'])
         && request.resource.data.plan == 'free'
+        && (!('role' in request.resource.data) || request.resource.data.role == 'teacher')
+        && !('institutionId' in request.resource.data)
+        && !('institutionName' in request.resource.data)
+        && !('isTrial' in request.resource.data)
+        && !('trialEndsAt' in request.resource.data)
+        && !('trialUsed' in request.resource.data)
+        && !('trialStartedAt' in request.resource.data)
         && request.resource.data.aiCallsThisMonth is number
         && request.resource.data.aiCallsThisMonth == 0;
 
       allow update: if isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.plan == existing().plan
-        && request.resource.data.aiCallsThisMonth == existing().aiCallsThisMonth;
+        && request.resource.data.aiCallsThisMonth == existing().aiCallsThisMonth
+        && (!('role' in request.resource.data) || request.resource.data.role == existing().role)
+        && (!('institutionId' in request.resource.data) || request.resource.data.institutionId == existing().institutionId)
+        && (!('institutionName' in request.resource.data) || request.resource.data.institutionName == existing().institutionName)
+        // HR-01/integración: los campos de trial son propiedad exclusiva del
+        // backend (activateTrial / resolveTrialExpiry / webhooks). El cliente
+        // no puede escribirlos ni auto-concederse una prueba. Se usa diff()
+        // sobre los campos EFECTIVAMENTE CAMBIADOS para no bloquear writes
+        // legítimos del cliente (p.ej. lastLoginAt) a docs que ya contienen
+        // campos trial escritos por el backend.
+        && !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['isTrial', 'trialEndsAt', 'trialUsed', 'trialStartedAt']);
 
       allow delete: if false;
     }
