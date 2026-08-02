@@ -14,3 +14,8 @@ gemini_key.txt
 .firebase/
 firebase functions.json
 "firebase init functions.js"
+
+# Archivos temporales y de herramientas
+.agents/*.txt
+tour_ids.csv
+"Ediagil Notes/"
