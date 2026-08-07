@@ -133,6 +133,43 @@ app.post('/api/gemini', checkRateLimit, async (req: Request, res: Response) => {
   }
 });
 
+// ── Forwarding dev → Cloud Functions desplegadas ─────────────────────────────
+// En producción (Firebase Hosting) los endpoints /api/create-checkout,
+// /api/create-portal y /api/lemon-webhook los sirven los rewrites de firebase.json.
+// En desarrollo el Vite proxy manda /api/* aquí, así que reenviamos estos tres a
+// las funciones GCFv2 reales para que los flujos de pago funcionen en local.
+const FORWARD_TO = process.env.FUNCTIONS_FORWARD_URL ||
+  'https://us-central1-ediagil-new-2026.cloudfunctions.net';
+
+const forwardedEndpoints: Array<[string, string]> = [
+  ['/api/create-checkout', 'createLemonSqueezyCheckout'],
+  ['/api/create-portal', 'createCustomerPortal'],
+  ['/api/lemon-webhook', 'lemonSqueezyWebhook'],
+];
+
+for (const [route, fnName] of forwardedEndpoints) {
+  app.post(route, async (req: Request, res: Response) => {
+    try {
+      const body = JSON.stringify(req.body ?? {});
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (req.headers.authorization) headers['Authorization'] = String(req.headers.authorization);
+      const r = await fetch(`${FORWARD_TO}/${fnName}`, { method: 'POST', headers, body });
+      const text = await r.text();
+      res
+        .status(r.status)
+        .set('Content-Type', r.headers.get('content-type') || 'application/json')
+        .send(text);
+    } catch (err: any) {
+      console.error(`❌ Error en forward ${route}:`, err?.message || err);
+      res.status(502).json({ error: 'No se pudo conectar con el backend Cloud Functions.' });
+    }
+  });
+}
+
+if (forwardedEndpoints.length) {
+  console.log(`   Forwarding dev: ${forwardedEndpoints.map(([r]) => r).join(', ')} → ${FORWARD_TO}`);
+}
+
 // ── Iniciar servidor ─────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.API_PORT || '3001', 10);
 app.listen(PORT, () => {
