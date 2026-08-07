@@ -15,7 +15,7 @@
 Error: expect(received).toContain(expected) // indexOf
 
 Expected substring: "accounts.google.com"
-Received string:    "https://ediagil-new-2026.firebaseapp.com/__/auth/handler?apiKey=AIzaSyDummyKeyForCompilation-ReplaceMe&appName=%5BDEFAULT%5D&authType=signInViaPopup&redirectUrl=http%3A%2F%2Flocalhost%3A3000%2Flogin&v=12.13.0&eventId=6579817909&providerId=google.com&scopes=profile"
+Received string:    "https://ediagil-new-2026.firebaseapp.com/__/auth/handler?apiKey=AIzaSyCkzx_b96jzAA1UZcUoT5TRtoEmZB-oufg&appName=%5BDEFAULT%5D&authType=signInViaPopup&redirectUrl=http%3A%2F%2Flocalhost%3A3000%2Flogin&v=12.13.0&eventId=2135210380&providerId=google.com&scopes=profile"
 ```
 
 # Page snapshot
@@ -32,21 +32,19 @@ Received string:    "https://ediagil-new-2026.firebaseapp.com/__/auth/handler?ap
         - generic [ref=e12]:
           - textbox "Email" [ref=e13]
           - textbox "Contraseña (mín. 6 caracteres)" [ref=e14]
-          - paragraph [ref=e15]: Error al iniciar sesión con Google. Asegúrate de haber habilitado el proveedor en Firebase Console > Authentication > Sign-in method.
-          - button "Iniciar sesión" [ref=e16]
-          - generic [ref=e17]: o
-          - button "Continuar con Google" [ref=e21]
-          - button "¿Olvidaste tu contraseña?" [ref=e27]
-        - button "¿No tienes cuenta? Regístrate" [ref=e28]
-        - generic [ref=e29]:
-          - link "Términos" [ref=e30] [cursor=pointer]:
+          - button "Iniciar sesión" [ref=e15]
+          - generic [ref=e16]: o
+          - button "Conectando..." [disabled] [ref=e20]
+          - button "¿Olvidaste tu contraseña?" [ref=e26]
+        - button "¿No tienes cuenta? Regístrate" [ref=e27]
+        - generic [ref=e28]:
+          - link "Términos" [ref=e29] [cursor=pointer]:
             - /url: /terminos.html
-          - generic [ref=e31]: ·
-          - link "Privacidad" [ref=e32] [cursor=pointer]:
+          - generic [ref=e30]: ·
+          - link "Privacidad" [ref=e31] [cursor=pointer]:
             - /url: /privacidad.html
     - generic: Iniciar sesión con Google
-  - iframe [ref=e33]:
-    
+  - iframe [ref=e32]
 ```
 
 # Test source
