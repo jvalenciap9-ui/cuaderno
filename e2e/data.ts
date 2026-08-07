@@ -76,8 +76,8 @@ export const INSTANCE_NAME = process.env.E2E_INSTITUTION_NAME || 'Colegio de Pru
 /** Nombre de la institución mostrada en el dashboard admin (coincide con institutionName de la cuenta admin). */
 export const ADMIN_INSTITUTION_NAME = process.env.E2E_ADMIN_INSTITUTION_NAME || 'Colegio de Prueba EdiAgil';
 
-export const LS_CHECKOUT_MARKER = 'checkout.liquonsqueezy.com';
-export const LS_PORTAL_MARKER = 'app.lemonsqueezy.com';
+export const LS_CHECKOUT_MARKER = 'lemonsqueezy.com';
+export const LS_PORTAL_MARKER = 'lemonsqueezy.com';
 
 export function firebaseConfig() {
   const p = path.join(here, '..', 'firebase-applet-config.json');

@@ -69,9 +69,8 @@ async function loginFree(page: Page) {
 async function openSettingsTab(page: Page, tabId: 'general' | 'advanced' | 'billing') {
   await page.locator('#weightings-btn').click();
   await expect(page.getByText('Ajustes', { exact: true }).first()).toBeVisible();
-  await page.locator(`[data-tab="${tabId}"]`).click().catch(async () => {
-    await page.getByRole('button', { name: /Suscripción|General|Avanzado/ }).first().click();
-  });
+  const tabLabel = tabId === 'general' ? 'General' : tabId === 'advanced' ? 'Avanzado' : 'Suscripción';
+  await page.getByRole('button', { name: tabLabel, exact: true }).click();
 }
 
 function denegado(r: { ok: boolean; status: number }): boolean {
@@ -296,7 +295,15 @@ test.describe('Fase 6 — Seguridad y Pagos', () => {
       await page.getByRole('button', { name: 'Eliminar', exact: true }).click();
       await expect(sidebarItem).toHaveCount(0, { timeout: 15000 });
       // intentar crear una tercera: el contador createdThisYear sigue en 2 → servidor deniega
-      await createSubject(page, 'Free Asig 3', { expectFail: true });
+      await page.locator('#new-subject-btn').click();
+      await page.locator('input[placeholder="Ej. Matemáticas Avanzadas"]').fill('Free Asig 3');
+      await page.locator('input[placeholder="Ej. Dra. García"]').fill('Docente de Prueba');
+      await page.locator('input[placeholder="Ej. Lunes y Miércoles 10:00 AM"]').fill('Lunes y Miércoles 10:00 AM');
+      await page.getByRole('button', { name: 'Guardar', exact: true }).click();
+      // no debe aparecer en la barra lateral
+      await expect(
+        page.getByTitle('Seleccionar esta asignatura').filter({ hasText: 'Free Asig 3' }),
+      ).toHaveCount(0, { timeout: 15000 });
       const sess = await signInAs(FREE.email, FREE.password);
       const subjects = await restListOwnedDocs(sess.idToken, 'subjects');
       const counters = await restGetDoc(sess.idToken, `userCounters/${sess.uid}`);
@@ -352,13 +359,14 @@ test.describe('Fase 6 — Seguridad y Pagos', () => {
     });
 
     test('6.22 Checkout Institucional → Lemon Squeezy (sandbox)', async ({ page }) => {
-      await doLogin(page, PAYMENT.email, PAYMENT.password);
+      // se usa una cuenta sin plan school para que el botón "Comprar Institucional" exista
+      await loginFree(page);
       await openSettingsTab(page, 'billing');
       const instName = page.getByPlaceholder('Nombre de tu institución');
       if (await instName.isVisible().catch(() => false)) {
         await instName.fill('Institución E2E');
       }
-      const checkoutPage = page.waitForURL((url) => url.hostname.includes('liquonsqueezy'), { timeout: 45_000 });
+      const checkoutPage = page.waitForURL((url) => url.hostname.includes('lemonsqueezy'), { timeout: 45_000 });
       await page.getByRole('button', { name: 'Comprar Institucional' }).click();
       const reached = await checkoutPage
         .then(() => true)
@@ -411,7 +419,7 @@ test.describe('Fase 6 — Seguridad y Pagos', () => {
       await openSettingsTab(page, 'billing');
       await page.getByPlaceholder('EJ. PRO-XXXX-XXXX-XXXX').fill(PAYMENT.validLicenseKey);
       await page.getByRole('button', { name: 'Canjear Código' }).click();
-      await expectToast(page, 'Licencia');
+      await expect(page.getByText('a la licencia Premium', { exact: false }).first()).toBeVisible();
       const sess = await signInAs(PAYMENT.licenseTesterEmail, PAYMENT.licenseTesterPass);
       const user = fromDoc((await restGetDoc(sess.idToken, `users/${sess.uid}`)).json) as Record<string, unknown>;
       expect(['pro', 'school']).toContain(user.plan);
@@ -424,7 +432,7 @@ test.describe('Fase 6 — Seguridad y Pagos', () => {
       await openSettingsTab(page, 'billing');
       await page.getByPlaceholder('EJ. PRO-XXXX-XXXX-XXXX').fill(PAYMENT.invalidLicenseKey || 'PRO-0000-0000-0000');
       await page.getByRole('button', { name: 'Canjear Código' }).click();
-      await expectToast(page, 'Código inválido o ya usado');
+      await expect(page.getByText('inválido o ya usado').first()).toBeVisible();
     });
 
     test('6.27 Redirect checkout=success → toast de plan activado', async ({ page }) => {

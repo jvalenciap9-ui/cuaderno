@@ -97,7 +97,8 @@ test.describe('Fase 3 — Estudiantes y Asistencia', () => {
     await expect(page.getByText(MATE[4].lastName, { exact: false }).first()).toHaveCount(0, { timeout: 15000 });
     const sess = await signInAs(TEACHER_1.email, TEACHER_1.password);
     const students = await restListOwnedDocs(sess.idToken, 'students');
-    expect(students.filter((s: any) => s.subjectId === (await subjId(sess.idToken, 'Matemáticas'))).length).toBe(4);
+    const mateId = await subjId(sess.idToken, 'Matemáticas');
+    expect(students.filter((s: any) => s.subjectId === mateId).length).toBe(4);
   });
 
   test('3.6 Aislamiento: Docente 1 NO ve estudiantes de Docente 2', async ({ page }) => {

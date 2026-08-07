@@ -189,12 +189,10 @@ export async function createEvaluation(
   dateStr?: string,
 ): Promise<void> {
   await page.getByRole('button', { name: 'Nueva Eval.' }).click();
-  await page.locator('input[type="text"]').filter({ has: page.locator('[placeholder="Ej. Examen Parcial"]') }).catch(() => {});
-  // re-lleno por placeholder para robustez
   await page.locator('input[placeholder="Ej. Examen Parcial"]').fill(title);
   await page.locator('input[placeholder="100"]').fill(String(maxScore));
   if (type) {
-    await page.locator('select').filter({ hasText: 'Teórica' }).or(page.locator('select').filter({ hasText: 'Práctica' })).first().selectOption({ label: new RegExp(`^${type === 'teorica' ? 'Teórica' : type === 'practica' ? 'Práctica' : 'Apreciativa'}`) });
+    await page.locator('select').first().selectOption({ value: type });
   }
   if (dateStr) {
     await page.locator('input[type="date"]').last().fill(dateStr);
