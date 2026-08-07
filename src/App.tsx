@@ -44,7 +44,6 @@ import { GradesTab } from "./components/GradesTab";
 import { AttendanceTab } from "./components/AttendanceTab";
 import { StudentsTab } from "./components/StudentsTab";
 import { ModulesTab } from "./components/ModulesTab";
-import { SubjectCalendar } from "./components/SubjectCalendar";
 import { UserGuide } from "./components/UserGuide";
 import { AdminDashboard } from "./components/AdminDashboard";
 import type { SubjectDoc, NoteDoc } from "./types/firestore";
@@ -78,6 +77,19 @@ import { LandingPage } from './components/LandingPage';
 export default function App() {
   const { user } = useAuth();
   const pathname = usePathname();
+
+  // Capturar parámetros de plan desde la landing page para el flujo de registro
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const planParam = params.get('plan');
+    if (planParam === 'pro' || planParam === 'school') {
+      localStorage.setItem('ediagil_pending_checkout_plan', planParam);
+    }
+    const instParam = params.get('institutionName');
+    if (instParam) {
+      localStorage.setItem('ediagil_pending_checkout_institution', instParam);
+    }
+  }, [pathname]);
 
   // ── Toast global listener (recibe errores de handleFirestoreError) ──────
   useEffect(() => {
@@ -333,7 +345,7 @@ function CuadernoApp() {
     "subject",
   );
   const [activeTab, setActiveTab] = useState<
-    "planning" | "grades" | "attendance" | "students" | "modules" | "calendar"
+    "planning" | "grades" | "attendance" | "students" | "modules"
   >("modules");
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(
     null,
@@ -379,6 +391,51 @@ function CuadernoApp() {
       window.dispatchEvent(new PopStateEvent('popstate'));
     }
   }, []);
+
+  // Procesar plan pendiente seleccionado desde la landing page tras registrarse
+  useEffect(() => {
+    if (loadingPlan || !user) return;
+    const pendingPlan = localStorage.getItem('ediagil_pending_checkout_plan') as 'pro' | 'school' | null;
+    const institutionName = localStorage.getItem('ediagil_pending_checkout_institution') || '';
+    
+    if (pendingPlan === 'pro' || pendingPlan === 'school') {
+      if (dbPlan === 'free') {
+        localStorage.removeItem('ediagil_pending_checkout_plan');
+        localStorage.removeItem('ediagil_pending_checkout_institution');
+        
+        showToast('info', 'Redirigiendo a la pasarela de pago para activar tu plan...');
+        
+        (async () => {
+          try {
+            const token = await user.getIdToken();
+            const res = await fetch('/api/create-checkout', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+              },
+              body: JSON.stringify({ 
+                plan: pendingPlan, 
+                ...(pendingPlan === 'school' && institutionName.trim() ? { institutionName: institutionName.trim() } : {})
+              }),
+            });
+            const data = await res.json();
+            if (res.ok && data.url) {
+              window.location.href = data.url;
+            } else {
+              showToast('error', data.error || 'Error al iniciar el pago.');
+            }
+          } catch (err: any) {
+            console.error('Error auto-redirecting to checkout:', err);
+            showToast('error', 'Error de red al iniciar el pago.');
+          }
+        })();
+      } else {
+        localStorage.removeItem('ediagil_pending_checkout_plan');
+        localStorage.removeItem('ediagil_pending_checkout_institution');
+      }
+    }
+  }, [user, dbPlan, loadingPlan]);
 
   useEffect(() => {
     const leftoverTourId = localStorage.getItem('tour_subject_id');
@@ -937,7 +994,7 @@ function CuadernoApp() {
               onNavigateToSubject={(id: string, tab: string) => {
                 setSelectedSubjectId(id);
                 setCurrentView("subject");
-                if (tab) setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules" | "calendar");
+                if (tab) setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules");
               }}
               onNewSubject={handleNewSubject}
               onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -1021,7 +1078,6 @@ function CuadernoApp() {
                 <div className="flex items-center gap-8 border-b border-neutral-200 mb-8 overflow-x-auto no-scrollbar scroll-smooth">
                   {[
                     { id: "modules", label: "Módulos y Materiales" },
-                    { id: "calendar", label: "Calendario" },
                     { id: "grades", label: "Calificaciones" },
                     { id: "attendance", label: "Asistencia" },
                     { id: "students", label: "Participantes" },
@@ -1029,7 +1085,7 @@ function CuadernoApp() {
                     <button
                       key={tab.id}
                       id={`tab-${tab.id}`}
-                      onClick={() => setActiveTab(tab.id as "modules" | "calendar" | "grades" | "attendance" | "students")}
+                      onClick={() => setActiveTab(tab.id as "modules" | "grades" | "attendance" | "students")}
                       title={`Sección de ${tab.label}`}
                       className={cn(
                          "pb-4 text-[10px] font-black uppercase tracking-[0.2em] transition-all border-b-4 whitespace-nowrap active:scale-95",
@@ -1062,11 +1118,6 @@ function CuadernoApp() {
                       }}
                       onDeleteNote={(id: string) => setNoteToDelete(id)}
                     />
-                  </div>
-                )}
-                {activeTab === "calendar" && (
-                  <div id="subject-calendar-section">
-                    <SubjectCalendar subjectId={selectedSubject.id!} />
                   </div>
                 )}
                 {activeTab === "grades" && (

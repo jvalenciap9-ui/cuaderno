@@ -14,7 +14,11 @@
     "deploy": "npm run build && firebase deploy",
     "deploy:rules": "firebase deploy --only firestore:rules,storage:rules",
     "deploy:indexes": "firebase deploy --only firestore:indexes",
-    "deploy:hosting": "npm run build && firebase deploy --only hosting"
+    "deploy:hosting": "npm run build && firebase deploy --only hosting",
+    "emulators": "node scripts/run-emulators.mjs",
+    "seed:emulator": "node scripts/seed-emulator.mjs",
+    "test:rules": "node scripts/test-rules.mjs",
+    "test:functions": "node scripts/test-functions.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.48.0",
@@ -45,6 +49,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.1",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react-joyride": "^2.0.2",

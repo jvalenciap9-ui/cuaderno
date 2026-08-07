@@ -447,7 +447,7 @@ export function LandingPage() {
                     </ul>
                   </div>
                   <button
-                    onClick={() => navigate('/login')}
+                    onClick={() => navigate(`/login?mode=signup&plan=${plan.id}`)}
                     title={`Elegir plan ${plan.name}`}
                     className={`w-full inline-flex items-center justify-center gap-2 py-4 rounded-2xl text-xs font-black uppercase tracking-widest text-white shadow-lg transition-all active:scale-95 ${accent.btn}`}
                   >

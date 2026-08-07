@@ -14,6 +14,12 @@ function getDb() {
   ensureInit();
   return admin.firestore();
 }
+
+// FieldValue (y el resto del namespace admin.firestore.*) solo existe DESPUÉS
+// de initializeApp(). Antes, capturarlo en carga de módulo devolvía undefined
+// y activateTrial/redeemLicenseKey/resolveTrialExpiry fallaban con
+// "Cannot read properties of undefined (reading 'serverTimestamp'|'delete')".
+ensureInit();
 const FieldValue = admin.firestore.FieldValue;
 
 // Duración de la prueba gratuita (14 días en milisegundos).
@@ -509,6 +515,8 @@ exports.activateTrial = onCall(async (request) => {
       throw err;
     }
     console.error('❌ activateTrial error:', err?.message || err);
+    // TEMP-DEBUG: diagnóstico del worker del emulador
+    console.error('TEMP-DEBUG admin.firestore.FieldValue =', typeof admin.firestore?.FieldValue, '| FieldValue =', typeof FieldValue, '| apps =', admin.apps?.length);
     throw new HttpsError('internal', 'Error al activar la prueba. Intenta de nuevo.');
   }
 });

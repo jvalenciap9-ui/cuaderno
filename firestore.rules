@@ -24,7 +24,12 @@ service cloud.firestore {
     // Política C8: "2 por año natural" = se cuentan las asignaturas CREADAS en
     // el año calendario actual (campo createdThisYear + yearKey). Borrar una
     // asignatura NO libera cupo del año. Un año nuevo resetea el contador a 1.
-    function currentYearKey() { return string(request.time.date().year); }
+    // ⚠️ TEMP-EMULADOR (revertir antes de producción): `request.time.date().year`
+    // falla con "Type error: Received [timestamp] Expected [map,path]" en el
+    // emulador de Firestore v1.21.0 (en producción Firestore sí lo soporta).
+    // Fórmula equivalente con toMillis() que funciona en ambos: para un
+    // múltiplo de 4 años desde 1970 la frontera cae EXACTA en 1 Ene 00:00 UTC.
+    function currentYearKey() { return string(1970 + int(request.time.toMillis() / 31557600000)); }
 
     function subjectCountWithinLimit() {
       let planPath = /databases/$(database)/documents/users/$(request.auth.uid);
@@ -35,8 +40,16 @@ service cloud.firestore {
       // HR-01: si el usuario tiene una prueba que ya expiró, el plan 'pro'
       // prestado por el trial no cuenta a efectos del límite → se trata como free.
       // Un usuario que pagó (paymentProvider distinto de 'trial') nunca se degrada.
-      let trialExpired = planDoc != null && planDoc.data.isTrial == true
+      // Los accesos a isTrial/trialEndsAt van precedidos por 'in' porque en
+      // CEL, leer una clave inexistente de un map lanza error de evaluación
+      // (y niega el write). El documento del cliente normalmente NO trae las
+      // claves del trial (son backend-only), así que sin la guardia la creación
+      // de una asignatura fallaría para cualquier usuario sin prueba.
+      let trialExpired = planDoc != null
+        && ('isTrial' in planDoc.data)
+        && planDoc.data.isTrial == true
         && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial')
+        && ('trialEndsAt' in planDoc.data)
         && planDoc.data.trialEndsAt is number
         && planDoc.data.trialEndsAt <= request.time.toMillis();
       let effectivePlan = trialExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);

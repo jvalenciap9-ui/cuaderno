@@ -35,12 +35,20 @@ export default defineConfig(({mode}) => {
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
       proxy: {
-        // Redirigir /api/* al servidor Express backend (puerto 3001)
-        '/api': {
-          target: `http://localhost:${env.API_PORT || 3001}`,
-          changeOrigin: true,
-          secure: false,
-        },
+        // Redirigir /api/* al servidor Express backend (puerto 3001) o, si
+        // VITE_EMULATORS=1, al emulador de Cloud Functions (puerto 5001).
+        '/api': env.VITE_EMULATORS === '1'
+          ? {
+              target: 'http://localhost:5001',
+              changeOrigin: true,
+              secure: false,
+              rewrite: (p) => p.replace(/^\/api/, `/ediagil-new-2026/us-central1`),
+            }
+          : {
+              target: `http://localhost:${env.API_PORT || 3001}`,
+              changeOrigin: true,
+              secure: false,
+            },
       },
     },
   };
