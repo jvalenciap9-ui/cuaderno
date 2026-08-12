@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-display: "Outfit", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
 div#root:nth-of-type(1) > div:nth-of-type(1) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) {
   margin-left: -20px !important;
 }
@@ -28,4 +33,56 @@ div#root:nth-of-type(1) > div:nth-of-type(1) > main:nth-of-type(1) > div:nth-of-
 
 :root {
   color-scheme: light;
+}
+
+/* ─── Boletín institucional ───────────────────────────────────────────────
+ * .report-container: área imprimible (documento). Todo lo interactivo vive
+ * fuera de ella y se oculta con .no-print al imprimir.
+ */
+.report-container {
+  font-family: 'Outfit', 'Plus Jakarta Sans', sans-serif;
+  color: #1A3C40;
+  background: white;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+/* Elementos que se ven en pantalla pero no al imprimir */
+.no-print {
+  /* visible en pantalla, oculto en impresión */
+}
+
+@media print {
+  /* Ocultar todo fuera del boletín */
+  body * {
+    visibility: hidden !important;
+  }
+  .report-container,
+  .report-container * {
+    visibility: visible !important;
+  }
+  .report-container {
+    position: absolute !important;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    border: none;
+    box-shadow: none;
+  }
+  /* Ocultar el botón de impresión y cualquier UI */
+  .no-print,
+  button,
+  nav,
+  aside,
+  header,
+  footer {
+    display: none !important;
+  }
+  /* Ajustes de página */
+  @page {
+    size: A4;
+    margin: 15mm;
+  }
 }
