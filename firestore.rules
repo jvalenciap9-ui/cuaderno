@@ -147,9 +147,18 @@ service cloud.firestore {
         return ('groupId' in data)
           && data.groupId is string
           && isValidId(data.groupId)
-          && exists(/databases/$(database)/documents/classGroups/$(data.groupId))
-          && get(/databases/$(database)/documents/classGroups/$(data.groupId)).data.userId == request.auth.uid
-          && get(/databases/$(database)/documents/classGroups/$(data.groupId)).data.modalidad == 'varias';
+          && (
+            exists(/databases/$(database)/documents/classGroups/$(data.groupId))
+            || existsAfter(/databases/$(database)/documents/classGroups/$(data.groupId))
+          )
+          && (
+            (exists(/databases/$(database)/documents/classGroups/$(data.groupId)) && get(/databases/$(database)/documents/classGroups/$(data.groupId)).data.userId == request.auth.uid)
+            || (existsAfter(/databases/$(database)/documents/classGroups/$(data.groupId)) && getAfter(/databases/$(database)/documents/classGroups/$(data.groupId)).data.userId == request.auth.uid)
+          )
+          && (
+            (exists(/databases/$(database)/documents/classGroups/$(data.groupId)) && get(/databases/$(database)/documents/classGroups/$(data.groupId)).data.modalidad == 'varias')
+            || (existsAfter(/databases/$(database)/documents/classGroups/$(data.groupId)) && getAfter(/databases/$(database)/documents/classGroups/$(data.groupId)).data.modalidad == 'varias')
+          );
       }
       allow create: if isSignedIn() && isValidId(subjectId) && isValidSubject(request.resource.data)
         && (isInternalAulaMateria(request.resource.data) || subjectCountWithinLimit());

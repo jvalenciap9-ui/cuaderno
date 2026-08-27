@@ -61,6 +61,17 @@ export function normalizeName(s: string): string {
   return String(s ?? '').trim().replace(/\s+/g, ' ');
 }
 
+export function computeAulaDisplayName(grado: string, seccion: string, customName?: string): string {
+  const custom = normalizeName(customName || '');
+  if (custom) return custom;
+  const g = normalizeName(grado);
+  const s = normalizeName(seccion);
+  if (g && s) return `${g} ${s}`;
+  if (g) return g;
+  if (s) return `Sección ${s}`;
+  return '';
+}
+
 export function nameKey(s: string): string {
   const n = normalizeName(s).toLowerCase();
   return n.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
