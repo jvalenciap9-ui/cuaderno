@@ -12,6 +12,7 @@ import {
   Plus,
   BookMarked,
   Calendar,
+  Clock,
   User,
   Trash2,
   Edit3,
@@ -26,12 +27,17 @@ import {
   Download,
   Upload,
   ArrowLeft,
+  Users,
 } from "lucide-react";
 import {
   exportSubjectToJSON,
   triggerJSONDownload,
+  triggerGroupJSONDownload,
   importSubjectFromJSON,
   isValidBackup,
+  isValidGroupBackup,
+  importClassGroupFromJSON,
+  exportClassGroupToJSON,
 } from "./lib/jsonSyncUtils";
 import { format, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
@@ -46,7 +52,6 @@ import { StudentsTab } from "./components/StudentsTab";
 import { ModulesTab } from "./components/ModulesTab";
 import { UserGuide } from "./components/UserGuide";
 import { AdminDashboard } from "./components/AdminDashboard";
-import type { SubjectDoc, NoteDoc } from "./types/firestore";
 import { cn } from "./lib/utils";
 import {
   initGA,
@@ -64,15 +69,29 @@ import { handleFirestoreError, OperationType } from './lib/firestoreUtils';
 import { ToastContainer } from './components/ToastContainer';
 import { TooltipProvider } from './components/TooltipProvider';
 import { GradeSettingsProvider } from './contexts/GradeSettingsContext';
+import { AdminFiltersProvider } from './contexts/AdminFiltersContext';
+import { SidebarFilters } from './components/SidebarFilters';
 import { STORAGE_KEYS, getStorageItem, setStorageItem, clearAppStorage } from './lib/storageKeys';
 import { db as dexieDb } from './lib/db';
 import { usePlan } from './hooks/usePlan';
+import { useInstitution } from './hooks/useInstitution';
 import { showToast } from './hooks/useToast';
 import { checkGeminiHealth } from './lib/geminiClient';
 import { useNetworkStatus } from './hooks/useNetworkStatus';
 import { addSubjectCounterOp } from './lib/subjectCounter';
 import { navigate, usePathname } from './lib/router';
 import { LandingPage } from './components/LandingPage';
+// Modo Demo (VITE_DEMO_MODE=true): evita lecturas a Firestore/IA reales.
+import { IS_DEMO_MODE } from './lib/demoAdminData';
+// ── Aula/Grupo multiasignatura ──────────────────────────────────────────────
+import type { ClassGroupDoc, SubjectDoc, NoteDoc } from "./types/firestore";
+import {
+  canCreateClassGroup,
+  canCreateStandaloneSubject,
+  planSubjectDeletion,
+  siblingsOf,
+  lastMateriaStorageKey,
+} from './lib/classGroups';
 
 export default function App() {
   const { user } = useAuth();
@@ -103,7 +122,7 @@ export default function App() {
 
   // ── Verificar disponibilidad del servidor proxy al iniciar ───────────────
   useEffect(() => {
-    if (!import.meta.env.DEV) return;
+    if (!import.meta.env.DEV || IS_DEMO_MODE) return;
     checkGeminiHealth().then(({ ok, hasKey, error }) => {
       if (!ok) {
         showToast('error', `Servidor IA no disponible: ${error || 'Inicia el servidor con npm run dev:full'}`, 8000);
@@ -114,8 +133,13 @@ export default function App() {
   }, []);
 
   // Normalizar la URL a /app cuando el usuario está autenticado
+  // (no redirigir desde '/' en modo normal para poder trabajar en la landing
+  // estando logueado; en modo demo sí se fuerza la entrada directa a la app).
   useEffect(() => {
-    if (user && (pathname === '/' || pathname === '/login')) {
+    const shouldNormalizeToApp =
+      (user && pathname === '/login') ||
+      (IS_DEMO_MODE && user && pathname !== '/app' && pathname !== '/login');
+    if (shouldNormalizeToApp) {
       window.history.replaceState({}, '', '/app');
       window.dispatchEvent(new PopStateEvent('popstate'));
     }
@@ -123,18 +147,24 @@ export default function App() {
 
   useNetworkStatus();
 
-  if (!user) {
-    if (pathname === '/login' || pathname === '/app') {
-      return <LoginScreen onBack={() => navigate('/')} />;
-    }
-    return <LandingPage />;
+  // Si no hay usuario y se intenta entrar a la app, mostrar login
+  if (!user && (pathname === '/login' || pathname === '/app')) {
+    return <LoginScreen onBack={() => navigate('/')} />;
+  }
+
+  // Mostrar la landing page en la raíz y sub-rutas, incluso si estamos logueados (para diseño).
+  // En modo demo la app se muestra directo: el host demo nunca cae en la landing.
+  if (pathname !== '/app' && pathname !== '/login' && !(IS_DEMO_MODE && user)) {
+    return <LandingPage pathname={pathname} />;
   }
 
   return (
     <TooltipProvider>
       <ToastContainer />
       <GradeSettingsProvider>
-        <CuadernoApp />
+        <AdminFiltersProvider>
+          <CuadernoApp />
+        </AdminFiltersProvider>
       </GradeSettingsProvider>
     </TooltipProvider>
   );
@@ -341,6 +371,9 @@ function LoginScreen({ onBack }: { onBack: () => void }) {
 function CuadernoApp() {
   const { user, logOut } = useAuth();
   const { plan: dbPlan, loading: loadingPlan, isAdmin, profile } = usePlan();
+  // Personalización institucional (Módulo 5): nombre, logo y color primario
+  // del admin, reflejados para TODOS los docentes de la institución.
+  const institution = useInstitution();
   const [currentView, setCurrentView] = useState<"dashboard" | "subject" | "admin">(
     "subject",
   );
@@ -376,10 +409,18 @@ function CuadernoApp() {
   }, []);
 
   useEffect(() => {
-    if (isAdmin && currentView === "dashboard") {
+    if (isAdmin && currentView !== "admin") {
       setCurrentView("admin");
     }
   }, [isAdmin, currentView]);
+
+  // Guarda de rol: un docente nunca debe poder aterrizar en la vista admin
+  // (ni por ruta directa ni por estado), se le redirige a su dashboard o asignatura.
+  useEffect(() => {
+    if (!isAdmin && currentView === "admin") {
+      setCurrentView(selectedSubjectId ? "subject" : "dashboard");
+    }
+  }, [isAdmin, currentView, selectedSubjectId]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -391,6 +432,39 @@ function CuadernoApp() {
       window.dispatchEvent(new PopStateEvent('popstate'));
     }
   }, []);
+
+  // Notificación de vencimiento de suscripción o prueba (7 días antes)
+  useEffect(() => {
+    if (loadingPlan || !profile) return;
+    
+    const notified = sessionStorage.getItem('ediagil_expiration_notified');
+    if (notified) return;
+
+    const now = Date.now();
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+    
+    // Check for trial expiration
+    const profileAny = profile as any;
+    if (profileAny.isTrial && profileAny.trialEndsAt && profileAny.trialEndsAt > now) {
+      const timeRemaining = profileAny.trialEndsAt - now;
+      if (timeRemaining <= SEVEN_DAYS_MS) {
+        const daysLeft = Math.ceil(timeRemaining / (24 * 60 * 60 * 1000));
+        showToast('warning', `¡Tu prueba gratuita expira en ${daysLeft} día${daysLeft === 1 ? '' : 's'}! Activa un plan para mantener los beneficios.`);
+        sessionStorage.setItem('ediagil_expiration_notified', 'true');
+        return;
+      }
+    }
+    
+    // Check for paid plan expiration
+    if (dbPlan !== 'free' && profile.expiresAt && profile.expiresAt > now) {
+      const timeRemaining = (profile.expiresAt as number) - now;
+      if (timeRemaining <= SEVEN_DAYS_MS) {
+        const daysLeft = Math.ceil(timeRemaining / (24 * 60 * 60 * 1000));
+        showToast('warning', `¡Tu plan ${dbPlan === 'school' ? 'Institucional' : 'Premium Pro'} expira en ${daysLeft} día${daysLeft === 1 ? '' : 's'}! Renueva para no perder acceso a las funciones avanzadas.`);
+        sessionStorage.setItem('ediagil_expiration_notified', 'true');
+      }
+    }
+  }, [loadingPlan, profile, dbPlan]);
 
   // Procesar plan pendiente seleccionado desde la landing page tras registrarse
   useEffect(() => {
@@ -472,10 +546,21 @@ function CuadernoApp() {
   }, [currentView, selectedSubjectId, activeTab]);
 
   const subjectsRef = collection(db, 'subjects');
-  const subjectsQuery = user?.uid ? query(subjectsRef, where('userId', '==', user?.uid), limit(500)) : null;
+  // En modo demo no se consulta Firestore real (el admin no ve la lista de
+  // asignaturas de todos modos).
+  const subjectsQuery = !IS_DEMO_MODE && user?.uid ? query(subjectsRef, where('userId', '==', user?.uid), limit(500)) : null;
   const [subjects = [], loadingSubjects] = useCustomCollectionData(subjectsQuery);
 
+  // ── Aula/Grupo multiasignatura: grupos reales del docente (live) ─────────
+  const classGroupsQuery = !IS_DEMO_MODE && user?.uid ? query(collection(db, 'classGroups'), where('userId', '==', user?.uid), limit(200)) : null;
+  const [groups = [], loadingGroups] = useCustomCollectionData<ClassGroupDoc>(classGroupsQuery);
+
+  /** Materias hermanas del aula de una asignatura, en orden estable. */
+  const aulaMateriasOf = (subject: SubjectDoc | undefined): SubjectDoc[] =>
+    subject?.groupId ? siblingsOf(subjects as SubjectDoc[], subject.groupId) : [];
+
   const selectedSubject = subjects.find((s) => s.id === selectedSubjectId);
+  const selectedGroup = selectedSubject?.groupId ? groups.find((g) => g.id === selectedSubject.groupId) ?? null : null;
 
   const [activeSubscription, setActiveSubscription] = useState<
     "free" | "pro" | "school"
@@ -526,6 +611,7 @@ function CuadernoApp() {
           plan: 'trimestral',
           teacher: '',
           schedule: '',
+          periodo: null,
         });
         await addSubjectCounterOp(batch, user.uid, +1);
         await batch.commit();
@@ -603,19 +689,51 @@ function CuadernoApp() {
     setIsSubjectModalOpen(true);
   };
 
+  /**
+   * Aula/Grupo: validación previa de límites según la modalidad elegida en el
+   * modal. Fuente central de permisos (usePlan/PLAN_LIMITS + classGroups):
+   * NADA hardcodeado aquí. Gratis = 2 unidades (asignaturas independientes +
+   * aulas) y máximo 1 aula; las materias internas NO consumen cuota.
+   */
+  const checkCanCreate = (modality: 'una' | 'varias'): string | null => {
+    if (activeSubscription !== 'free') return null;
+    const decision = modality === 'varias'
+      ? canCreateClassGroup('free', subjects as SubjectDoc[], groups as ClassGroupDoc[])
+      : canCreateStandaloneSubject('free', subjects as SubjectDoc[], groups as ClassGroupDoc[]);
+    return decision.allowed ? null : decision.reason ?? null;
+  };
+
+  const handleCreated = (result: { kind: 'subject'; subjectId: string } | { kind: 'group'; groupId: string; firstMateriaId: string }) => {
+    if (result.kind === 'group') {
+      setSelectedSubjectId(result.firstMateriaId);
+    } else {
+      setSelectedSubjectId(result.subjectId);
+    }
+    setCurrentView('subject');
+  };
+
+  /** Cambio de materia DENTRO de un mismo aula (selector de Calificaciones/Planificación). */
+  const handleSelectAulaMateria = (materiaId: string) => {
+    const materia = subjects.find((s) => s.id === materiaId);
+    if (!materia) return;
+    // Recordar la última materia usada POR AULA.
+    try {
+      if (materia.groupId) localStorage.setItem(lastMateriaStorageKey(materia.groupId), String(materiaId));
+    } catch { /* storage lleno/bloqueado: no bloquear el cambio */ }
+    setSelectedSubjectId(String(materiaId));
+  };
+
   const handleNewSubject = () => {
     if (activeSubscription === "free") {
-      const currentYear = new Date().getFullYear();
-      const subjectsThisYear = subjects.filter(
-        (s) => {
-          const created = s.createdAt ? new Date(s.createdAt) : null;
-          return created !== null && created.getFullYear() === currentYear;
-        },
-      );
-      if (subjectsThisYear.length >= 2) {
-        showToast('warning', 'Has alcanzado el límite de 2 asignaturas por año en el plan gratis. Mejora tu plan en Configuración para crear hasta 999.');
+      // Límite por UNIDADES (asignaturas independientes + aulas; máx 1 aula).
+      const decision = canCreateStandaloneSubject('free', subjects as SubjectDoc[], groups as ClassGroupDoc[]);
+      const groupDecision = canCreateClassGroup('free', subjects as SubjectDoc[], groups as ClassGroupDoc[]);
+      if (!decision.allowed && !groupDecision.allowed) {
+        showToast('warning', groupDecision.reason || decision.reason || 'Has alcanzado tu límite del plan gratuito.');
         return;
       }
+      // Con al menos una modalidad posible se abre el modal (la validación
+      // fina por modalidad vive en checkCanCreate).
     }
     setSubjectToEdit(null);
     setIsSubjectModalOpen(true);
@@ -623,20 +741,50 @@ function CuadernoApp() {
 
   const handleDeleteSubject = async (id: string) => {
     try {
-      // Create a batch
+      // ── Aula/Grupo: plan de eliminación inteligente ────────────────────
+      // - Asignatura independiente → como siempre (counter -1).
+      // - Materia intermedia de un aula → solo se borra ELLA (counter 0);
+      //   si era la canónica, participantes/asistencia se MUEVEN a la
+      //   siguiente hermana (cero pérdida de historial).
+      // - Última materia del aula → borra también el doc del aula y libera
+      //   la unidad (counter -1).
+      const plan = planSubjectDeletion(subjects as SubjectDoc[], groups as ClassGroupDoc[], id);
+      if (!plan.found) return;
+
       const batch = writeBatch(db);
-      
       batch.delete(doc(db, 'subjects', id));
 
+      if (plan.isGrouped && plan.reassignTo) {
+        // Reasignar la lista compartida al nuevo canonical del aula.
+        for (const collName of ['students', 'attendance'] as const) {
+          const q = query(collection(db, collName), where('subjectId', '==', id), where('userId', '==', user?.uid), limit(500));
+          const snapshot = await getDocs(q);
+          snapshot.docs.forEach((docSnap) => batch.update(docSnap.ref, { subjectId: plan.reassignTo! }));
+        }
+      }
+
       const subCollections = ['notes', 'materials', 'subjectModules', 'calendarEvents', 'evaluations', 'students', 'grades', 'attendance'];
-      
-      for (const collName of subCollections) {
+      // Si la canónica se está moviendo a otra hermana, NO borrar la lista
+      // compartida: ya fue REASIGNADA arriba (las queries ven estado
+      // pre-batch; borrar aquí eliminaría lo recién movido).
+      const collsToDelete = (plan.isGrouped && plan.reassignTo)
+        ? subCollections.filter((c) => c !== 'students' && c !== 'attendance')
+        : subCollections;
+
+      for (const collName of collsToDelete) {
         const q = query(collection(db, collName), where('subjectId', '==', id), where('userId', '==', user?.uid), limit(500));
         const snapshot = await getDocs(q);
         snapshot.docs.forEach((docSnap) => batch.delete(docSnap.ref));
       }
 
-      if (user?.uid) await addSubjectCounterOp(batch, user.uid, -1);
+      if (!plan.isGrouped || plan.deleteGroup) {
+        if (user?.uid) await addSubjectCounterOp(batch, user.uid, -1);
+      }
+      const targetGroupId = subjects.find((s) => s.id === id)?.groupId;
+      if (plan.deleteGroup && targetGroupId) {
+        batch.delete(doc(db, 'classGroups', targetGroupId));
+      }
+
       await batch.commit();
 
       if (selectedSubjectId === id) setSelectedSubjectId(null);
@@ -666,6 +814,20 @@ function CuadernoApp() {
     if (!user) return;
     try {
       showToast('info', 'Generando archivo de exportación...');
+      // Aula/Grupo: exporta el aula COMPLETA (materias + lista compartida).
+      const materias = aulaMateriasOf(subject);
+      if (subject.groupId && materias.length >= 2) {
+        const groupName = groups.find((g) => g.id === subject.groupId)?.name || subject.groupId;
+        const backup = await exportClassGroupToJSON(
+          user.uid,
+          subject.groupId,
+          groupName,
+          materias.map((m) => ({ id: m.id!, name: m.name })),
+        );
+        triggerGroupJSONDownload(backup, groupName);
+        showToast('success', 'Aula exportada con éxito (todas sus materias y la lista compartida).');
+        return;
+      }
       const backup = await exportSubjectToJSON(user.uid, subject.id);
       triggerJSONDownload(backup, subject.name);
       showToast('success', 'Asignatura exportada con éxito.');
@@ -690,7 +852,11 @@ function CuadernoApp() {
     reader.onload = (event) => {
       try {
         const json = JSON.parse(event.target?.result as string);
-        if (isValidBackup(json)) {
+        // Aula/Grupo (v1.1) primero; asignatura suelta (v1.0) después.
+        if (isValidGroupBackup(json)) {
+          setImportedBackupData(json);
+          setIsImportModalOpen(true);
+        } else if (isValidBackup(json)) {
           setImportedBackupData(json);
           setIsImportModalOpen(true);
         } else {
@@ -717,6 +883,20 @@ function CuadernoApp() {
     if (!user || !importedBackupData) return;
     setIsImportingLoading(true);
     try {
+      // ── Aula/Grupo (v1.1): restaurar aula completa ──
+      if (isValidGroupBackup(importedBackupData)) {
+        if (mode === 'overwrite') {
+          showToast('warning', 'La sobrescritura aplica a asignaturas individuales; el aula se importará como nueva.');
+        }
+        showToast('info', 'Restaurando el aula completa (materias, participantes y asistencia)...');
+        const res = await importClassGroupFromJSON(user.uid, importedBackupData);
+        showToast('success', 'Aula importada con éxito.');
+        setSelectedSubjectId(res.firstMateriaId);
+        setCurrentView('subject');
+        setIsImportModalOpen(false);
+        setImportedBackupData(null);
+        return;
+      }
       showToast('info', mode === 'create' ? 'Creando asignatura...' : 'Sobrescribiendo asignatura...');
       const newSubjectId = await importSubjectFromJSON(
         user.uid,
@@ -761,24 +941,31 @@ function CuadernoApp() {
           <div className="flex items-center gap-4">
             {isAdmin ? (
               <>
-                <img src="/logo.webp" alt="Logo EdiAgil" className="app-logo w-7 h-7 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
+                <img src={institution.logoUrl || '/logo.webp'} alt="Logo institucional" className="app-logo w-7 h-7 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
                 <div>
                   <h1 className="font-black text-xl tracking-tight text-neutral-900">
                     Panel Institucional
                   </h1>
-                  <p className="text-xs font-medium text-neutral-500">
-                    {profile?.institutionName || 'Cuenta institucional'}
+                  <p className="text-xs font-medium text-neutral-500 truncate">
+                    {institution.name || profile?.institutionName || 'Cuenta institucional'}
                   </p>
                 </div>
               </>
             ) : (
               <>
-                <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/20">
-                  <img src="/logo.webp" alt="Logo" className="app-logo w-5 h-5 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
+                <div className="w-10 h-10 rounded-xl bg-[var(--institution-primary)] flex items-center justify-center text-white shadow-lg">
+                  <img src={institution.logoUrl || '/logo.webp'} alt="Logo institucional" className="app-logo w-5 h-5 object-contain" style={{ filter: 'none', backgroundColor: 'transparent' }} />
                 </div>
-                <h1 className="font-black text-xl tracking-tight text-neutral-900">
-                  Mi Cuaderno
-                </h1>
+                <div className="min-w-0">
+                  <h1 className="font-black text-xl tracking-tight text-neutral-900">
+                    Mi Cuaderno
+                  </h1>
+                  {institution.name && (
+                    <p className="text-xs font-medium text-neutral-500 truncate">
+                      {institution.name}
+                    </p>
+                  )}
+                </div>
               </>
             )}
           </div>
@@ -804,7 +991,7 @@ function CuadernoApp() {
               className={cn(
                 "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all mb-6 hover:scale-[1.02] active:scale-95 group",
                 currentView === "dashboard"
-                  ? "bg-indigo-600 text-white shadow-xl shadow-indigo-500/20"
+                  ? "bg-[var(--institution-primary)] text-[var(--institution-primary-contrast)] shadow-xl"
                   : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900",
               )}
             >
@@ -817,7 +1004,7 @@ function CuadernoApp() {
                 <LayoutDashboard
                   className={cn(
                     "hidden w-5 h-5 transition-transform group-hover:rotate-12",
-                    currentView === "dashboard" ? "text-white" : "text-neutral-400",
+                    currentView === "dashboard" ? "text-[var(--institution-primary-contrast)]" : "text-neutral-400",
                   )}
                 />
               </div>
@@ -838,7 +1025,7 @@ function CuadernoApp() {
               className={cn(
                 "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all mb-6 hover:scale-[1.02] active:scale-95 group",
                 currentView === "admin"
-                  ? "bg-blue-600 text-white shadow-xl shadow-blue-500/20"
+                  ? "bg-[var(--institution-primary)] text-[var(--institution-primary-contrast)] shadow-xl"
                   : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900",
               )}
             >
@@ -851,63 +1038,153 @@ function CuadernoApp() {
                 <LayoutDashboard
                   className={cn(
                     "hidden w-5 h-5 transition-transform group-hover:rotate-12",
-                    currentView === "admin" ? "text-white" : "text-neutral-400",
+                    currentView === "admin" ? "text-[var(--institution-primary-contrast)]" : "text-neutral-400",
                   )}
                 />
               </div>
               <span className="font-black text-sm uppercase tracking-widest">
-                Panel Administrativo
+                Dashboard Administrativo
               </span>
             </button>
           )}
 
+          {/* Filtros del panel admin (turno + nivel educativo) en el sidebar */}
+          {isAdmin && <SidebarFilters />}
+
+          {!isAdmin && (
+          <>
           <div className="text-[10px] font-black text-neutral-400 uppercase tracking-[0.2em] mb-6 px-4">
             Asignaturas
           </div>
 
-          {!loadingSubjects && subjects.length === 0 ? (
+          {!loadingSubjects && !loadingGroups && subjects.length === 0 ? (
             <div className="text-center px-6 py-12 text-neutral-400 text-sm font-medium italic bg-neutral-50 rounded-3xl border border-dashed border-neutral-200">
               No tienes asignaturas aún.
             </div>
           ) : (
             <div className="space-y-2">
-              {subjects.map((subject: SubjectDoc) => (
-                <button
-                  key={subject.id}
-                  title="Seleccionar esta asignatura"
-                  onClick={() => {
-                    setSelectedSubjectId(subject.id);
-                    setCurrentView("subject");
-                    setIsSidebarOpen(false);
-                  }}
-                  className={cn(
-                    "w-full flex items-center justify-between px-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95",
-                    selectedSubjectId === subject.id &&
-                      currentView === "subject"
-                      ? "bg-neutral-100 text-neutral-900 shadow-sm border border-neutral-200"
-                      : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 border border-transparent",
-                  )}
-                >
-                  <div className="flex items-center gap-4 truncate">
-                    <div
-                      className="w-3.5 h-3.5 rounded-full shrink-0 shadow-sm border-2 border-white"
-                      style={{ backgroundColor: subject.color }}
-                    />
-                    <span className="truncate font-black text-sm">
-                      {subject.name}
-                    </span>
-                  </div>
-                  <ChevronRight
-                    className={cn(
-                      "w-4 h-4 shrink-0 transition-all duration-300",
-                      selectedSubjectId === subject.id
-                        ? "opacity-100 translate-x-0 text-indigo-600"
-                        : "opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0",
-                    )}
-                  />
-                </button>
-              ))}
+              {/* ── Aulas/Grupos primero (etiqueta + sus materias), luego las
+                  asignaturas independientes. Las antiguas se ven EXACTAMENTE
+                  igual que siempre. ── */}
+              {(() => {
+                type Item =
+                  | { kind: 'aula'; group: ClassGroupDoc; members: SubjectDoc[] }
+                  | { kind: 'solo'; subject: SubjectDoc };
+                const items: Item[] = [];
+                const inAula = new Set<string>();
+                for (const g of groups) {
+                  const members = siblingsOf(subjects as SubjectDoc[], g.id);
+                  if (members.length > 0) {
+                    items.push({ kind: 'aula', group: g, members });
+                    members.forEach((m) => inAula.add(String(m.id)));
+                  }
+                }
+                for (const s of subjects as SubjectDoc[]) {
+                  if (!inAula.has(String(s.id))) items.push({ kind: 'solo', subject: s });
+                }
+
+                /** Abre una asignatura; si pertenece a un aula, restaura la
+                    última materia usada en ESE aula (memoria por aula). */
+                const openSubject = (subject: SubjectDoc) => {
+                  let targetId = String(subject.id);
+                  if (subject.groupId) {
+                    try {
+                      const last = localStorage.getItem(lastMateriaStorageKey(subject.groupId));
+                      const validLast = last
+                        ? siblingsOf(subjects as SubjectDoc[], subject.groupId).some((m) => m.id === last)
+                        : false;
+                      if (validLast) targetId = last!;
+                    } catch { /* storage bloqueado: usar la materia clicada */ }
+                  }
+                  setSelectedSubjectId(targetId);
+                  setCurrentView("subject");
+                  setIsSidebarOpen(false);
+                };
+
+                return items.map((item) =>
+                  item.kind === 'aula' ? (
+                    <div key={`aula-${item.group.id}`} className="pt-2">
+                      <div className="flex items-center gap-2 px-4 pb-1.5">
+                        <Users className="w-3 h-3 text-[var(--institution-primary)]" />
+                        <span className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-500 truncate">
+                          Aula · {item.group.name}
+                        </span>
+                        <span className="ml-auto shrink-0 text-[9px] font-black text-neutral-400 bg-neutral-100 rounded-full px-2 py-0.5">
+                          {item.members.length} materias
+                        </span>
+                      </div>
+                      <div className="space-y-2">
+                        {item.members.map((subject) => (
+                          <button
+                            key={subject.id}
+                            title="Abrir esta materia del aula"
+                            onClick={() => openSubject(subject)}
+                            className={cn(
+                              "w-full flex items-center justify-between pl-6 pr-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95",
+                              selectedSubjectId === subject.id &&
+                                currentView === "subject"
+                                ? "bg-neutral-100 text-neutral-900 shadow-sm border border-neutral-200"
+                                : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 border border-transparent",
+                            )}
+                          >
+                            <div className="flex items-center gap-4 truncate">
+                              <div
+                                className="w-3.5 h-3.5 rounded-full shrink-0 shadow-sm border-2 border-white"
+                                style={{ backgroundColor: subject.color }}
+                              />
+                              <span className="truncate font-black text-sm">
+                                {subject.name}
+                              </span>
+                            </div>
+                            <ChevronRight
+                              className={cn(
+                                "w-4 h-4 shrink-0 transition-all duration-300",
+                                selectedSubjectId === subject.id
+                                  ? "opacity-100 translate-x-0 text-[var(--institution-primary)]"
+                                  : "opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0",
+                              )}
+                            />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      key={item.subject.id}
+                      title="Seleccionar esta asignatura"
+                      onClick={() => openSubject(item.subject)}
+                      className={cn(
+                        "w-full flex items-center justify-between px-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95",
+                        selectedSubjectId === item.subject.id &&
+                          currentView === "subject"
+                          ? "bg-neutral-100 text-neutral-900 shadow-sm border border-neutral-200"
+                          : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 border border-transparent",
+                      )}
+                    >
+                      <div className="flex items-center gap-4 truncate">
+                        <div
+                          className="w-3.5 h-3.5 rounded-full shrink-0 shadow-sm border-2 border-white"
+                          style={{ backgroundColor: item.subject.color }}
+                        />
+                        <span className="truncate font-black text-sm">
+                          {item.subject.name}
+                        </span>
+                      </div>
+                      <ChevronRight
+                        className={cn(
+                          "w-4 h-4 shrink-0 transition-all duration-300",
+                          selectedSubjectId === item.subject.id
+                            ? "opacity-100 translate-x-0 text-[var(--institution-primary)]"
+                            : "opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0",
+                        )}
+                      />
+                    </button>
+                  ),
+                );
+              })()}
             </div>
+          )}
+          </>
           )}
         </div>
 
@@ -924,6 +1201,7 @@ function CuadernoApp() {
               Configuración
             </span>
           </button>
+          {!isAdmin && (
           <button
             id="new-subject-btn"
             onClick={handleNewSubject}
@@ -933,6 +1211,8 @@ function CuadernoApp() {
             <Plus className="w-5 h-5" />
             Nueva Asignatura
           </button>
+          )}
+          {!isAdmin && (
           <button
             id="import-subject-btn"
             onClick={triggerFileInputClick}
@@ -942,6 +1222,7 @@ function CuadernoApp() {
             <Upload className="w-4 h-4 text-neutral-500" />
             Importar JSON
           </button>
+          )}
           <input
             type="file"
             accept=".json"
@@ -964,7 +1245,7 @@ function CuadernoApp() {
       {/* Main Content */}
       <main className="flex-1 flex flex-col min-w-0 bg-neutral-50 relative">
         {/* Mobile Header */}
-        <header className="md:hidden flex items-center gap-4 p-6 border-b border-neutral-200 bg-white shadow-sm">
+        <header className="md:hidden flex items-center gap-4 p-6 border-b-[3px] border-b-[var(--institution-primary)] bg-white shadow-sm">
           <button
             aria-label="Abrir menú"
             title="Abrir menú lateral"
@@ -984,7 +1265,7 @@ function CuadernoApp() {
           </span>
         </header>
 
-        {currentView === "admin" ? (
+        {currentView === "admin" && isAdmin ? (
           <div className="flex-1 overflow-y-auto custom-scrollbar">
             <AdminDashboard />
           </div>
@@ -1017,28 +1298,56 @@ function CuadernoApp() {
                       </h2>
                     </div>
                     <div className="flex flex-wrap items-center gap-4 text-sm text-neutral-500 mt-6">
+                      {/* Chip del Aula/Grupo (solo materias agrupadas): nombre
+                          del aula + grado y sección. */}
+                      {selectedGroup && (
+                        <div className="flex items-center gap-2.5 bg-[#F0F7F4] px-4 py-2 rounded-xl border border-[#1A3C40]/10 shadow-sm">
+                          <Users className="w-4 h-4 text-[#1A3C40]" />
+                          <span className="font-bold text-[#1A3C40] text-xs">
+                            {selectedGroup.name}
+                            {(selectedGroup.grado || selectedGroup.seccion) && (
+                              <span className="text-neutral-500 font-bold">
+                                {' · '}
+                                {[selectedGroup.grado, selectedGroup.seccion].filter(Boolean).join(' ')}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      )}
                       {selectedSubject.plan &&
                         selectedSubject.plan !== "otro" && (
-                          <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-indigo-200 transition-colors">
-                            <Layers className="w-4 h-4 text-indigo-500" />
+                          <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-[var(--institution-primary)]/40 transition-colors">
+                            <Layers className="w-4 h-4 text-[var(--institution-primary)]" />
                             <span className="font-bold uppercase text-[10px] tracking-widest">
                               {selectedSubject.plan.replace("_", " ")}
                             </span>
                           </div>
                         )}
                       {selectedSubject.teacher && (
-                        <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-indigo-200 transition-colors">
-                          <User className="w-4 h-4 text-indigo-500" />
+                        <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-[var(--institution-primary)]/40 transition-colors">
+                          <User className="w-4 h-4 text-[var(--institution-primary)]" />
                           <span className="font-bold">
                             {selectedSubject.teacher}
                           </span>
                         </div>
                       )}
                       {selectedSubject.schedule && (
-                        <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-indigo-200 transition-colors">
-                          <Calendar className="w-4 h-4 text-indigo-500" />
+                        <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-[var(--institution-primary)]/40 transition-colors">
+                          <Calendar className="w-4 h-4 text-[var(--institution-primary)]" />
                           <span className="font-bold">
                             {selectedSubject.schedule}
+                          </span>
+                        </div>
+                      )}
+                      {selectedSubject.periodo && (
+                        <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-indigo-200 transition-colors">
+                          <Clock className="w-4 h-4 text-indigo-500" />
+                          <span className="font-bold capitalize">
+                            {selectedSubject.periodo === 'matutino'
+                              ? 'Matutino'
+                              : selectedSubject.periodo === 'vespertino'
+                                ? 'Vespertino'
+                                : 'Nocturno'}
                           </span>
                         </div>
                       )}
@@ -1050,7 +1359,7 @@ function CuadernoApp() {
                       <button
                         aria-label="Exportar JSON"
                         onClick={() => handleExportJSON(selectedSubject)}
-                        className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all active:scale-90"
+                        className="p-3 text-neutral-400 hover:text-[var(--institution-primary)] hover:bg-[var(--institution-primary)]/10 rounded-xl transition-all active:scale-90"
                         title="Exportar asignatura como JSON"
                       >
                         <Download className="w-6 h-6" />
@@ -1058,7 +1367,7 @@ function CuadernoApp() {
                       <button
                         aria-label="Editar asignatura"
                         onClick={() => handleEditSubject(selectedSubject)}
-                        className="p-3 text-neutral-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all active:scale-90"
+                        className="p-3 text-neutral-400 hover:text-[var(--institution-primary)] hover:bg-[var(--institution-primary)]/10 rounded-xl transition-all active:scale-90"
                         title="Editar asignatura"
                       >
                         <Edit3 className="w-6 h-6" />
@@ -1089,8 +1398,8 @@ function CuadernoApp() {
                       title={`Sección de ${tab.label}`}
                       className={cn(
                          "pb-4 text-[10px] font-black uppercase tracking-[0.2em] transition-all border-b-4 whitespace-nowrap active:scale-95",
-                        activeTab === tab.id
-                          ? "border-indigo-600 text-indigo-600"
+                         activeTab === tab.id
+                          ? "border-[var(--institution-primary)] text-neutral-900"
                           : "border-transparent text-neutral-400 hover:text-neutral-600",
                       )}
                     >
@@ -1117,12 +1426,18 @@ function CuadernoApp() {
                         setIsNoteModalOpen(true);
                       }}
                       onDeleteNote={(id: string) => setNoteToDelete(id)}
+                      aulaMaterias={aulaMateriasOf(selectedSubject)}
+                      onSelectMateria={handleSelectAulaMateria}
                     />
                   </div>
                 )}
                 {activeTab === "grades" && (
                   <div id="grades-section">
-                    <GradesTab subjectId={selectedSubject.id!} />
+                    <GradesTab
+                      subjectId={selectedSubject.id!}
+                      aulaMaterias={aulaMateriasOf(selectedSubject)}
+                      onSelectMateria={handleSelectAulaMateria}
+                    />
                   </div>
                 )}
                 {activeTab === "attendance" && (
@@ -1256,12 +1571,20 @@ function CuadernoApp() {
               <Upload className="w-8 h-8" />
             </div>
             <h3 className="text-2xl font-black text-neutral-900 mb-4 text-center tracking-tight">
-              Importar Asignatura
+              {isValidGroupBackup(importedBackupData) ? 'Importar Aula/Grupo' : 'Importar Asignatura'}
             </h3>
             <p className="text-neutral-500 mb-6 text-center font-medium leading-relaxed">
-              Se detectó el respaldo de: <strong className="text-neutral-900">{importedBackupData.subject.name}</strong>.
+              Se detectó el respaldo de:{' '}
+              <strong className="text-neutral-900">
+                {isValidGroupBackup(importedBackupData)
+                  ? `Aula «${importedBackupData.classGroup.name}» (${importedBackupData.materias.length} materias)`
+                  : importedBackupData.subject?.name}
+              </strong>
+              .
               <br />
-              ¿Cómo deseas realizar la importación?
+              {isValidGroupBackup(importedBackupData)
+                ? 'Se restaurarán todas las materias y la lista compartida de participantes.'
+                : '¿Cómo deseas realizar la importación?'}
             </p>
 
             {isImportingLoading ? (
@@ -1273,13 +1596,13 @@ function CuadernoApp() {
               <div className="flex flex-col gap-4">
                 <button
                   onClick={() => handleConfirmImport('create')}
-                  title="Importar como una nueva asignatura"
+                  title="Importar como nueva asignatura o aula"
                   className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-all active:scale-95"
                 >
-                  Crear como nueva asignatura
+                  {isValidGroupBackup(importedBackupData) ? 'Importar aula completa' : 'Crear como nueva asignatura'}
                 </button>
 
-                {selectedSubject && (
+                {selectedSubject && !isValidGroupBackup(importedBackupData) && (
                   <div className="border-t border-neutral-100 pt-4 mt-2">
                     <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-4">
                       <p className="text-[11px] text-amber-700 font-bold leading-normal">
@@ -1316,6 +1639,8 @@ function CuadernoApp() {
         isOpen={isSubjectModalOpen}
         onClose={() => setIsSubjectModalOpen(false)}
         subjectToEdit={subjectToEdit}
+        checkCanCreate={checkCanCreate}
+        onCreated={handleCreated}
       />
 
       <Suspense fallback={null}>

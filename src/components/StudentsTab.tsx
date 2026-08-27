@@ -4,12 +4,14 @@ import { collection, query, where, addDoc, updateDoc, deleteDoc, doc, writeBatch
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthProvider';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
-import { Upload, Users, Trash2, AlertTriangle, FileSpreadsheet, Plus, X } from 'lucide-react';
+import { Upload, Users, Trash2, AlertTriangle, FileSpreadsheet, Plus, X, Download } from 'lucide-react';
+import * as XLSX from 'xlsx';
 import { trackEvent, ANALYTICS_CATEGORIES, ANALYTICS_ACTIONS } from '../lib/analytics';
 import { motion, AnimatePresence } from 'motion/react';
 import { extractTextFromFile } from '../lib/fileParser';
 import { ai } from '../lib/gemini';
 import { cn } from '../lib/utils';
+import { useCanonicalSubjectId } from '../lib/classGroups';
 
 function extractJSON(text: string): string {
   const trimmed = text.trim();
@@ -23,9 +25,19 @@ function extractJSON(text: string): string {
   throw new Error('No se encontró JSON válido en la respuesta de la IA.');
 }
 
-export function StudentsTab({ subjectId }: { subjectId: string }) {
+export function StudentsTab({ subjectId: rawSubjectId }: { subjectId: string }) {
   const { user } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Aula/Grupo multiasignatura: participantes COMPARTIDOS ──────────────
+  // La lista vive UNA sola vez bajo la asignatura canónica del aula (la más
+  // antigua). Para asignaturas independientes el canonical es la misma
+  // asignatura → comportamiento legacy idéntico. Al reasignar el nombre aquí,
+  // TODAS las referencias a `subjectId` del componente (queries, addDoc,
+  // importaciones, borrados) pasan a operar sobre la lista compartida sin
+  // duplicar participantes por materia.
+  const { canonicalId } = useCanonicalSubjectId(rawSubjectId);
+  const subjectId = canonicalId;
   
   const studentsRef = collection(db, 'students');
   const studentsQuery = user?.uid ? query(studentsRef, where('subjectId', '==', subjectId), where('userId', '==', user?.uid), limit(500)) : null;
@@ -472,14 +484,36 @@ ${text}
         
         <div className="flex items-center gap-4 w-full lg:w-auto">
           {students.length > 0 && (
-            <button
-              onClick={() => setShowDeleteAllConfirm(true)}
-              className="flex-1 lg:flex-none flex items-center justify-center gap-3 bg-red-50 hover:bg-red-100 text-red-600 px-8 py-4 rounded-2xl text-xs font-black transition-all border border-red-100 active:scale-95 uppercase tracking-widest"
-              title="Eliminar todos los estudiantes de esta asignatura"
-            >
-              <AlertTriangle className="w-5 h-5" />
-              Borrar Todos
-            </button>
+            <>
+              <button
+                onClick={() => {
+                  const data = students.map((s, idx) => ({
+                    'N°': idx + 1,
+                    Cédula: s.cedula || '—',
+                    Nombres: s.firstName,
+                    Apellidos: s.lastName,
+                    Género: s.gender === 'M' ? 'Masculino' : s.gender === 'F' ? 'Femenino' : '—',
+                  }));
+                  const ws = XLSX.utils.json_to_sheet(data);
+                  const wb = XLSX.utils.book_new();
+                  XLSX.utils.book_append_sheet(wb, ws, 'Estudiantes');
+                  XLSX.writeFile(wb, `lista_estudiantes_${new Date().toISOString().split('T')[0]}.xlsx`);
+                }}
+                className="flex-1 lg:flex-none flex items-center justify-center gap-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-6 py-4 rounded-2xl text-xs font-black transition-all active:scale-95 uppercase tracking-widest"
+                title="Exportar lista de estudiantes a Excel"
+              >
+                <Download className="w-5 h-5" />
+                Exportar
+              </button>
+              <button
+                onClick={() => setShowDeleteAllConfirm(true)}
+                className="flex-1 lg:flex-none flex items-center justify-center gap-3 bg-red-50 hover:bg-red-100 text-red-600 px-8 py-4 rounded-2xl text-xs font-black transition-all border border-red-100 active:scale-95 uppercase tracking-widest"
+                title="Eliminar todos los estudiantes de esta asignatura"
+              >
+                <AlertTriangle className="w-5 h-5" />
+                Borrar Todos
+              </button>
+            </>
           )}
           <input 
             type="file" 

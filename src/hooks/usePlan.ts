@@ -10,6 +10,8 @@ import { useState, useEffect } from 'react';
 import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from '../components/AuthProvider';
+// Modo Demo (VITE_DEMO_MODE=true): perfil admin mock, sin leer Firestore.
+import { IS_DEMO_MODE, DEMO_PROFILE } from '../lib/demoAdminData';
 
 export type PlanType = 'free' | 'pro' | 'school';
 
@@ -50,6 +52,12 @@ export function usePlan() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (IS_DEMO_MODE) {
+      setProfile(DEMO_PROFILE);
+      setLoading(false);
+      return;
+    }
+
     if (!user) {
       setProfile(null);
       setLoading(false);

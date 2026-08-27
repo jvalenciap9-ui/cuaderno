@@ -78,7 +78,19 @@ export const Dashboard = memo(function Dashboard({ onNavigateToSubject, onNewSub
     : query(attendancesRef, where('userId', '==', user?.uid), where('subjectId', '==', selectedGlobalSubjectId), limit(500))) : null;
   const [attendances = [], loadingAttds] = useCustomCollectionData(attendancesQuery);
 
+  // ── Aula/Grupo multiasignatura: aulas reales del docente ────────────────
+  const classGroupsQuery = user?.uid ? query(collection(db, 'classGroups'), where('userId', '==', user?.uid), limit(200)) : null;
+  const [groups = []] = useCustomCollectionData(classGroupsQuery);
+
   const isLoading = loadingSubjects || loadingNotes || loadingStudents || loadingEvals || loadingAttds;
+
+  // Diferenciación docente de aula (solo vista "Todas"): aulas vs materias,
+  // estudiantes ÚNICOS por cédula (la lista compartida del aula ya no
+  // duplica) y días con asistencia registrada (asistencia diaria única).
+  const uniqueStudentCount = selectedGlobalSubjectId === 'all'
+    ? new Set((students as any[]).map((s) => String(s.cedula || s.id)).filter(Boolean)).size
+    : students.length;
+  const attendanceDaysCount = new Set((attendances as any[]).map((a) => String(a.date))).size;
 
   if (isLoading) {
     return (
@@ -225,6 +237,24 @@ export const Dashboard = memo(function Dashboard({ onNavigateToSubject, onNewSub
           </div>
         </div>
       </div>
+
+      {/* ── Aula/Grupo: diferenciación aulas / materias / estudiantes únicos /
+          asistencia diaria (vista "Todas"). ── */}
+      {selectedGlobalSubjectId === 'all' && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {[
+            { label: 'Aulas/Grupos', value: groups.length },
+            { label: 'Materias', value: subjects.length },
+            { label: 'Estudiantes únicos', value: uniqueStudentCount },
+            { label: 'Días con asistencia', value: attendanceDaysCount },
+          ].map((chip) => (
+            <div key={chip.label} className="bg-white border border-neutral-200 rounded-3xl px-6 py-5 shadow-sm">
+              <p className="text-neutral-400 text-[10px] font-black uppercase tracking-[0.2em]">{chip.label}</p>
+              <p className="text-2xl font-black text-neutral-900 leading-none mt-1.5">{chip.value}</p>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="w-full">
         <CalendarSection subjectId={selectedGlobalSubjectId} />

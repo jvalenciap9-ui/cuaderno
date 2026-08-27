@@ -5,7 +5,7 @@ import { collection, query, where, addDoc, updateDoc, doc, writeBatch, getDocs, 
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthProvider';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
-import { Plus, Trash2, ChevronLeft, BarChart3, UserCheck, UserX, Info, Edit3, Download, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
+import { Plus, Trash2, ChevronLeft, BarChart3, UserCheck, UserX, Info, Edit3, Download, ChevronRight, ChevronDown, AlertTriangle, MessageSquare } from 'lucide-react';
 import { safeJSONParse, cn, parseLocalDate } from '../lib/utils';
 import { GradesSummary } from './GradesSummary';
 import { STORAGE_KEYS, getStorageItem } from '../lib/storageKeys';
@@ -14,10 +14,28 @@ import { executeBatchChunked, createSetOp } from '../lib/batchUtils';
 
 import { ModuleSummaryModal } from './ModuleSummaryModal';
 import { exportSubjectDataToExcel } from '../lib/exportUtils';
-import type { SubjectModuleDoc, EvaluationDoc } from '../types/firestore';
+import type { SubjectModuleDoc, EvaluationDoc, SubjectDoc } from '../types/firestore';
+// Boletín v2: observaciones del boletín (consejero general + por asignatura).
+import { useInstitution } from '../hooks/useInstitution';
+import { currentPeriodKey } from '../lib/planPeriods';
+import { loadObservationsForSubject, saveObservation } from '../lib/observations';
+import { showToast } from '../hooks/useToast';
+import { usePlan } from '../hooks/usePlan';
+// Aula/Grupo multiasignatura: participantes compartidos + selector de materia.
+import { useCanonicalSubjectId } from '../lib/classGroups';
+import { MateriaSelector } from './MateriaSelector';
 
-export function GradesTab({ subjectId }: { subjectId: string }) {
+interface GradesTabProps {
+  subjectId: string;
+  /** Materias hermanas del aula (≥2 activa el selector de materia). */
+  aulaMaterias?: SubjectDoc[];
+  /** Solicita a App cambiar de materia dentro del mismo aula. */
+  onSelectMateria?: (materiaId: string) => void;
+}
+
+export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTabProps) {
   const { user } = useAuth();
+  const { isPro, isAdmin } = usePlan();
   const [isAddingEval, setIsAddingEval] = useState(false);
   const [editingEvalId, setEditingEvalId] = useState<string | null>(null);
   const [evalTitle, setEvalTitle] = useState('');
@@ -37,7 +55,13 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
   const [savingGrades, setSavingGrades] = useState(false);
   const [consolidatedScores, setConsolidatedScores] = useState<Record<string, Record<string, string>>>({});
 
-  const studentsQuery = user?.uid ? query(collection(db, 'students'), where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
+  // ── Aula/Grupo: los ESTUDIANTES viven en la asignatura canónica del aula
+  // (lista compartida); evaluaciones y calificaciones siguen siendo de ESTA
+  // materia. La nota se escribe con subjectId = materia y studentId del doc
+  // canónico (las reglas de Firestore aceptan hermanos del mismo aula).
+  const { canonicalId: sharedStudentListId } = useCanonicalSubjectId(subjectId);
+
+  const studentsQuery = user?.uid ? query(collection(db, 'students'), where('userId', '==', user?.uid), where('subjectId', '==', sharedStudentListId), limit(500)) : null;
   const [students = []] = useCustomCollectionData(studentsQuery);
 
   const evaluationsQuery = user?.uid ? query(collection(db, 'evaluations'), where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
@@ -51,6 +75,80 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
 
   const selectedEvalGradesQuery = selectedEvalId && user?.uid ? query(collection(db, 'grades'), where('userId', '==', user?.uid), where('evaluationId', '==', selectedEvalId), limit(500)) : null;
   const [grades = []] = useCustomCollectionData(selectedEvalGradesQuery);
+
+  // ── Observaciones del boletín (boletín v2) ───────────────────────────────
+  // Cada estudiante puede tener una observación GENERAL (docente consejero,
+  // subjectId '') y una de ESTA asignatura. Cualquier docente puede escribir
+  // la general (decisión documentada: EdiAgil no tiene campo "consejero").
+  const { planRules } = useInstitution();
+  const obsPeriod = currentPeriodKey(planRules.reglaSeleccionada);
+  const [openObsStudentId, setOpenObsStudentId] = useState<string | null>(null);
+  const [obsDrafts, setObsDrafts] = useState<Record<string, { general: string; subject: string }>>({});
+  const [savingObs, setSavingObs] = useState(false);
+
+  // Carga las observaciones existentes del docente para esta asignatura.
+  useEffect(() => {
+    let cancelled = false;
+    if (!user?.uid || students.length === 0) return;
+    loadObservationsForSubject(user.uid, subjectId, students.map((s) => s.id!)).then((byKey) => {
+      if (cancelled) return;
+      const drafts: Record<string, { general: string; subject: string }> = {};
+      for (const st of students) {
+        drafts[st.id!] = {
+          general: byKey[`${st.id}|general|${obsPeriod}`] || '',
+          subject: byKey[`${st.id}|${subjectId}|${obsPeriod}`] || '',
+        };
+      }
+      setObsDrafts(drafts);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid, subjectId, students.length, obsPeriod]);
+
+  const handleSaveObservations = async (studentId: string) => {
+    if (!user?.uid) return;
+    const draft = obsDrafts[studentId];
+    if (!draft || (!draft.general.trim() && !draft.subject.trim())) {
+      showToast('info', 'Escribe al menos una observación para guardar.');
+      return;
+    }
+    setSavingObs(true);
+    try {
+      let allOk = true;
+      if (draft.general.trim()) {
+        const r = await saveObservation({
+          userId: user.uid,
+          studentId,
+          subjectId: '',
+          period: obsPeriod,
+          text: draft.general.trim(),
+        });
+        if (!r.firestoreOk) allOk = false;
+      }
+      if (draft.subject.trim()) {
+        const r = await saveObservation({
+          userId: user.uid,
+          studentId,
+          subjectId,
+          period: obsPeriod,
+          text: draft.subject.trim(),
+        });
+        if (!r.firestoreOk) allOk = false;
+      }
+      if (allOk) {
+        showToast('success', 'Observación(es) guardada(s). Aparecerán en el boletín del periodo actual.');
+        setOpenObsStudentId(null);
+      } else {
+        showToast('warning', 'Sin conexión: la observación se guardó en este dispositivo y se sincronizará después.');
+      }
+    } catch (err) {
+      showToast('error', 'No se pudieron guardar las observaciones.');
+    } finally {
+      setSavingObs(false);
+    }
+  };
 
   const groupedEvaluations = React.useMemo(() => {
     const parents = modules.filter(m => !m.parentId);
@@ -288,6 +386,96 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
     }
   };
 
+  // ── Aula/Grupo: protección de cambios al cambiar de materia ─────────────
+  // Nunca se descartan notas silenciosamente: si hay celdas sin guardar
+  // (evaluación individual o vista consolidada), el cambio de materia pide
+  // confirmación y puede autoguardar todo primero con el mecanismo actual.
+  const pendingGradesCount =
+    Object.keys(localScores).length +
+    Object.values(consolidatedScores || {}).reduce((n, m) => n + Object.keys(m || {}).length, 0);
+  const [pendingSwitchId, setPendingSwitchId] = useState<string | null>(null);
+
+  /** Guarda TODO lo pendiente (individual + consolidado) en un solo batch. */
+  const flushPendingScores = async (): Promise<boolean> => {
+    if (!user) return false;
+    setSavingGrades(true);
+    try {
+      const batch = writeBatch(db);
+      let ops = 0;
+      if (selectedEvalId) {
+        const evaluation = (evaluations || []).find(e => e.id === selectedEvalId);
+        const max = evaluation?.maxScore || 100;
+        for (const [studentId, scoreStr] of Object.entries(localScores)) {
+          const normalized = scoreStr.trim().replace(',', '.');
+          let score = Number(normalized);
+          if (isNaN(score)) continue;
+          if (score > max) score = max;
+          if (score < 0) score = 0;
+          const existingGrade = (grades || []).find(g => g.studentId === studentId);
+          if (existingGrade) {
+            batch.update(doc(db, 'grades', existingGrade.id!), { score, subjectId });
+          } else {
+            batch.set(doc(collection(db, 'grades')), { userId: user.uid, subjectId, evaluationId: selectedEvalId, studentId, score });
+          }
+          ops++;
+        }
+      }
+      for (const groupMap of Object.values(consolidatedScores || {})) {
+        for (const [key, scoreStr] of Object.entries(groupMap || {})) {
+          const [studentId, evaluationId] = key.split('::');
+          const ev = (evaluations || []).find(e => e.id === evaluationId);
+          if (!ev) continue;
+          const max = ev.maxScore || 100;
+          const normalized = scoreStr.trim().replace(',', '.');
+          let score = Number(normalized);
+          if (isNaN(score)) continue;
+          if (score > max) score = max;
+          if (score < 0) score = 0;
+          const existing = (allGrades || []).find(g => g.studentId === studentId && g.evaluationId === evaluationId);
+          if (existing) {
+            batch.update(doc(db, 'grades', existing.id!), { score, subjectId });
+          } else {
+            batch.set(doc(collection(db, 'grades')), { userId: user.uid, subjectId, evaluationId, studentId, score });
+          }
+          ops++;
+        }
+      }
+      if (ops > 0) await batch.commit();
+      setLocalScores({});
+      setConsolidatedScores({});
+      return true;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'grades');
+      return false;
+    } finally {
+      setSavingGrades(false);
+    }
+  };
+
+  const handleMateriaSwitchRequest = (materiaId: string) => {
+    if (String(materiaId) === String(subjectId)) return;
+    if ((pendingGradesCount > 0 || savingGrades) && onSelectMateria) {
+      setPendingSwitchId(String(materiaId));
+      return;
+    }
+    onSelectMateria?.(materiaId);
+  };
+
+  const saveAndSwitch = async () => {
+    const ok = await flushPendingScores();
+    if (ok && pendingSwitchId && onSelectMateria) {
+      onSelectMateria(pendingSwitchId);
+    }
+    setPendingSwitchId(null);
+  };
+
+  const discardAndSwitch = () => {
+    setLocalScores({});
+    setConsolidatedScores({});
+    if (pendingSwitchId && onSelectMateria) onSelectMateria(pendingSwitchId);
+    setPendingSwitchId(null);
+  };
+
   const [weights, setWeights] = useState(() => parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS)));
   const [viewMode, setViewMode] = useState<ViewMode>(() => (getStorageItem(STORAGE_KEYS.GRADING_VIEW_MODE) as ViewMode) || 'categories');
   const [calculationMode, setCalculationMode] = useState<CalculationMode>(() => (getStorageItem(STORAGE_KEYS.GRADING_CALCULATION_MODE) as CalculationMode) || 'average');
@@ -339,6 +527,52 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
 
   return (
     <div className="space-y-8">
+      {/* ── Selector de materia del Aula/Grupo (solo aulas reales ≥2 materias) */}
+      {aulaMaterias && aulaMaterias.length >= 2 && onSelectMateria && (
+        <MateriaSelector
+          currentSubject={{ id: subjectId } as SubjectDoc}
+          materias={aulaMaterias}
+          onSwitch={handleMateriaSwitchRequest}
+          hint="Evaluaciones propias · Participantes compartidos"
+        />
+      )}
+      {pendingSwitchId && (
+        <div className="bg-amber-50 border border-amber-200 rounded-2xl px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0" />
+            <p className="text-sm font-bold text-neutral-800">
+              Tienes {pendingGradesCount} nota{pendingGradesCount === 1 ? '' : 's'} sin guardar en esta materia.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={saveAndSwitch}
+              disabled={savingGrades}
+              title="Guardar las notas pendientes y cambiar de materia"
+              className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95"
+            >
+              {savingGrades ? 'Guardando...' : 'Guardar y cambiar'}
+            </button>
+            <button
+              type="button"
+              onClick={discardAndSwitch}
+              title="Descartar los cambios sin guardar y cambiar de materia"
+              className="bg-white border border-red-200 hover:bg-red-50 text-red-600 px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95"
+            >
+              Descartar y cambiar
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingSwitchId(null)}
+              title="Quedarme en esta materia"
+              className="text-neutral-400 hover:text-neutral-900 px-3 py-2.5 text-[10px] font-black uppercase tracking-widest transition-colors"
+            >
+              Cancelar
+            </button>
+          </div>
+        </div>
+      )}
       <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-6">
         <div>
           <h3 className="text-2xl font-black text-neutral-900 tracking-tight">Evaluaciones</h3>
@@ -371,7 +605,13 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
 
               <button
                 id="exporta-tu-informe-de-clases-en-excel-y-editalo-para-tus-entregas"
-                onClick={() => exportSubjectDataToExcel(user!.uid, user!.displayName || user!.email!, subjectId)}
+                onClick={() => {
+                  if (!isPro && !isAdmin) {
+                    showToast('warning', '¡Actualiza a Premium Pro para exportar tus calificaciones a Excel!');
+                    return;
+                  }
+                  exportSubjectDataToExcel(user!.uid, user!.displayName || user!.email!, subjectId);
+                }}
                 className={cn("inline-flex items-center gap-2 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 hover:text-emerald-700 px-6 py-4 rounded-2xl text-sm font-black transition-all border border-emerald-200 uppercase tracking-widest active:scale-95 shadow-sm", modules.length < 2 ? "ml-auto" : "")}
                 title="exporta tu informe de clases en excel y editalo para tus entregas"
               >
@@ -569,13 +809,17 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                     <tr>
                       <th className="px-8 py-6 font-black uppercase tracking-[0.2em] text-[10px]">Estudiante</th>
                       <th className="px-8 py-6 font-black uppercase tracking-[0.2em] text-[10px] w-64 text-center">Calificación</th>
+                      <th className="px-8 py-6 font-black uppercase tracking-[0.2em] text-[10px] w-40 text-center">Boletín</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-neutral-50">
                     {students.map(student => {
                       const grade = (grades || []).find(g => g.studentId === student.id);
+                      const isObsOpen = openObsStudentId === student.id;
+                      const draft = obsDrafts[student.id] || { general: '', subject: '' };
                       return (
-                        <tr key={student.id} className="hover:bg-neutral-50/50 transition-all group duration-300">
+                        <React.Fragment key={student.id}>
+                        <tr className="hover:bg-neutral-50/50 transition-all group duration-300">
                           <td className="px-8 py-6">
                             <p className="text-xl font-black text-neutral-900 group-hover:text-indigo-600 transition-colors leading-tight">{student.lastName}, {student.firstName}</p>
                             <p className="text-[10px] text-neutral-400 font-mono font-black mt-1.5 tracking-widest uppercase opacity-60">{student.cedula}</p>
@@ -611,7 +855,84 @@ export function GradesTab({ subjectId }: { subjectId: string }) {
                               </span>
                             </div>
                           </td>
+                          <td className="px-8 py-6">
+                            <button
+                              type="button"
+                              onClick={() => setOpenObsStudentId(isObsOpen ? null : student.id!)}
+                              aria-label={`Observaciones del boletín de ${student.firstName} ${student.lastName}`}
+                              title="Observaciones del boletín"
+                              className={cn(
+                                "inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all active:scale-95 border",
+                                (draft.general || draft.subject)
+                                  ? "bg-amber-50 text-amber-600 border-amber-200 hover:bg-amber-100"
+                                  : "bg-neutral-50 text-neutral-500 border-neutral-200 hover:bg-neutral-100"
+                              )}
+                            >
+                              <MessageSquare className="w-4 h-4" />
+                              {draft.general || draft.subject ? 'Editar' : 'Observ.'}
+                            </button>
+                          </td>
                         </tr>
+                        {isObsOpen && (
+                          <tr className="bg-amber-50/40">
+                            <td colSpan={3} className="px-8 py-5">
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                  <label className="block text-[10px] font-black uppercase tracking-widest text-neutral-500 mb-2">
+                                    Observación general del boletín (consejero)
+                                  </label>
+                                  <textarea
+                                    rows={2}
+                                    value={draft.general}
+                                    onChange={(e) =>
+                                      setObsDrafts((prev) => ({
+                                        ...prev,
+                                        [student.id!]: { ...(prev[student.id!] || { subject: '' }), general: e.target.value },
+                                      }))
+                                    }
+                                    placeholder="Aparece como observación general en el boletín del estudiante..."
+                                    className="w-full bg-white border border-neutral-200 rounded-2xl px-4 py-3 text-sm font-medium text-neutral-900 outline-none focus:border-amber-500 focus:ring-4 focus:ring-amber-500/5 resize-none"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[10px] font-black uppercase tracking-widest text-neutral-500 mb-2">
+                                    Observación de esta asignatura
+                                  </label>
+                                  <textarea
+                                    rows={2}
+                                    value={draft.subject}
+                                    onChange={(e) =>
+                                      setObsDrafts((prev) => ({
+                                        ...prev,
+                                        [student.id!]: { ...(prev[student.id!] || { general: '' }), subject: e.target.value },
+                                      }))
+                                    }
+                                    placeholder="Se muestra junto a la asignatura en el boletín..."
+                                    className="w-full bg-white border border-neutral-200 rounded-2xl px-4 py-3 text-sm font-medium text-neutral-900 outline-none focus:border-amber-500 focus:ring-4 focus:ring-amber-500/5 resize-none"
+                                  />
+                                </div>
+                              </div>
+                              <div className="flex justify-end gap-2 mt-4">
+                                <button
+                                  type="button"
+                                  onClick={() => setOpenObsStudentId(null)}
+                                  className="px-5 py-2.5 rounded-2xl text-[11px] font-black uppercase tracking-widest text-neutral-500 hover:text-neutral-900 transition-colors"
+                                >
+                                  Cancelar
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSaveObservations(student.id!)}
+                                  disabled={savingObs}
+                                  className="inline-flex items-center gap-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white px-6 py-2.5 rounded-2xl text-[11px] font-black uppercase tracking-widest transition-all active:scale-95"
+                                >
+                                  {savingObs ? 'Guardando...' : 'Guardar en el boletín'}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        </React.Fragment>
                       );
                     })}
                   </tbody>

@@ -1,245 +1,102 @@
-# 📊 Análisis de Capacidad: Usuarios Concurrentes en EdiAgil
+# Auditoría de Seguridad y Análisis de Rendimiento (EdiAgil - Plan Institucional)
 
-## Resumen Ejecutivo
-**Usuarios concurrentes recomendados:** `100-500 usuarios simultáneos`
-**Máximo teórico:** `1,000-10,000+ dependiendo de la carga`
+Este documento contiene un análisis exhaustivo del **Plan Institucional** (30 docentes + 1 admin) y el **Boletín Individual** en EdiAgil. Evalúa el cumplimiento de las reglas de seguridad, el rendimiento bajo pruebas de carga extrema (30 docentes activos con miles de alumnos y notas) y propone optimizaciones clave.
 
 ---
 
-## 🏗️ Arquitectura Actual
+## 🔒 1. Auditoría de Seguridad y Cumplimiento
 
+### Cumplimiento del Principio de Soberanía Docente
+El principio inmutable de EdiAgil establece que **el administrador no puede editar datos pedagógicos de los docentes**; su rol es de supervisión y solo lectura.
+
+* **Validación en Firestore Rules:**
+  Las reglas en `firestore.rules` protegen todas las colecciones pedagógicas (`subjects`, `notes`, `students`, `evaluations`, `grades`, `attendance`, `materials`, `subjectModules`) con la cláusula:
+  ```javascript
+  allow create, update, delete: if isSignedIn() && isExistingOwner();
+  ```
+  Donde `isExistingOwner()` exige que `resource.data.userId == request.auth.uid`. Dado que el administrador posee un UID distinto, Firestore bloquea cualquier intento de escritura (creación, edición o borrado) de datos pedagógicos por parte del admin desde el cliente.
+* **Validación de Lectura Directa:**
+  Las reglas también restringen la lectura directa de estas colecciones al propietario:
+  ```javascript
+  allow list, get: if isSignedIn() && isExistingOwner();
+  ```
+  Esto significa que el administrador tiene **bloqueada la lectura directa** de los documentos pedagógicos de los docentes a través del SDK del cliente.
+* **Acceso del Administrador vía Cloud Functions:**
+  El administrador obtiene la información agregada a través de HTTPS Callable Functions (`adminListTeachers`, `adminGetTeacherData`, `adminGetTeacherSummary`, `adminGetInstitutionStats`). Estas funciones usan el SDK de administración (`firebase-admin`) en el backend (que bypassa las reglas de seguridad) pero realizan las siguientes verificaciones:
+  1. Validar que el token de sesión sea correcto.
+  2. Ejecutar `assertAdmin(uid)` para asegurar que el usuario tiene el campo `role === 'admin'` en su perfil de Firestore (cargado exclusivamente por el webhook/backend).
+  3. Comprobar que el docente consultado pertenezca a la **misma institución** del administrador (`teacherData.institutionId === adminInstitutionId`).
+
+> [!TIP]
+> **Conclusión de Seguridad:** El diseño de seguridad cumple al 100% con los requisitos de soberanía. El administrador solo puede consultar y exportar datos a través de funciones del servidor auditadas, sin posibilidad de alterar información pedagógica ni leer datos de docentes de otras instituciones.
+
+---
+
+## ⚡ 2. Análisis de Rendimiento y Capacidad (Uso Extremo)
+
+Para evaluar la escalabilidad, modelamos un escenario de **Uso Extremo** en una institución con el límite de licenciamiento completo:
+* **Docentes:** 30 docentes activos.
+* **Asignaturas por docente:** 5 asignaturas (150 asignaturas en total).
+* **Alumnos por asignatura:** 30 alumnos (4,500 alumnos en total).
+* **Evaluaciones por asignatura:** 15 evaluaciones (2,250 evaluaciones en total).
+* **Calificaciones:** 30 alumnos × 15 evaluaciones × 5 asignaturas = 2,250 notas por docente (**67,500 notas en total**).
+* **Asistencias:** 30 alumnos × 30 días = 900 registros de asistencia por docente (**27,000 asistencias en total**).
+
+### Cuellos de Botella Detectados
+
+#### 🚨 B1. Concurrencia de Consultas en el Backend (OOM y Timeouts)
+En `adminGetInstitutionStats` y `adminGetInstitutionAlerts`, el servidor ejecuta consultas en paralelo para los 30 docentes usando `Promise.allSettled`:
+```javascript
+const results = await Promise.allSettled(teachers.map(async (teacherData) => {
+  const [subjects, students, evaluations, attendance, grades, ...] = await Promise.all([
+    getAllDocsForUser('subjects', teacherUid),
+    getAllDocsForUser('students', teacherUid),
+    ...
+  ]);
+}));
 ```
-┌─────────────────────┐
-│  FRONTEND (Vite)    │  ← React + Firebase SDK
-│  http://localhost:3000  (Browser)
-└──────────┬──────────┘
-           │ (REST + WebSocket)
-┌──────────▼──────────┐
-│  EXPRESS SERVER     │  ← Proxy Gemini AI
-│  http://localhost:3001
-└──────────┬──────────┘
-           │ (HTTP)
-┌──────────▼──────────┐
-│  FIREBASE          │  ← Firestore + Auth + Storage
-│  (Cloud)           │  ← Google-managed infrastructure
-└────────────────────┘
-```
+* **Problema:** Esto dispara `30 docentes × 8 consultas = 240` promesas concurrentes hacia Firestore.
+* **Impacto:** Con un volumen de datos extremo (más de 100,000 documentos a recuperar), el tiempo de respuesta del servidor puede superar los 60 segundos (provocando un **Timeout HTTP 504**). Además, almacenar en memoria 100k documentos en formato JSON dentro de una sola instancia de Cloud Function puede provocar un error de **Out of Memory (OOM)**, tirando el contenedor.
+
+#### 🚨 B2. Facturación y Costos de Lectura de Firestore
+Cada vez que el administrador hace clic en "Actualizar" o abre la pestaña de métricas, la función lee todos los documentos del historial del colegio.
+* **Problema:** En el escenario extremo, una sola consulta al dashboard lee ~100k documentos.
+* **Costo:** 10 ejecuciones del dashboard al día equivalen a **1 millón de lecturas de Firestore diarias**, lo que consumiría rápidamente la cuota gratuita de Firebase y generaría costos de facturación innecesarios.
 
 ---
 
-## 1️⃣ Límites de FIREBASE FIRESTORE
+## 🛠️ 3. Mejoras Técnicas Propuestas (Plan de Optimización)
 
-### 📉 Límites de Lectura/Escritura
-| Métrica | Límite | Notas |
-|---------|--------|-------|
-| **Escrituras/segundo** | 500 ops/sec por colección | Con indexing correcto |
-| **Lecturas/segundo** | Ilimitadas | Pero costo aumenta |
-| **Conexiones simultáneas** | 1 millón+ | Firebase maneja esto |
-| **Tamaño documento** | 1 MB máx | Archivos grandes → Storage |
-| **Transacciones** | 500 por segundo | Por DB |
+Para resolver de manera definitiva los cuellos de botella de rendimiento y costo en escenarios de uso masivo, implementaremos las siguientes tres optimizaciones:
 
-### 💰 Coste por operación (Spark Plan)
-- Lectura: **$0.06 por 100K lecturas**
-- Escritura: **$0.18 por 100K escrituras**
+### 1. Sistema de Caché de Estadísticas y Alertas (Firestore Caching)
+En lugar de recalcular las métricas en cada llamada, crearemos documentos de caché en Firestore (`/institutionStats/{institutionId}` e `/institutionAlerts/{institutionId}`).
+* **Lógica:**
+  * Al llamar a `adminGetInstitutionStats`, el servidor busca el documento de caché.
+  * Si el documento existe y tiene un `generatedAt` menor a **15 minutos**, se devuelve de inmediato el JSON precalculado.
+  * Si no existe o expiró, se realiza el cálculo pesado, se guarda el nuevo resultado en la caché y se le responde al administrador.
+* **Rendimiento:** Reduce el tiempo de respuesta del dashboard de **15-30 segundos a menos de 500 milisegundos**.
+* **Ahorro de Costos:** Reduce las lecturas de Firestore de 100,000 a **1 lectura** por cada consulta del administrador dentro de la ventana de 15 minutos.
 
-### 📋 Consultas por usuario
-Analizando el código, cada usuario típicamente hace:
-- **Initial load:** 5-10 queries (subjects, students, grades, evaluations, modules)
-- **Por interacción:** 1-3 queries/minuto en promedio
-- **Peak (calificando):** 10-20 queries/minuto
+### 2. Filtrado de Actividad Reciente por Fecha
+Para calcular la actividad semanal y las métricas de uso de la app, no es necesario descargar el historial completo de notas, materiales y eventos de los últimos años.
+* **Lógica:**
+  * Modificar `getAllDocsForUser` para que acepte un parámetro opcional de fecha límite (`dateLimit`).
+  * Para las colecciones de actividad (`notes`, `materials`, `calendarEvents`), solo solicitaremos documentos donde `date >= fecha_de_hace_60_dias`.
+* **Rendimiento:** Reduce el volumen de transferencia de datos en un **80%**, evitando la saturación de memoria en la Cloud Function.
 
----
-
-## 2️⃣ Límites del SERVIDOR EXPRESS (Proxy IA)
-
-### 🖥️ Capacidad por Instancia
-```
-Config Actual:
-- Node.js single process (no clustering)
-- Express + JSON parsing (20MB limit)
-- Gemini API proxy
-
-Estimado:
-- 100-200 req/segundo en 1 máquina (t2.medium AWS)
-- 1000+ req/segundo con clustering
-```
-
-### ⚙️ Request al Servidor IA
-- **Endpoint:** `POST /api/gemini` (extracción de notas)
-- **Payload:** 5-20 MB (imágenes en base64)
-- **Timeout:** Gemini tarda 2-10 segundos/request
-- **Frecuencia:** Solo cuando usuario usa "IA Mágica" (no es crítico)
+### 3. Ejecución Controlada en Lotes (Query Batching)
+En lugar de disparar 240 promesas en paralelo con `Promise.allSettled`, agruparemos la carga de docentes en lotes secuenciales de 5 docentes a la vez.
+* **Lógica:**
+  * Usar un iterador por lotes (batch helper) para procesar a los docentes de forma controlada.
+* **Rendimiento:** Evita la congestión de conexiones concurrentes y mantiene el uso de memoria estable por debajo del límite de la Cloud Function.
 
 ---
 
-## 3️⃣ Límites de GEMINI API
+## 🧪 4. Validador de Rendimiento Extremo
 
-### 🤖 Cuota de Google
-| Plan | Límite | Coste |
-|------|--------|-------|
-| **Free (Spark)** | 60 req/minuto | Gratis |
-| **Pay-as-you-go** | 30 req/segundo | $0.075 por 1M tokens |
-
-**Conclusion:** La función IA es el cuello de botella para uso masivo.
-
----
-
-## 4️⃣ Análisis por Escenarios
-
-### 🟢 Escenario 1: Clase Pequeña (30-100 estudiantes)
-**Usuarios concurrentes:** `5-10 profesores`
-**Carga mensual:** ~1,000 operaciones Firestore
-**Coste:** ~$0.18/mes (Spark)
-**Servidor:** Ni necesita
-
-### 🟡 Escenario 2: Institución Mediana (500-2,000 estudiantes)
-**Usuarios concurrentes:** `50-100 profesores`
-**Operaciones/minuto:** ~500-1,000
-**Coste:** ~$10-50/mes
-**Servidor:** 1x t2.small (4GB RAM, 1 vCPU)
-**Gemini:** Free tier o Pay-as-you-go
-
-### 🔴 Escenario 3: Empresa/Universidad Grande (10K+ estudiantes)
-**Usuarios concurrentes:** `500-1,000+ profesores`
-**Operaciones/minuto:** ~5,000-20,000
-**Coste Firestore:** ~$100-500/mes
-**Servidor IA:** 3-5x t2.medium con load balancer
-**Gemini:** Pay-as-you-go (~$50-200/mes según uso)
-
----
-
-## 5️⃣ Cuellos de Botella Identificados
-
-### 🔴 **Críticos:**
-1. **Gemini API** (solo 60 req/min gratis)
-   - Solución: Implementar cola de procesos + rate limiting
-   
-2. **Firestore limite de escritura** (500 ops/sec)
-   - Solución: Batch writes, agregar datos antes de escribir
-
-3. **Servidor Express single-process**
-   - Solución: Usar clustering (Node cluster module)
-
-### 🟡 **Importantes:**
-1. **localStorage compartido** (recientemente reparado ✅)
-   - Ya solucionado con prefijos `ediagil_app_`
-
-2. **Falta caché en frontend**
-   - Solución: Implementar service workers / IndexedDB
-
-3. **Queries sin índices optimizadas**
-   - Solución: Revisar Firestore indexes
-
----
-
-## 6️⃣ Recomendaciones de Escalabilidad
-
-### 🔧 Mejoras Inmediatas (Bajo Esfuerzo)
-1. **Implementar rate limiting en Gemini**
-   ```typescript
-   // Limitar a 1 request por usuario/minuto
-   const queueGeminiRequest = (userId, payload) => {
-     if (userQueue[userId] && Date.now() - userQueue[userId] < 60000) {
-       return "Espera un minuto antes de otro análisis";
-     }
-   }
-   ```
-
-2. **Batch writes en calificaciones**
-   ```typescript
-   // En lugar de 30 escrituras, hacer 1 batch
-   const batch = writeBatch(db);
-   grades.forEach(g => batch.set(doc(...), g));
-   await batch.commit(); // 1 op en lugar de 30
-   ```
-
-3. **Caché local con IndexedDB**
-   ```typescript
-   // Ya usas Dexie! Aprovechar más:
-   - Cachear resultados de queries
-   - Sincronizar en background
-   ```
-
-### 📈 Mejoras de Escalabilidad (Mediano Plazo)
-1. **Clustering del servidor Node.js**
-   ```bash
-   npm install pm2
-   pm2 start server/index.ts -i max  # 1 proceso por CPU core
-   ```
-
-2. **Redis para sesiones + caché**
-   ```typescript
-   // Session store: Express → Redis
-   // Cache: Gemini responses → Redis
-   ```
-
-3. **Cloud Functions en lugar de servidor dedicado**
-   - Firebase Cloud Functions para proxy IA
-   - Auto-scaling automático
-   - Pago por uso
-
-4. **Índices de Firestore optimizados**
-   ```firestore
-   // Agregar índices para queries frecuentes:
-   - (userId, subjectId, createdAt)
-   - (userId, type, date)
-   ```
-
-### 🚀 Escalabilidad Masiva (Largo Plazo)
-1. **Migrar a arquitectura serverless**
-   - Cloud Run + Cloud Functions
-   - Auto-scaling a 0-10,000 instancias
-
-2. **CDN + Caching**
-   - Cloudflare/AWS CloudFront para static assets
-   - API caching inteligente
-
-3. **Database replication**
-   - Firestore multi-region
-   - Read replicas
-
-4. **Microservicios**
-   - Servicio IA separado
-   - Servicio de reportes
-   - Servicio de exportación
-
----
-
-## 7️⃣ Métricas para Monitorear
-
-```typescript
-// Agregar monitoreo a Analytics
-- Users concurrentes (real-time)
-- Requests/segundo a Firestore
-- Latencia promedio de queries
-- Errores 429 (rate limit) de Gemini
-- Tiempo de respuesta del servidor IA
-```
-
----
-
-## 📋 Tabla Resumen
-
-| Métrica | 100 Usuarios | 500 Usuarios | 5,000 Usuarios |
-|---------|-------------|-------------|----------------|
-| Ops Firestore/min | 100-200 | 500-1K | 5K-20K |
-| Costo Firestore | <$1 | $5-10 | $50-100 |
-| Servidor Necesario | Ninguno | t2.small | 3-5x t2.medium |
-| Gemini Cost | Free | Free-$5 | $50-200 |
-| Latencia (p95) | <1s | <2s | <3s |
-
----
-
-## 🎯 Conclusión
-
-**EdiAgil está bien diseñada** para:
-- ✅ Instituciones educativas medianas (hasta 500 profesores concurrentes)
-- ✅ Bajo costo (Firebase Spark = gratis/muy barato)
-- ✅ Buena UX (real-time con Firestore)
-
-**Necesita mejoras para:**
-- ⚠️ Más de 1,000 usuarios concurrentes
-- ⚠️ Alto uso de función IA
-- ⚠️ Datos masivos (1M+ documentos)
-
-**Recomendación:** Implementar mejoras inmediatas (batch writes, rate limiting) ahora. Escalar arquitectura cuando llegues a 500+ usuarios.
+Proponemos la ejecución de una prueba de rendimiento en desarrollo para validar los límites de la app:
+1. **Semillero de Datos Masivos:** Ejecutar el script `functions/seed-demo.js` o un script adaptado que simule 30 docentes y 60,000 notas en el emulador local de Firestore.
+2. **Medición de Tiempos:** Realizar solicitudes a `adminGetInstitutionStats` localmente y registrar el tiempo de respuesta inicial.
+3. **Validación de Caché:** Realizar una segunda solicitud inmediata y verificar que el tiempo sea inferior a 50ms y que el log del servidor indique `Servido desde caché`.
+4. **Prueba de TypeScript:** Ejecutar `npm run lint` para asegurar la tipificación de los documentos de caché.

@@ -15,6 +15,16 @@ service cloud.firestore {
       return existing().userId == request.auth.uid;
     }
 
+    // ¿Es el usuario autenticado administrador de la institución dada?
+    // role/institutionId solo los escribe el backend (webhook / funciones
+    // admin), así que el doc /users es una fuente fiable.
+    function isInstitutionAdmin(uid, institutionId) {
+      let userPath = /databases/$(database)/documents/users/$(uid);
+      return exists(userPath)
+        && get(userPath).data.role == 'admin'
+        && get(userPath).data.institutionId == institutionId;
+    }
+
     // ── Límite de asignaturas según plan (2 por año natural en el plan free) ──
     // El cliente escribe un contador en /userCounters/{uid} en el MISMO batch
     // que crea/borra la asignatura (ver src/lib/subjectCounter.ts). getAfter()
@@ -126,9 +136,52 @@ service cloud.firestore {
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
-      allow create: if isSignedIn() && isValidId(subjectId) && isValidSubject(request.resource.data) && subjectCountWithinLimit();
+      // ── Aula/Grupo multiasignatura ──
+      // Una materia INTERNA de un aula (groupId apunta a un classGroups
+      // propio, modalidad 'varias') NO consume cuota del plan: el AULA
+      // completa vale 1 unidad y se descuenta cuando se crea su documento.
+      // Si el groupId falta, es inválido o ajeno, la asignatura se trata
+      // como independiente y exige su +1 de contador (subjectCountWithinLimit),
+      // así que nadie puede eludir el límite inventando grupos.
+      function isInternalAulaMateria(data) {
+        return ('groupId' in data)
+          && data.groupId is string
+          && isValidId(data.groupId)
+          && exists(/databases/$(database)/documents/classGroups/$(data.groupId))
+          && get(/databases/$(database)/documents/classGroups/$(data.groupId)).data.userId == request.auth.uid
+          && get(/databases/$(database)/documents/classGroups/$(data.groupId)).data.modalidad == 'varias';
+      }
+      allow create: if isSignedIn() && isValidId(subjectId) && isValidSubject(request.resource.data)
+        && (isInternalAulaMateria(request.resource.data) || subjectCountWithinLimit());
       allow update: if isSignedIn() && isValidId(subjectId) && isExistingOwner() && isValidSubject(request.resource.data);
       allow delete: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
+    }
+
+    // ── classGroups (Aula/Grupo multiasignatura) ─────────────────────────
+    // Contenedor de varias materias que comparten participantes y asistencia
+    // diaria. El docente dueño es el ÚNICO que lee/escribe sus aulas. La
+    // creación del aula ocurre en el MISMO batch que sus materias + el
+    // contador de unidades (+1 por AULA, no por materia interna — ver
+    // src/lib/classGroups.ts). Las asignaturas antiguas NO tienen groupId:
+    // son aulas virtuales de una materia y nunca se migran desde aquí.
+    match /classGroups/{groupId} {
+      function isValidClassGroup(data) {
+        return data.keys().hasAll(['userId', 'name', 'modalidad', 'createdAt', 'updatedAt'])
+          && data.userId is string && data.userId == request.auth.uid
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 200
+          && data.modalidad is string && data.modalidad == 'varias'
+          && data.createdAt is number && data.updatedAt is number
+          && (!('nivelEducativo' in data) || (data.nivelEducativo is string && data.nivelEducativo.size() <= 40))
+          && (!('grado' in data) || (data.grado is string && data.grado.size() <= 60))
+          && (!('seccion' in data) || (data.seccion is string && data.seccion.size() <= 60))
+          && (!('periodo' in data) || (data.periodo is string && data.periodo.size() <= 40))
+          && (!('schemaVersion' in data) || data.schemaVersion is number);
+      }
+      allow list: if isSignedIn() && isExistingOwner();
+      allow get: if isSignedIn() && isValidId(groupId) && isExistingOwner();
+      allow create: if isSignedIn() && isValidId(groupId) && isValidClassGroup(request.resource.data);
+      allow update: if isSignedIn() && isValidId(groupId) && isExistingOwner() && isValidClassGroup(request.resource.data);
+      allow delete: if isSignedIn() && isValidId(groupId) && isExistingOwner();
     }
 
     // ── userCounters (contador atómico de asignaturas + cuota de writes) ──
@@ -258,22 +311,49 @@ service cloud.firestore {
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(gradeId) && isExistingOwner();
+      // ── Aula/Grupo multiasignatura: participantes compartidos ──────────
+      // En un aula, los students viven UNA sola vez en la asignatura
+      // canónica (la más antigua del grupo), pero las notas se registran por
+      // MATERIA. La nota es válida si el estudiante pertenece a la misma
+      // materia (comportamiento legacy intacto) O si ambas asignaturas son
+      // hermanas del MISMO aula del mismo dueño. Nunca cruza docentes ni
+      // aulas distintas.
+      function sameOwnedClassGroup(canonicalSubjectId, materiaId) {
+        let a = get(/databases/$(database)/documents/subjects/$(canonicalSubjectId));
+        let b = get(/databases/$(database)/documents/subjects/$(materiaId));
+        return a.data.userId == request.auth.uid
+          && b.data.userId == request.auth.uid
+          && ('groupId' in a.data)
+          && a.data.groupId is string
+          && a.data.groupId.size() > 0
+          && a.data.groupId.size() <= 128
+          && isValidId(a.data.groupId)
+          && a.data.groupId == b.data.groupId;
+      }
+      function gradeTargetOk(g) {
+        let ev = get(/databases/$(database)/documents/evaluations/$(g.evaluationId));
+        let st = get(/databases/$(database)/documents/students/$(g.studentId));
+        return ev.data.userId == request.auth.uid
+          && ev.data.subjectId == g.subjectId
+          && g.score is number
+          && g.score <= ev.data.maxScore
+          && st.data.userId == request.auth.uid
+          && (
+            st.data.subjectId == g.subjectId
+            || (
+              st.data.subjectId is string
+              && st.data.subjectId.size() > 0
+              && st.data.subjectId.size() <= 128
+              && st.data.subjectId != g.subjectId
+              && g.subjectId is string
+              && sameOwnedClassGroup(st.data.subjectId, g.subjectId)
+            )
+          );
+      }
       allow create: if isSignedIn() && isValidId(gradeId) && isValidGrade(request.resource.data)
-        && exists(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId))
-        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.userId == request.auth.uid
-        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.subjectId == request.resource.data.subjectId
-        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore
-        && exists(/databases/$(database)/documents/students/$(request.resource.data.studentId))
-        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.userId == request.auth.uid
-        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.subjectId == request.resource.data.subjectId;
+        && gradeTargetOk(request.resource.data);
       allow update: if isSignedIn() && isValidId(gradeId) && isExistingOwner() && isValidGrade(request.resource.data)
-        && exists(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId))
-        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.userId == request.auth.uid
-        && get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.subjectId == request.resource.data.subjectId
-        && request.resource.data.score <= get(/databases/$(database)/documents/evaluations/$(request.resource.data.evaluationId)).data.maxScore
-        && exists(/databases/$(database)/documents/students/$(request.resource.data.studentId))
-        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.userId == request.auth.uid
-        && get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data.subjectId == request.resource.data.subjectId;
+        && gradeTargetOk(request.resource.data);
       allow delete: if isSignedIn() && isValidId(gradeId) && isExistingOwner();
     }
 
@@ -362,9 +442,79 @@ service cloud.firestore {
       allow list, write: if false;
     }
 
+    // ── institutions / institutionUsers (plan school) ──
+    // El backend (webhook de Lemon Squeezy) crea la institución y la
+    // membresía admin. Los administradores pueden crear membresías de
+    // docentes directamente desde el cliente (invitación) y leer las de su
+    // institución; cada docente lee la suya propia.
+    match /institutions/{institutionId} {
+      allow read: if isSignedIn()
+        && exists(/databases/$(database)/documents/institutionUsers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/institutionUsers/$(request.auth.uid)).data.institutionId == institutionId;
+      allow write: if false;
+    }
+
+    match /institutionUsers/{membershipId} {
+      allow get: if isSignedIn() && (
+        resource.data.userId == request.auth.uid
+        || isInstitutionAdmin(request.auth.uid, resource.data.institutionId)
+      );
+      allow list: if false;
+      // Los admins crean miembros (solo rol teacher), nunca admins, y solo
+      // dentro de SU institución. El id del doc debe coincidir con el userId
+      // (invariante usado por garantizar idempotencia y por las reglas).
+      allow create: if isSignedIn()
+        && request.resource.data.userId is string
+        && request.resource.data.userId == membershipId
+        && request.resource.data.role == 'teacher'
+        && request.resource.data.institutionId is string
+        && isInstitutionAdmin(request.auth.uid, request.resource.data.institutionId);
+      // update/delete: lo gestiona el backend (quitar/editar docentes) para no
+      // desincronizar users.institutionId, que el cliente no puede cambiar.
+      allow update, delete: if false;
+    }
+
     // ── userSettings (ponderaciones, escala, etc.) ──
     match /userSettings/{userId} {
       allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // ── observations (boletín v2: observaciones del consejero y docentes) ──
+    // Cada observación pertenece a su AUTOR (el docente que la escribe). La
+    // lectura está abierta al autor y a cualquier miembro de la MISMA
+    // institución (para que el admin consolide el boletín vía Cloud Function
+    // y los colegas de institución puedan verlas). La escritura (crear/
+    // actualizar/borrar) solo del autor.
+    function isSameInstitutionAsAuthor() {
+      let authorPath = /databases/$(database)/documents/institutionUsers/$(resource.data.userId);
+      let readerPath = /databases/$(database)/documents/institutionUsers/$(request.auth.uid);
+      return exists(authorPath)
+        && exists(readerPath)
+        && get(authorPath).data.institutionId == get(readerPath).data.institutionId;
+    }
+
+    match /observations/{observationId} {
+      function isValidObservation(data) {
+        return data.keys().hasAll(['userId', 'studentId', 'subjectId', 'period', 'text', 'updatedAt'])
+          && data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128
+          && data.studentId is string && data.studentId.size() > 0 && data.studentId.size() <= 128
+          && data.subjectId is string && data.subjectId.size() <= 128
+          && data.period is string && data.period.size() > 0 && data.period.size() <= 32
+          && data.text is string && data.text.size() >= 0 && data.text.size() <= 3000
+          && data.updatedAt is number;
+      }
+      allow read: if isSignedIn() && isValidId(observationId) && (
+        resource.data.userId == request.auth.uid
+        || isSameInstitutionAsAuthor()
+      );
+      allow create: if isSignedIn() && isValidId(observationId)
+        && isValidObservation(request.resource.data)
+        && request.resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(observationId)
+        && isValidObservation(request.resource.data)
+        && resource.data.userId == request.auth.uid;
+      allow delete: if isSignedIn() && isValidId(observationId)
+        && resource.data.userId == request.auth.uid;
     }
 
     // ── users ──

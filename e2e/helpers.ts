@@ -15,7 +15,12 @@ export async function gotoLanding(page: Page): Promise<void> {
 
 export async function waitForApp(page: Page): Promise<void> {
   // Sidebar cargado = sesión activa y datos listos.
-  await expect(page.getByText('Dashboard', { exact: true }).first()).toBeVisible();
+  // El sidebar puede ser de docente ("Dashboard") o de admin ("Panel Institucional").
+  await expect(
+    page.getByText('Dashboard', { exact: true }).first().or(
+      page.getByText('Panel Institucional', { exact: true }).first(),
+    ),
+  ).toBeVisible();
   await expect(page.getByText('Asignaturas', { exact: true }).first()).toBeVisible();
 }
 

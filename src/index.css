@@ -5,6 +5,16 @@
   --font-display: "Outfit", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
 }
 
+/* Custom animations */
+@keyframes bounce-subtle {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+.animate-bounce-subtle {
+  animation: bounce-subtle 2s ease-in-out infinite;
+}
+
 div#root:nth-of-type(1) > div:nth-of-type(1) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) {
   margin-left: -20px !important;
 }
@@ -33,6 +43,10 @@ div#root:nth-of-type(1) > div:nth-of-type(1) > main:nth-of-type(1) > div:nth-of-
 
 :root {
   color-scheme: light;
+  /* Accent institucional configurable (Módulo 5). useInstitution inyecta el
+     color primario elegido por el admin; este es el default EdiAgil. */
+  --institution-primary: #FFC107;
+  --institution-primary-contrast: #1A3C40;
 }
 
 /* ─── Boletín institucional ───────────────────────────────────────────────
@@ -45,6 +59,37 @@ div#root:nth-of-type(1) > div:nth-of-type(1) > main:nth-of-type(1) > div:nth-of-
   background: white;
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
+}
+
+/* Boletín v2 (AdminBoletin.tsx): área imprimible de UNA página A4.
+   Fuente base 10-11px, padding mínimo, tablas con borde 1px #4A5568, sin
+   sombras ni fondos de color (estilo documento). */
+.boletin-a4 {
+  width: 794px; /* A4 @96dpi (se recorta a 100% en pantallas pequeñas) */
+  max-width: 100%;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.boletin-a4 table {
+  border-collapse: collapse;
+}
+.boletin-a4 th,
+.boletin-a4 td {
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+/* Informe institucional PDF (AdminDashboard): documento A4 (~2 páginas)
+   capturado por exportInstitutionalReport desde un contenedor off-screen.
+   Mismo enfoque que .boletin-a4; los colores van literales en el JSX. */
+.informe-a4 {
+  width: 794px;
+  max-width: none;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.informe-a4 table {
+  border-collapse: collapse;
 }
 
 /* Elementos que se ven en pantalla pero no al imprimir */

@@ -65,7 +65,7 @@ export interface RestResult {
   json: any;
 }
 
-async function restOp(token: string, method: string, url: string, body?: unknown): Promise<RestResult> {
+export async function restOp(token: string, method: string, url: string, body?: unknown): Promise<RestResult> {
   const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });

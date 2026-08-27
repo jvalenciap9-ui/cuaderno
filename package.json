@@ -18,7 +18,10 @@
     "emulators": "node scripts/run-emulators.mjs",
     "seed:emulator": "node scripts/seed-emulator.mjs",
     "test:rules": "node scripts/test-rules.mjs",
-    "test:functions": "node scripts/test-functions.mjs"
+    "test:functions": "node scripts/test-functions.mjs",
+    "dev:demo": "vite --mode demo --port=3000 --host=0.0.0.0",
+    "build:demo": "vite build --mode demo",
+    "preview:demo": "vite preview --mode demo"
   },
   "dependencies": {
     "@google/genai": "^1.48.0",
@@ -32,6 +35,8 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "firebase": "^12.13.0",
+    "firebase-admin": "^14.3.0",
+    "html2canvas-pro": "^2.3.8",
     "html2pdf.js": "^0.14.0",
     "lucide-react": "^0.546.0",
     "mammoth": "^1.12.0",

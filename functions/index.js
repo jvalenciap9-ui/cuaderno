@@ -1,7 +1,12 @@
 const { onRequest, onCall, HttpsError } = require('firebase-functions/v2/https');
 const { defineSecret } = require('firebase-functions/params');
 const admin = require('firebase-admin');
+require('firebase-admin/firestore');
+require('firebase-admin/auth');
 const crypto = require('crypto');
+
+const { getFirestore } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 
 let _initialized = false;
 function ensureInit() {
@@ -12,15 +17,22 @@ function ensureInit() {
 }
 function getDb() {
   ensureInit();
-  return admin.firestore();
+  return getFirestore();
+}
+function getAuthInstance() {
+  ensureInit();
+  return getAuth();
 }
 
-// FieldValue (y el resto del namespace admin.firestore.*) solo existe DESPUÉS
-// de initializeApp(). Antes, capturarlo en carga de módulo devolvía undefined
-// y activateTrial/redeemLicenseKey/resolveTrialExpiry fallaban con
-// "Cannot read properties of undefined (reading 'serverTimestamp'|'delete')".
-ensureInit();
-const FieldValue = admin.firestore.FieldValue;
+// FieldValue lazy getter - ensures Firebase Admin is initialized first
+let _fieldValue = null;
+function getFieldValue() {
+  if (!_fieldValue) {
+    ensureInit();
+    _fieldValue = require('firebase-admin/firestore').FieldValue;
+  }
+  return _fieldValue;
+}
 
 // Duración de la prueba gratuita (14 días en milisegundos).
 const TRIAL_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
@@ -86,7 +98,7 @@ async function isEventProcessed(eventId) {
 async function markEventProcessed(eventId) {
   if (!eventId) return;
   await getDb().collection('webhookEvents').doc(eventId).set(
-    { processedAt: FieldValue.serverTimestamp() },
+    { processedAt: getFieldValue().serverTimestamp() },
     { merge: true }
   );
 }
@@ -100,7 +112,7 @@ async function userStillOnSubscription(uid, subId) {
   const userSnap = await getDb().collection('users').doc(uid).get();
   if (!userSnap.exists) return false;
   const userData = userSnap.data();
-  if (userData.subscriptionId && userData.subscriptionId !== subId) {
+  if (userData.subscriptionId && String(userData.subscriptionId) !== String(subId)) {
     console.warn(`⚠️ Webhook de sub ${subId} ignorado: la suscripción activa es ${userData.subscriptionId}`);
     return false;
   }
@@ -119,7 +131,7 @@ async function handleSubscriptionCancelled(uid, subId, endsAt) {
     subscriptionId: subId,
     subscriptionCancelledAt: Date.now(),
     expiresAt,
-    updatedAt: FieldValue.serverTimestamp(),
+    updatedAt: getFieldValue().serverTimestamp(),
   }, { merge: true });
   return true;
 }
@@ -130,7 +142,7 @@ async function handleSubscriptionExpired(uid, subId) {
     plan: 'free',
     subscriptionId: subId,
     subscriptionExpiredAt: Date.now(),
-    updatedAt: FieldValue.serverTimestamp(),
+    updatedAt: getFieldValue().serverTimestamp(),
   }, { merge: true });
   return true;
 }
@@ -204,7 +216,7 @@ exports.geminiproxy = onRequest(
         return res.status(401).json({ error: 'Debes iniciar sesión' });
       }
       ensureInit();
-      const decoded = await admin.auth().verifyIdToken(idToken);
+      const decoded = await getAuthInstance().verifyIdToken(idToken);
       const uid = decoded.uid;
 
       // 2. Validar el cuerpo de la solicitud ANTES de reservar cuota
@@ -263,7 +275,7 @@ exports.geminiproxy = onRequest(
           userData = {
             plan: 'free',
             email: decoded.email || null,
-            createdAt: FieldValue.serverTimestamp(),
+            createdAt: getFieldValue().serverTimestamp(),
             aiCallsThisMonth: 0,
             aiCallsResetAt: now
           };
@@ -296,12 +308,12 @@ exports.geminiproxy = onRequest(
           tx.update(userRef, {
             aiCallsThisMonth: 1,
             aiCallsResetAt: now,
-            updatedAt: FieldValue.serverTimestamp()
+            updatedAt: getFieldValue().serverTimestamp()
           });
         } else {
           tx.update(userRef, {
-            aiCallsThisMonth: FieldValue.increment(1),
-            updatedAt: FieldValue.serverTimestamp()
+            aiCallsThisMonth: getFieldValue().increment(1),
+            updatedAt: getFieldValue().serverTimestamp()
           });
         }
 
@@ -380,74 +392,99 @@ exports.redeemLicenseKey = onCall(async (request) => {
   const keyRef = getDb().collection('licenseKeys').doc(key);
 
   try {
-    const result = await getDb().runTransaction(async (tx) => {
-      const snap = await tx.get(keyRef);
-      if (!snap.exists || snap.data().used === true) {
-        throw new HttpsError('invalid-argument', 'Código inválido o ya usado');
+    const snap = await keyRef.get();
+    if (!snap.exists || snap.data().used === true) {
+      throw new HttpsError('invalid-argument', 'Código inválido o ya usado');
+    }
+    const keyData = snap.data();
+    const keyPlan = keyData.plan;
+    const validPlans = ['pro', 'school', 'school_admin', 'school_teacher'];
+    if (!validPlans.includes(keyPlan)) {
+      throw new HttpsError('invalid-argument', 'Código inválido o ya usado');
+    }
+
+    let plan = keyPlan;
+    let role = 'teacher';
+    let keyInstitutionId = null;
+
+    if (keyPlan === 'school_admin' || keyPlan === 'school_teacher') {
+      plan = 'school';
+      role = keyPlan === 'school_admin' ? 'admin' : 'teacher';
+      keyInstitutionId = String(keyData.institutionId || '').trim();
+      if (!keyInstitutionId) {
+        throw new HttpsError('invalid-argument', 'Este código no tiene una institución asignada. Contacta al soporte.');
       }
-      const keyData = snap.data();
-      const keyPlan = keyData.plan;
-      const validPlans = ['pro', 'school', 'school_admin', 'school_teacher'];
-      if (!validPlans.includes(keyPlan)) {
-        throw new HttpsError('invalid-argument', 'Código inválido o ya usado');
+    } else if (keyPlan === 'school') {
+      plan = 'school';
+      role = 'teacher';
+      keyInstitutionId = String(keyData.institutionId || '').trim() || null;
+    }
+
+    // 1. Verifica que institutions/{institutionId} exista si la licencia especifica institución
+    if (keyInstitutionId) {
+      const instRef = getDb().collection('institutions').doc(keyInstitutionId);
+      const instSnap = await instRef.get();
+      if (!instSnap.exists) {
+        throw new HttpsError('failed-precondition', 'La institución asociada a este código ya no existe. Contacta al soporte.');
       }
-
-      // Marcar la clave como usada
-      tx.update(keyRef, {
-        used: true,
-        usedBy: uid,
-        usedAt: FieldValue.serverTimestamp(),
-      });
-
-      const userUpdate = {
-        paymentProvider: 'licensekey',
-        // CR-01: un pago/canje real termina la prueba (limpia estado de trial).
-        isTrial: false,
-        trialEndsAt: FieldValue.delete(),
-        trialStartedAt: FieldValue.delete(),
-        // MEDIUM-5: el canje consume el derecho a prueba gratuita.
-        trialUsed: true,
-        updatedAt: FieldValue.serverTimestamp(),
-      };
-
-      let plan = keyPlan;
-      let role = 'teacher';
-
-      if (keyPlan === 'pro') {
-        plan = 'pro';
-        role = 'teacher';
-      } else if (keyPlan === 'school') {
-        plan = 'school';
-        role = 'teacher';
-      } else if (keyPlan === 'school_admin') {
-        plan = 'school';
-        role = 'admin';
-        if (keyData.institutionId) userUpdate.institutionId = keyData.institutionId;
-        if (keyData.institutionName) userUpdate.institutionName = keyData.institutionName;
-      } else if (keyPlan === 'school_teacher') {
-        plan = 'school';
-        role = 'teacher';
-        if (keyData.institutionId) userUpdate.institutionId = keyData.institutionId;
-        if (keyData.institutionName) userUpdate.institutionName = keyData.institutionName;
+      const userSnap = await getDb().collection('users').doc(uid).get();
+      const existingInstitutionId = userSnap.exists ? userSnap.data().institutionId : null;
+      if (existingInstitutionId && existingInstitutionId !== keyInstitutionId) {
+        throw new HttpsError('failed-precondition', 'Tu cuenta ya pertenece a otra institución.');
       }
+    }
 
-      userUpdate.plan = plan;
-      userUpdate.role = role;
+    // 4. Usa batch write
+    const batch = getDb().batch();
 
-      // Aplicar el plan y el rol al usuario (única vía legítima de cambio)
-      tx.set(getDb().collection('users').doc(uid), userUpdate, { merge: true });
-
-      return { plan, role };
+    // Marcar la clave como usada
+    batch.update(keyRef, {
+      used: true,
+      usedBy: uid,
+      usedAt: getFieldValue().serverTimestamp(),
     });
 
-    const message = result.role === 'admin'
+    const userUpdate = {
+      plan,
+      role,
+      paymentProvider: 'licensekey',
+      // CR-01: un pago/canje real termina la prueba (limpia estado de trial).
+      isTrial: false,
+      trialEndsAt: getFieldValue().delete(),
+      trialStartedAt: getFieldValue().delete(),
+      // MEDIUM-5: el canje consume el derecho a prueba gratuita.
+      trialUsed: true,
+      updatedAt: getFieldValue().serverTimestamp(),
+    };
+
+    if (keyInstitutionId) {
+      userUpdate.institutionId = keyInstitutionId;
+      if (keyData.institutionName) userUpdate.institutionName = keyData.institutionName;
+
+      // 3. Crea/actualiza institutionUsers/{uid} con userId, institutionId y role
+      const instUserRef = getDb().collection('institutionUsers').doc(uid);
+      batch.set(instUserRef, {
+        userId: uid,
+        institutionId: keyInstitutionId,
+        role,
+        joinedAt: getFieldValue().serverTimestamp(),
+      }, { merge: true });
+    }
+
+    // 2. Actualiza users/{uid} con role e institutionId
+    const userRef = getDb().collection('users').doc(uid);
+    batch.set(userRef, userUpdate, { merge: true });
+
+    await batch.commit();
+
+    const message = role === 'admin'
       ? 'Licencia Institucional activada. Acceso de administrador habilitado.'
-      : result.plan === 'school'
+      : plan === 'school'
         ? 'Licencia Institucional activada correctamente.'
         : 'Licencia Pro activada correctamente.';
-    return { success: true, plan: result.plan, role: result.role, message };
+    return { success: true, plan, role, message };
   } catch (err) {
-    if (err && err.code && (err.code === 'invalid-argument' || err.code === 'unauthenticated')) {
+    if (err instanceof HttpsError || (err && err.code && ['invalid-argument', 'unauthenticated', 'failed-precondition', 'not-found', 'already-exists'].includes(err.code))) {
       throw err;
     }
     console.error('❌ redeemLicenseKey error:', err?.message || err);
@@ -504,7 +541,7 @@ exports.activateTrial = onCall(async (request) => {
         trialStartedAt: now,
         trialEndsAt,
         trialUsed: true,
-        updatedAt: FieldValue.serverTimestamp(),
+        updatedAt: getFieldValue().serverTimestamp(),
       }, { merge: true });
 
       return { ok: true, trialEndsAt };
@@ -555,10 +592,10 @@ exports.resolveTrialExpiry = onCall(async (request) => {
         isTrial: false,
         trialUsed: true,
         // LOW-7: limpiar campos stale del trial.
-        paymentProvider: FieldValue.delete(),
-        trialEndsAt: FieldValue.delete(),
-        trialStartedAt: FieldValue.delete(),
-        updatedAt: FieldValue.serverTimestamp(),
+        paymentProvider: getFieldValue().delete(),
+        trialEndsAt: getFieldValue().delete(),
+        trialStartedAt: getFieldValue().delete(),
+        updatedAt: getFieldValue().serverTimestamp(),
       }, { merge: true });
       return { ok: true, plan: 'free' };
     }
@@ -836,6 +873,1655 @@ async function getAllDocsForUserBySubject(colName, userId, subjectId) {
   return all;
 }
 
+// ─── Sprint 4: Métricas Institucionales (KPIs, tendencias, distribución, retención) ────────────────
+exports.getInstitutionalMetrics = onCall({ timeoutSeconds: 120, memory: '1GiB' }, async (request) => {
+  const { calculateStudentRisk, generateRecommendations } = require('./lib/risk-calculator');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const turno = parseTurnoFilter(request.data);
+  const nivel = parseNivelFilter(request.data);
+
+  const rows = await loadInstitutionData(adminInstitutionId);
+  const subjectMeta = new Map(); // subjectId → { name, periodo, nivelEducativo, userId }
+  const teacherNameById = new Map();
+  for (const { teacher, subjects, students } of rows) {
+    teacherNameById.set(teacher.uid, teacher.displayName || (teacher.email || '').split('@')[0] || 'Docente');
+    for (const sub of subjects) {
+      if (!subjectMatchesFilters(sub, turno, nivel)) continue;
+      subjectMeta.set(sub.id, {
+        name: sub.name || 'Sin nombre',
+        periodo: sub.periodo || null,
+        nivelEducativo: sub.nivelEducativo || null,
+        userId: teacher.uid,
+      });
+    }
+  }
+  const subjectIds = new Set(subjectMeta.keys());
+  const studentsAll = [];
+  for (const { students } of rows) {
+    for (const s of students) if (subjectIds.has(s.subjectId)) studentsAll.push(s);
+  }
+
+  // Evaluaciones / notas / asistencia de las asignaturas que matchean los filtros.
+  const teacherUids = Array.from(new Set(rows.map((r) => r.teacher.uid)));
+  const bySubject = (arr) => (arr || []).filter((x) => subjectIds.has(x.subjectId));
+  const loaded = await Promise.allSettled(teacherUids.map(async (teacherUid) => {
+    const [evaluations, grades, attendance] = await Promise.all([
+      getAllDocsForUser('evaluations', teacherUid),
+      getAllDocsForUser('grades', teacherUid),
+      getAllDocsForUser('attendance', teacherUid),
+    ]);
+    return { evaluations: bySubject(evaluations), grades: bySubject(grades), attendance: bySubject(attendance) };
+  }));
+  const evalsAll = [];
+  const gradesAll = [];
+  const attendanceAll = [];
+  for (const r of loaded) {
+    if (r.status !== 'fulfilled') continue;
+    evalsAll.push(...r.value.evaluations);
+    gradesAll.push(...r.value.grades);
+    attendanceAll.push(...r.value.attendance);
+  }
+
+  // Asistencia global + por turno + por nivel educativo.
+  const attByTurno = {
+    matutino: { present: 0, total: 0 },
+    vespertino: { present: 0, total: 0 },
+    nocturno: { present: 0, total: 0 },
+  };
+  const attByGrado = new Map(); // nivelEducativo → { present, total }
+  const attGlobal = { present: 0, total: 0 };
+  for (const a of attendanceAll) {
+    const meta = subjectMeta.get(a.subjectId);
+    const isPresent = (a.status || 'present') === 'present';
+    attGlobal.total += 1;
+    if (isPresent) attGlobal.present += 1;
+    const turnoKey = meta && meta.periodo && attByTurno[meta.periodo] ? meta.periodo : null;
+    if (turnoKey) {
+      attByTurno[turnoKey].total += 1;
+      if (isPresent) attByTurno[turnoKey].present += 1;
+    }
+    const gKey = meta && meta.nivelEducativo ? meta.nivelEducativo : 'sin-nivel';
+    if (!attByGrado.has(gKey)) attByGrado.set(gKey, { present: 0, total: 0 });
+    attByGrado.get(gKey).total += 1;
+    if (isPresent) attByGrado.get(gKey).present += 1;
+  }
+  const pctOf = (present, total) => (total > 0 ? Math.round((present / total) * 1000) / 10 : null);
+
+  // Promedio general de notas (0-100 normalizado por maxScore).
+  const maxScoreByEval = new Map(evalsAll.map((e) => [e.id, Number(e.maxScore) || 0]));
+  let gradeSum = 0;
+  let gradeCount = 0;
+  for (const g of gradesAll) {
+    const max = maxScoreByEval.get(g.evaluationId);
+    const score = Number(g.score);
+    if (max && max > 0 && Number.isFinite(score)) {
+      gradeSum += (score / max) * 100;
+      gradeCount += 1;
+    }
+  }
+
+  // Riesgo por persona (consolidada por cédula/nombre) × asignatura.
+  const byPerson = new Map();
+  for (const s of studentsAll) {
+    const key = String(s.cedula || '').trim() || `${normText(s.firstName)}|${normText(s.lastName)}`;
+    if (!byPerson.has(key)) {
+      byPerson.set(key, { studentId: s.id, cedula: s.cedula || '', firstName: s.firstName || '', lastName: s.lastName || '', memberships: [] });
+    }
+    byPerson.get(key).memberships.push(s);
+  }
+
+  const riskOrder = { low: 0, medium: 1, high: 2 };
+  const riskSummary = { low: 0, medium: 0, high: 0 };
+  const atRiskStudents = [];
+  for (const person of byPerson.values()) {
+    let worst = 'low';
+    for (const st of person.memberships) {
+      const meta = subjectMeta.get(st.subjectId);
+      const pcts = gradesAll
+        .filter((g) => g.subjectId === st.subjectId && g.studentId === st.id)
+        .map((g) => {
+          const max = maxScoreByEval.get(g.evaluationId);
+          return max && max > 0 ? (Number(g.score) / max) * 100 : null;
+        })
+        .filter((v) => v !== null);
+      const gradePct = pcts.length > 0 ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+      const attRecords = attendanceAll.filter((a) => a.subjectId === st.subjectId && a.studentId === st.id);
+      const attPct = attRecords.length > 0
+        ? (attRecords.filter((a) => a.status === 'present').length / attRecords.length) * 100
+        : null;
+      const risk = calculateStudentRisk(attPct, gradePct !== null ? [gradePct] : []);
+      if (riskOrder[risk.level] > riskOrder[worst]) worst = risk.level;
+      if (risk.level !== 'low') {
+        atRiskStudents.push({
+          studentId: person.studentId,
+          cedula: person.cedula,
+          studentName: `${person.firstName} ${person.lastName}`.trim(),
+          asignatura: meta ? meta.name : 'Sin nombre',
+          docente: meta ? teacherNameById.get(meta.userId) || 'Docente' : 'Docente',
+          periodo: meta ? meta.periodo : null,
+          nivelEducativo: meta ? meta.nivelEducativo : null,
+          asistencia: attPct !== null ? Math.round(attPct * 10) / 10 : null,
+          nota: gradePct !== null ? Math.round(gradePct * 10) / 10 : null,
+          nivelRiesgo: risk.level,
+          razones: risk.reasons,
+        });
+      }
+    }
+    riskSummary[worst] += 1;
+  }
+  atRiskStudents.sort((a, b) => riskOrder[b.nivelRiesgo] - riskOrder[a.nivelRiesgo] || (a.studentName || '').localeCompare(b.studentName || '', 'es'));
+  if (atRiskStudents.length > 50) atRiskStudents.length = 50;
+
+  const byGradoOut = {};
+  for (const [k, v] of attByGrado.entries()) byGradoOut[k] = pctOf(v.present, v.total);
+
+  // --- SPRINT 4: Tendencias (trends) ---
+  const trendsAttMap = new Map(); // YYYY-MM -> { present, total }
+  for (const a of attendanceAll) {
+    if (!a.date) continue;
+    const month = a.date.substring(0, 7);
+    if (!trendsAttMap.has(month)) trendsAttMap.set(month, { present: 0, total: 0 });
+    trendsAttMap.get(month).total += 1;
+    if ((a.status || 'present') === 'present') trendsAttMap.get(month).present += 1;
+  }
+  const attendanceTrends = Array.from(trendsAttMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, counts]) => ({ date, value: pctOf(counts.present, counts.total) || 0 }));
+
+  const trendsGradesMap = new Map(); // YYYY-MM -> { sum, count }
+  const evalsById = new Map(evalsAll.map(e => [e.id, e]));
+  for (const g of gradesAll) {
+    const ev = evalsById.get(g.evaluationId);
+    if (!ev || !ev.date) continue;
+    const month = ev.date.substring(0, 7);
+    const max = maxScoreByEval.get(g.evaluationId);
+    const score = Number(g.score);
+    if (max && max > 0 && Number.isFinite(score)) {
+      if (!trendsGradesMap.has(month)) trendsGradesMap.set(month, { sum: 0, count: 0 });
+      trendsGradesMap.get(month).sum += (score / max) * 100;
+      trendsGradesMap.get(month).count += 1;
+    }
+  }
+  const gradesTrends = Array.from(trendsGradesMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, counts]) => ({ date, value: Math.round((counts.sum / counts.count) * 10) / 10 }));
+
+  // --- SPRINT 4: Distribución (distribution) ---
+  const distByTurno = { matutino: 0, vespertino: 0, nocturno: 0 };
+  const distByGrado = {};
+  for (const person of byPerson.values()) {
+    const turnosSet = new Set();
+    const gradosSet = new Set();
+    for (const st of person.memberships) {
+      const meta = subjectMeta.get(st.subjectId);
+      if (meta && meta.periodo) turnosSet.add(meta.periodo);
+      if (meta && meta.nivelEducativo) gradosSet.add(meta.nivelEducativo);
+    }
+    for (const t of turnosSet) {
+      if (distByTurno[t] !== undefined) distByTurno[t] += 1;
+    }
+    for (const g of gradosSet) {
+      distByGrado[g] = (distByGrado[g] || 0) + 1;
+    }
+  }
+
+  // --- SPRINT 4: Retención (retention) ---
+  const retention = {
+    estimatedRate: null,
+    totalActive: byPerson.size,
+    totalPrevious: null,
+  };
+
+  return {
+    generatedAt: Date.now(),
+    institutionId: adminInstitutionId,
+    attendance: {
+      global: pctOf(attGlobal.present, attGlobal.total),
+      byTurno: {
+        matutino: pctOf(attByTurno.matutino.present, attByTurno.matutino.total),
+        vespertino: pctOf(attByTurno.vespertino.present, attByTurno.vespertino.total),
+        nocturno: pctOf(attByTurno.nocturno.present, attByTurno.nocturno.total),
+      },
+      byGrado: byGradoOut,
+    },
+    grades: { global: gradeCount > 0 ? Math.round((gradeSum / gradeCount) * 10) / 10 : null },
+    riskSummary,
+    atRiskStudents,
+    trends: {
+      attendance: attendanceTrends,
+      grades: gradesTrends,
+    },
+    distribution: {
+      byTurno: distByTurno,
+      byGrado: distByGrado,
+    },
+    retention,
+  };
+});
+
+// ─── Sprint 2: Detalle del estudiante y recomendaciones ───────────────────
+exports.getStudentRiskReport = onCall({ timeoutSeconds: 60 }, async (request) => {
+  const { calculateStudentRisk, generateRecommendations } = require('./lib/risk-calculator');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const studentId = typeof request.data?.studentId === 'string' ? request.data.studentId.trim() : '';
+  if (!studentId) {
+    throw new HttpsError('invalid-argument', 'Indica el id o la cédula del estudiante.');
+  }
+
+  const rows = await loadInstitutionData(adminInstitutionId);
+  const subjectMeta = new Map(); // subjectId → { name, periodo, nivelEducativo, userId }
+  const teacherNameById = new Map();
+  for (const { teacher, subjects } of rows) {
+    teacherNameById.set(teacher.uid, teacher.displayName || (teacher.email || '').split('@')[0] || 'Docente');
+    for (const sub of subjects) {
+      subjectMeta.set(sub.id, {
+        name: sub.name || 'Sin nombre',
+        periodo: sub.periodo || null,
+        nivelEducativo: sub.nivelEducativo || null,
+        userId: teacher.uid,
+      });
+    }
+  }
+
+  // Localizar al estudiante (id de documento o cédula) y consolidar la persona
+  // por cédula (o nombre si no hay cédula).
+  let person = null;
+  const allStudents = [];
+  for (const { students } of rows) allStudents.push(...students);
+  for (const st of allStudents) {
+    if (String(st.id) === studentId || (st.cedula && String(st.cedula).trim() === studentId)) { person = st; break; }
+  }
+  if (!person) {
+    throw new HttpsError('not-found', 'El estudiante no existe en la institución.');
+  }
+  const personKey = String(person.cedula || '').trim() || `${normText(person.firstName)}|${normText(person.lastName)}`;
+  const memberships = allStudents.filter((st) => {
+    const k = String(st.cedula || '').trim() || `${normText(st.firstName)}|${normText(st.lastName)}`;
+    return k === personKey;
+  });
+
+  const riskOrder = { low: 0, medium: 1, high: 2 };
+  const subjects = [];
+  let worst = 'low';
+  const reasons = [];
+  let attPresent = 0;
+  let attTotal = 0;
+  let sumGrade = 0;
+  let countGrade = 0;
+  let fails = 0;
+
+  for (const st of memberships) {
+    const meta = subjectMeta.get(st.subjectId);
+    const [evals, grades, attendance] = await Promise.all([
+      getAllDocsForUserBySubject('evaluations', st.userId, st.subjectId),
+      getAllDocsForUserBySubject('grades', st.userId, st.subjectId),
+      getAllDocsForUserBySubject('attendance', st.userId, st.subjectId),
+    ]);
+    const maxByEval = new Map(evals.map((e) => [e.id, Number(e.maxScore) || 0]));
+    const pcts = grades
+      .filter((g) => g.studentId === st.id)
+      .map((g) => {
+        const max = maxByEval.get(g.evaluationId);
+        return max && max > 0 ? (Number(g.score) / max) * 100 : null;
+      })
+      .filter((v) => v !== null);
+    const gradePct = pcts.length > 0 ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+    const stAtt = attendance.filter((a) => a.studentId === st.id);
+    const attPct = stAtt.length > 0 ? (stAtt.filter((a) => a.status === 'present').length / stAtt.length) * 100 : null;
+
+    const risk = calculateStudentRisk(attPct, gradePct !== null ? [gradePct] : []);
+    if (riskOrder[risk.level] > riskOrder[worst]) worst = risk.level;
+    for (const reason of risk.reasons) {
+      if (!reasons.includes(reason)) reasons.push(reason);
+    }
+    if (gradePct !== null) {
+      sumGrade += gradePct;
+      countGrade += 1;
+      if (gradePct < 60) fails += 1;
+    }
+    attPresent += stAtt.filter((a) => a.status === 'present').length;
+    attTotal += stAtt.length;
+
+    const gs = meta ? deriveGradoSeccion(meta.name) : { grado: null, seccion: null };
+    subjects.push({
+      subjectId: st.subjectId,
+      subjectName: meta ? meta.name : 'Sin nombre',
+      teacherName: meta ? teacherNameById.get(meta.userId) || 'Docente' : 'Docente',
+      periodo: meta ? meta.periodo : null,
+      nivelEducativo: meta ? meta.nivelEducativo : null,
+      attendance: attPct !== null ? Math.round(attPct * 10) / 10 : null,
+      finalGrade: gradePct !== null ? Math.round(gradePct * 10) / 10 : null,
+      grado: gs.grado,
+      seccion: gs.seccion,
+    });
+  }
+
+  const overallAtt = attTotal > 0 ? (attPresent / attTotal) * 100 : null;
+  const promedioGeneral = countGrade > 0 ? Math.round((sumGrade / countGrade) * 10) / 10 : null;
+  const gradoSeccion = subjects.find((s) => s.grado) || { grado: null, seccion: null };
+
+  return {
+    student: {
+      studentId: person.id,
+      cedula: person.cedula || '',
+      firstName: person.firstName || '',
+      lastName: person.lastName || '',
+      grado: gradoSeccion.grado,
+      seccion: gradoSeccion.seccion,
+      // El esquema no tiene correo del estudiante.
+      correo: null,
+    },
+    subjects,
+    promedioGeneral,
+    riskLevel: worst,
+    reasons,
+    recommendations: generateRecommendations(worst, overallAtt, fails),
+  };
+});
+
+// ─── Sprint 3: Desempeño por docente ──────────────────────────────────────
+exports.getTeacherPerformance = onCall({ timeoutSeconds: 60 }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const teacherId = typeof request.data?.teacherId === 'string' ? request.data.teacherId.trim() : '';
+  if (!teacherId) throw new HttpsError('invalid-argument', 'Indica el docente.');
+
+  const teacherSnap = await getDb().collection('users').doc(teacherId).get();
+  if (!teacherSnap.exists) throw new HttpsError('not-found', 'El docente no existe.');
+  const teacherData = teacherSnap.data();
+  if (teacherData.institutionId !== adminInstitutionId) {
+    throw new HttpsError('not-found', 'El docente no pertenece a tu institución.');
+  }
+
+  // `periodo` → turno de la asignatura; `grado` → nivel educativo (no hay
+  // campo "grado" en el esquema: se filtra por el nivel de la asignatura).
+  const turno = parseTurnoFilter({ turno: request.data?.periodo });
+  const nivel = parseNivelFilter({ nivelEducativo: request.data?.grado });
+
+  const [subjects, students, evaluations, grades, attendance] = await Promise.all([
+    getAllDocsForUser('subjects', teacherId),
+    getAllDocsForUser('students', teacherId),
+    getAllDocsForUser('evaluations', teacherId),
+    getAllDocsForUser('grades', teacherId),
+    getAllDocsForUser('attendance', teacherId),
+  ]);
+  const filtered = applyDashboardFilters({ subjects, students, evaluations, grades, attendance }, turno, nivel);
+
+  const maxByEval = new Map(filtered.evaluations.map((e) => [e.id, Number(e.maxScore) || 0]));
+  const teacherName = teacherData.displayName || (teacherData.email || '').split('@')[0] || 'Docente';
+
+  // Métricas por asignatura + promedio general del docente.
+  const subjectOut = [];
+  let sumGrade = 0;
+  let countGrade = 0;
+  for (const sub of filtered.subjects) {
+    const subGrades = filtered.grades.filter((g) => g.subjectId === sub.id);
+    const subAtt = filtered.attendance.filter((a) => a.subjectId === sub.id);
+    let gradeSum = 0;
+    let gradeCount = 0;
+    for (const g of subGrades) {
+      const max = maxByEval.get(g.evaluationId);
+      if (max && max > 0) { gradeSum += (Number(g.score) / max) * 100; gradeCount += 1; }
+    }
+    const present = subAtt.filter((a) => a.status === 'present').length;
+    sumGrade += gradeSum;
+    countGrade += gradeCount;
+    subjectOut.push({
+      subjectId: sub.id,
+      subjectName: sub.name || 'Sin nombre',
+      periodo: sub.periodo || null,
+      nivelEducativo: sub.nivelEducativo || null,
+      promedioCalificaciones: gradeCount > 0 ? Math.round((gradeSum / gradeCount) * 10) / 10 : null,
+      promedioAsistencia: subAtt.length > 0 ? Math.round((present / subAtt.length) * 1000) / 10 : null,
+      numEstudiantes: filtered.students.filter((s) => s.subjectId === sub.id).length,
+    });
+  }
+
+  // Estudiantes en riesgo del docente (persona × asignatura, mismo criterio).
+  const riskOrder = { low: 0, medium: 1, high: 2 };
+  const byPerson = new Map();
+  for (const s of filtered.students) {
+    const key = String(s.cedula || '').trim() || `${normText(s.firstName)}|${normText(s.lastName)}`;
+    if (!byPerson.has(key)) {
+      byPerson.set(key, { studentId: s.id, cedula: s.cedula || '', firstName: s.firstName || '', lastName: s.lastName || '', memberships: [] });
+    }
+    byPerson.get(key).memberships.push(s);
+  }
+  const atRisk = [];
+  for (const person of byPerson.values()) {
+    for (const st of person.memberships) {
+      const sub = filtered.subjects.find((x) => x.id === st.subjectId);
+      const pcts = filtered.grades
+        .filter((g) => g.subjectId === st.subjectId && g.studentId === st.id)
+        .map((g) => {
+          const max = maxByEval.get(g.evaluationId);
+          return max && max > 0 ? (Number(g.score) / max) * 100 : null;
+        })
+        .filter((v) => v !== null);
+      const gradePct = pcts.length > 0 ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+      const stAtt = filtered.attendance.filter((a) => a.subjectId === st.subjectId && a.studentId === st.id);
+      const attPct = stAtt.length > 0 ? (stAtt.filter((a) => a.status === 'present').length / stAtt.length) * 100 : null;
+      const risk = calculateStudentRisk(attPct, gradePct !== null ? [gradePct] : []);
+      if (risk.level !== 'low') {
+        atRisk.push({
+          studentId: person.studentId,
+          cedula: person.cedula,
+          studentName: `${person.firstName} ${person.lastName}`.trim(),
+          subjectName: sub ? sub.name : 'Sin nombre',
+          asistencia: attPct !== null ? Math.round(attPct * 10) / 10 : null,
+          nota: gradePct !== null ? Math.round(gradePct * 10) / 10 : null,
+          nivelRiesgo: risk.level,
+          razones: risk.reasons,
+        });
+      }
+    }
+  }
+  atRisk.sort((a, b) => riskOrder[b.nivelRiesgo] - riskOrder[a.nivelRiesgo] || a.studentName.localeCompare(b.studentName, 'es'));
+  if (atRisk.length > 50) atRisk.length = 50;
+
+  // Evolución por trimestre (I/II/III): asistencia y calificaciones.
+  const evolution = ['I', 'II', 'III'].map((periodo) => {
+    const pEvalIds = new Set(filtered.evaluations.filter((e) => evDateInPeriodo(e.date, periodo)).map((e) => e.id));
+    let gradeSum = 0;
+    let gradeCount = 0;
+    for (const g of filtered.grades) {
+      const max = maxByEval.get(g.evaluationId);
+      if (pEvalIds.has(g.evaluationId) && max && max > 0) {
+        gradeSum += (Number(g.score) / max) * 100;
+        gradeCount += 1;
+      }
+    }
+    const pAtt = filtered.attendance.filter((a) => evDateInPeriodo(a.date, periodo));
+    const pPresent = pAtt.filter((a) => a.status === 'present').length;
+    return {
+      periodo,
+      attendance: pAtt.length > 0 ? Math.round((pPresent / pAtt.length) * 1000) / 10 : null,
+      grades: gradeCount > 0 ? Math.round((gradeSum / gradeCount) * 10) / 10 : null,
+    };
+  });
+
+  return {
+    teacher: {
+      uid: teacherId,
+      email: teacherData.email || '',
+      displayName: teacherName,
+      institutionId: adminInstitutionId,
+      institutionName: adminSnap.data().institutionName || 'Institución',
+      subjectsCount: filtered.subjects.length,
+      totalStudents: filtered.students.length,
+      promedioGeneral: countGrade > 0 ? Math.round((sumGrade / countGrade) * 10) / 10 : null,
+    },
+    subjects: subjectOut,
+    atRiskStudents: atRisk,
+    evolution,
+  };
+});
+
+// ─── Métricas institucionales globales (adminGetInstitutionStats) ──────────
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = 7 * DAY_MS;
+
+function toTs(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(v);
+    const t = m ? new Date(+m[1], +m[2] - 1, +m[3]).getTime() : Date.parse(v);
+    return Number.isNaN(t) ? null : t;
+  }
+  if (typeof v.toMillis === 'function') return v.toMillis();
+  return null;
+}
+
+function weekStartKey(ts) {
+  const d = new Date(ts);
+  const day = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - day);
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString().slice(0, 10);
+}
+
+exports.adminGetInstitutionStats = onCall({ timeoutSeconds: 120, memory: '1GiB' }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const teachersSnap = await getDb()
+    .collection('users')
+    .where('institutionId', '==', adminInstitutionId)
+    .get();
+
+  const teachers = teachersSnap.docs
+    .map((d) => ({ uid: d.id, ...d.data() }))
+    .filter((t) => t.uid !== uid && (t.role || 'teacher') !== 'admin');
+
+  const results = await Promise.allSettled(teachers.map(async (teacherData) => {
+    const teacherUid = teacherData.uid;
+    const [subjects, students, evaluations, attendance, grades, notes, materials, calendarEvents] = await Promise.all([
+      getAllDocsForUser('subjects', teacherUid),
+      getAllDocsForUser('students', teacherUid),
+      getAllDocsForUser('evaluations', teacherUid),
+      getAllDocsForUser('attendance', teacherUid),
+      getAllDocsForUser('grades', teacherUid),
+      getAllDocsForUser('notes', teacherUid),
+      getAllDocsForUser('materials', teacherUid),
+      getAllDocsForUser('calendarEvents', teacherUid),
+    ]);
+    return { teacherData, subjects, students, evaluations, attendance, grades, notes, materials, calendarEvents };
+  }));
+
+  const weekKeys = [];
+  for (let i = 7; i >= 0; i--) weekKeys.push(weekStartKey(Date.now() - i * WEEK_MS));
+  const weekly = {};
+  weekKeys.forEach((k) => {
+    weekly[k] = { week: k, sessions: 0, evaluations: 0, notes: 0, materials: 0, events: 0 };
+  });
+
+  const byPlan = { free: 0, pro: 0, school: 0 };
+  const attendanceTotal = { present: 0, late: 0, absent: 0, total: 0 };
+  const subjectMap = new Map();
+  const teachersOut = [];
+  let totals = { subjects: 0, students: 0, evaluations: 0, gradesCount: 0, attendanceCount: 0, sessions: 0 };
+  let aiCallsThisMonth = 0;
+  let teachersWithAiUsage = 0;
+  let gradeAvgSum = 0;
+  let gradeAvgCount = 0;
+
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    const { teacherData, subjects, students, evaluations, attendance, grades, notes, materials, calendarEvents } = r.value;
+
+    const teacherUid = teacherData.uid;
+    const plan = teacherData.plan || 'free';
+    if (Object.prototype.hasOwnProperty.call(byPlan, plan)) byPlan[plan] += 1;
+
+    const aiCalls = Number(teacherData.aiCallsThisMonth) || 0;
+    aiCallsThisMonth += aiCalls;
+    if (aiCalls > 0) teachersWithAiUsage += 1;
+
+    const lastActivity = toTs(teacherData.lastLoginAt) || toTs(teacherData.updatedAt) || null;
+    const active7d = lastActivity !== null && Date.now() - lastActivity < 7 * DAY_MS;
+    const active30d = lastActivity !== null && Date.now() - lastActivity < 30 * DAY_MS;
+
+    totals.subjects += subjects.length;
+    totals.students += students.length;
+    totals.evaluations += evaluations.length;
+    totals.gradesCount += grades.length;
+    totals.attendanceCount += attendance.length;
+
+    const attBySubject = new Map();
+    const sessionSet = new Set();
+    for (const a of attendance) {
+      const key = `${teacherUid}|${a.subjectId}`;
+      const status = a.status === 'late' ? 'late' : a.status === 'absent' ? 'absent' : 'present';
+      if (!attBySubject.has(key)) {
+        attBySubject.set(key, { subjectId: a.subjectId, present: 0, late: 0, absent: 0, total: 0 });
+      }
+      attBySubject.get(key)[status] += 1;
+      attBySubject.get(key).total += 1;
+      attendanceTotal[status] += 1;
+      attendanceTotal.total += 1;
+      sessionSet.add(`${a.subjectId}|${a.date}`);
+    }
+    totals.sessions += sessionSet.size;
+    for (const pair of sessionSet) {
+      const ts = toTs(pair.split('|')[1]);
+      const wk = ts === null ? null : weekStartKey(ts);
+      if (wk && weekly[wk]) weekly[wk].sessions += 1;
+    }
+
+    const addWeekly = (arr, dateField, bucketField) => {
+      for (const d of arr) {
+        const ts = toTs(d[dateField]);
+        if (ts === null) continue;
+        const wk = weekStartKey(ts);
+        if (weekly[wk]) weekly[wk][bucketField] += 1;
+      }
+    };
+    addWeekly(notes, 'date', 'notes');
+    addWeekly(materials, 'date', 'materials');
+    addWeekly(calendarEvents, 'date', 'events');
+    addWeekly(evaluations, 'date', 'evaluations');
+
+    const maxScoreByEval = new Map();
+    for (const ev of evaluations) maxScoreByEval.set(ev.id, Number(ev.maxScore) || null);
+
+    const gradesBySubject = new Map();
+    for (const g of grades) {
+      const key = `${teacherUid}|${g.subjectId}`;
+      if (!gradesBySubject.has(key)) {
+        gradesBySubject.set(key, {
+          subjectId: g.subjectId,
+          sumPct: 0,
+          count: 0,
+          students: new Set(),
+          evaluationsWithGrades: new Set(),
+          evaluationsWithoutGrades: new Set(),
+        });
+      }
+      const entry = gradesBySubject.get(key);
+      const maxScore = maxScoreByEval.get(g.evaluationId);
+      const score = Number(g.score);
+      if (maxScore && maxScore > 0 && Number.isFinite(score)) {
+        entry.sumPct += (score / maxScore) * 100;
+        entry.count += 1;
+      }
+      entry.students.add(g.studentId);
+      entry.evaluationsWithGrades.add(g.evaluationId);
+    }
+    for (const ev of evaluations) {
+      const key = `${teacherUid}|${ev.subjectId}`;
+      const entry = gradesBySubject.get(key);
+      if (entry && !entry.evaluationsWithGrades.has(ev.id)) entry.evaluationsWithoutGrades.add(ev.id);
+    }
+
+    const studentsBySubject = new Map();
+    for (const s of students) {
+      const key = `${teacherUid}|${s.subjectId}`;
+      if (!studentsBySubject.has(key)) studentsBySubject.set(key, new Set());
+      studentsBySubject.get(key).add(s.id);
+    }
+
+    for (const sub of subjects) {
+      const key = `${teacherUid}|${sub.id}`;
+      if (subjectMap.has(key)) continue;
+      const att = attBySubject.get(key);
+      const gr = gradesBySubject.get(key);
+      const stCount = studentsBySubject.get(key) ? studentsBySubject.get(key).size : 0;
+      subjectMap.set(key, {
+        subjectId: sub.id,
+        subjectName: sub.name || 'Sin nombre',
+        teacherName: teacherData.displayName || teacherData.email?.split('@')[0] || 'Docente',
+        periodo: sub.periodo || null,
+        students: stCount,
+        evaluations: evaluations.filter((e) => e.subjectId === sub.id).length,
+        evaluationsWithGrades: gr ? gr.evaluationsWithGrades.size : 0,
+        evaluationsWithoutGrades: gr ? gr.evaluationsWithoutGrades.size : 0,
+        attendanceTotal: att ? att.total : 0,
+        attendancePresent: att ? att.present : 0,
+        attendanceLate: att ? att.late : 0,
+        attendanceAbsent: att ? att.absent : 0,
+        attendanceRate: att && att.total > 0 ? Math.round((att.present / att.total) * 1000) / 10 : 0,
+        avgPct: gr && gr.count > 0 ? Math.round((gr.sumPct / gr.count) * 10) / 10 : null,
+      });
+    }
+
+    let teacherSumPct = 0;
+    let teacherCount = 0;
+    for (const entry of gradesBySubject.values()) {
+      teacherSumPct += entry.sumPct;
+      teacherCount += entry.count;
+    }
+    gradeAvgSum += teacherSumPct;
+    gradeAvgCount += teacherCount;
+
+    teachersOut.push({
+      uid: teacherUid,
+      displayName: teacherData.displayName || teacherData.email?.split('@')[0] || 'Docente',
+      plan,
+      lastActivity,
+      active7d,
+      active30d,
+      aiCallsThisMonth: aiCalls,
+      subjects: subjects.length,
+      students: students.length,
+      evaluations: evaluations.length,
+      attendanceCount: attendance.length,
+      gradesCount: grades.length,
+    });
+  }
+
+  const subjectStats = Array.from(subjectMap.values())
+    .sort((a, b) => b.students - a.students || b.attendanceTotal - a.attendanceTotal)
+    .slice(0, 12);
+
+  teachersOut.sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0));
+  totals.teachers = teachersOut.length;
+
+  return {
+    generatedAt: Date.now(),
+    institutionId: adminInstitutionId,
+    totals,
+    byPlan,
+    attendance: {
+      present: attendanceTotal.present,
+      late: attendanceTotal.late,
+      absent: attendanceTotal.absent,
+      total: attendanceTotal.total,
+      passRate: attendanceTotal.total > 0 ? Math.round((attendanceTotal.present / attendanceTotal.total) * 1000) / 10 : 0,
+    },
+    grades: {
+      count: gradeAvgCount,
+      avgPct: gradeAvgCount > 0 ? Math.round((gradeAvgSum / gradeAvgCount) * 10) / 10 : null,
+    },
+    subjectStats,
+    weeklyActivity: weekKeys.map((k) => weekly[k]),
+    teachers: teachersOut,
+    aiUsage: { callsThisMonth: aiCallsThisMonth, teachersWithUsage: teachersWithAiUsage },
+  };
+});
+
+// ─── Alertas de riesgo institucional ──────────────────────────────────────
+exports.adminGetInstitutionAlerts = onCall({ timeoutSeconds: 120, memory: '1GiB' }, async (request) => {
+  const { computeInstitutionAlerts } = require('./lib/institution-alerts');
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  }
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const teachersSnap = await getDb()
+    .collection('users')
+    .where('institutionId', '==', adminInstitutionId)
+    .get();
+
+  const teachers = teachersSnap.docs
+    .map((d) => ({ uid: d.id, ...d.data() }))
+    .filter((t) => t.uid !== uid && (t.role || 'teacher') !== 'admin');
+
+  const turno = parseTurnoFilter(request.data);
+  const nivel = parseNivelFilter(request.data);
+
+  const results = await Promise.allSettled(teachers.map(async (teacherData) => {
+    const teacherUid = teacherData.uid;
+    const [subjects, students, evaluations, grades, attendance] = await Promise.all([
+      getAllDocsForUser('subjects', teacherUid),
+      getAllDocsForUser('students', teacherUid),
+      getAllDocsForUser('evaluations', teacherUid),
+      getAllDocsForUser('grades', teacherUid),
+      getAllDocsForUser('attendance', teacherUid),
+    ]);
+    return {
+      ...applyDashboardFilters({ subjects, students, evaluations, grades, attendance }, turno, nivel),
+      teacher: teacherData,
+    };
+  }));
+
+  const rows = results
+    .filter((r) => r.status === 'fulfilled')
+    .map((r) => r.value);
+
+  const alerts = computeInstitutionAlerts(rows);
+
+  const summary = alerts.reduce(
+    (acc, a) => {
+      acc.total += 1;
+      if (a.severity === 'critical') acc.critical += 1;
+      else acc.warning += 1;
+      if (a.type === 'student_grades' || a.type === 'student_attendance') {
+        if (!acc.studentIds.has(a.studentId)) { acc.studentIds.add(a.studentId); acc.studentsAtRisk += 1; }
+      }
+      if (a.type === 'group_grades' || a.type === 'group_attendance') {
+        const k = `${a.teacherUid}|${a.subjectId}`;
+        if (!acc.groupKeys.has(k)) { acc.groupKeys.add(k); acc.groupsAtRisk += 1; }
+      }
+      return acc;
+    },
+    { total: 0, critical: 0, warning: 0, studentsAtRisk: 0, groupsAtRisk: 0, studentIds: new Set(), groupKeys: new Set() }
+  );
+
+  return {
+    generatedAt: Date.now(),
+    institutionId: adminInstitutionId,
+    institutionName: adminSnap.data().institutionName || 'Institución',
+    summary: {
+      total: summary.total,
+      critical: summary.critical,
+      warning: summary.warning,
+      studentsAtRisk: summary.studentsAtRisk,
+      groupsAtRisk: summary.groupsAtRisk,
+    },
+    alerts,
+  };
+});
+
+// ─── Inteligencia Institucional (Gemini AI) ───────────────────────────────
+exports.adminGenerateInstitutionInsights = onCall(
+  { timeoutSeconds: 120, memory: '1GiB' },
+  async (request) => {
+    const { calculateStudentRisk, generateRecommendations } = require('./lib/risk-calculator');
+    const { computeInstitutionAlerts } = require('./lib/institution-alerts');
+    const { schoolConfigOut } = require('./lib/school-config');
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+
+    const uid = request.auth.uid;
+    await assertAdmin(uid);
+
+    const adminSnap = await getDb().collection('users').doc(uid).get();
+    const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+    if (!adminInstitutionId) {
+      throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+    }
+
+    const teachersSnap = await getDb()
+      .collection('users')
+      .where('institutionId', '==', adminInstitutionId)
+      .get();
+    const teachers = teachersSnap.docs
+      .map((d) => ({ uid: d.id, ...d.data() }))
+      .filter((t) => t.uid !== uid && (t.role || 'teacher') !== 'admin');
+
+    const turno = parseTurnoFilter(request.data);
+    const nivel = parseNivelFilter(request.data);
+
+    const results = await Promise.allSettled(teachers.map(async (teacherData) => {
+      const teacherUid = teacherData.uid;
+      const [subjects, students, evaluations, grades, attendance] = await Promise.all([
+        getAllDocsForUser('subjects', teacherUid),
+        getAllDocsForUser('students', teacherUid),
+        getAllDocsForUser('evaluations', teacherUid),
+        getAllDocsForUser('grades', teacherUid),
+        getAllDocsForUser('attendance', teacherUid),
+      ]);
+      return {
+        ...applyDashboardFilters({ subjects, students, evaluations, grades, attendance }, turno, nivel),
+        teacher: teacherData,
+      };
+    }));
+
+    const rows = results
+      .filter((r) => r.status === 'fulfilled')
+      .map((r) => r.value);
+
+    const alerts = computeInstitutionAlerts(rows);
+
+    // Resumen compacto para el prompt (sin nombres de estudiantes ni docentes
+    // para no microgestionar; solo patrones agregados).
+    const alertTypes = { student_grades: 0, student_attendance: 0, group_grades: 0, group_attendance: 0, teacher_inactive: 0 };
+    for (const a of alerts) alertTypes[a.type] = (alertTypes[a.type] || 0) + 1;
+
+    // Promedios globales de notas y asistencia.
+    let sumPct = 0;
+    let countPct = 0;
+    let attPresent = 0;
+    let attTotal = 0;
+    const subjectsSnapshot = [];
+    const evalScoreById = new Map();
+    for (const row of rows) {
+      const teacherName = row.teacher.displayName || row.teacher.email?.split('@')[0] || 'Docente';
+      for (const ev of row.evaluations || []) evalScoreById.set(ev.id, Number(ev.maxScore) || null);
+      const gradesBySubject = new Map();
+      for (const g of row.grades || []) {
+        const maxScore = evalScoreById.get(g.evaluationId);
+        const score = Number(g.score);
+        if (maxScore && maxScore > 0 && Number.isFinite(score)) {
+          const p = (score / maxScore) * 100;
+          sumPct += p;
+          countPct += 1;
+          const key = `${g.subjectId}|${teacherName}`;
+          if (!gradesBySubject.has(key)) gradesBySubject.set(key, { name: row.subjects.find(s => s.id === g.subjectId)?.name || 'Sin nombre', teacherName, sum: 0, n: 0 });
+          gradesBySubject.get(key).sum += p;
+          gradesBySubject.get(key).n += 1;
+        }
+      }
+      for (const a of row.attendance || []) {
+        attTotal += 1;
+        if (a.status !== 'absent') attPresent += 1;
+      }
+      for (const entry of gradesBySubject.values()) {
+        subjectsSnapshot.push({ asignatura: entry.name, docente: entry.teacherName, promedio: Math.round((entry.sum / entry.n) * 10) / 10 });
+      }
+    }
+    subjectsSnapshot.sort((a, b) => a.promedio - b.promedio);
+    const lowestSubjects = subjectsSnapshot.slice(0, 5);
+    const highestSubjects = subjectsSnapshot.slice(-5).reverse();
+
+    // Reservar cuota de IA de forma atómica.
+    const quota = await reserveAiQuota(uid, request.auth.token?.email || null);
+    if (quota.exceeded) {
+      throw new HttpsError('resource-exhausted', 'Límite de solicitudes de IA excedido para este mes.');
+    }
+
+    const prompt = `Eres el director de análisis pedagógico de la institución educativa ${adminSnap.data().institutionName || 'la institución'}. Tu tarea es detectar PATRONES institucionales de rendimiento a partir de datos agregados, a nivel directivo, SIN señalar ni microgestionar a docentes ni estudiantes individuales.
+
+Datos agregados de la institución:
+- Docentes con datos: ${rows.length}
+- Total de notas registradas: ${countPct}, promedio general: ${countPct > 0 ? Math.round((sumPct / countPct) * 10) / 10 : 'sin datos'}%
+- Asistencia general: ${attTotal > 0 ? Math.round((attPresent / attTotal) * 1000) / 10 : 'sin datos'}% de presencia (${attTotal} registros)
+- Alertas de riesgo detectadas: ${alerts.length} (${alertTypes.student_grades} por notas de estudiantes, ${alertTypes.student_attendance} por asistencia de estudiantes, ${alertTypes.group_grades} por grupos con notas bajas, ${alertTypes.group_attendance} por grupos con baja asistencia, ${alertTypes.teacher_inactive} docentes inactivos)
+- Asignaturas con peor promedio: ${JSON.stringify(lowestSubjects)}
+- Asignaturas con mejor promedio: ${JSON.stringify(highestSubjects)}
+
+Instrucciones:
+- Identifica hasta 4 patrones institucionales (p. ej. tendencia general de notas, problema sistémico de asistencia, asignaturas consistentemente débiles, falta de actividad de docentes, desequilibrios por turno si los datos lo sugieren). NO nombres personas ni asignaturas como culpables; habla de patrones.
+- Escribe un resumen ejecutivo de 2-3 oraciones.
+- Propón hasta 4 recomendaciones accionables a nivel de dirección.
+- Devuelve ÚNICAMENTE JSON válido con esta estructura exacta (sin markdown):
+{"resumen": string, "patrones": [{"titulo": string, "detalle": string}], "recomendaciones": [string]}`;
+
+    let generatedText = '';
+    try {
+      const body = {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json' },
+      };
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey.value()}`;
+      const geminiRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!geminiRes.ok) {
+        const geminiErr = await geminiRes.text();
+        console.error('Gemini error (adminGenerateInstitutionInsights):', geminiErr?.slice(0, 2000));
+        throw new HttpsError('internal', `Error del proveedor de IA: ${geminiRes.status}`);
+      }
+      const data = await geminiRes.json();
+      generatedText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } catch (err) {
+      await releaseAiCall(uid);
+      throw err;
+    }
+
+    let insights;
+    try {
+      insights = JSON.parse(generatedText);
+    } catch {
+      await releaseAiCall(uid);
+      throw new HttpsError('internal', 'No se pudo interpretar la respuesta de la IA.');
+    }
+
+    return {
+      institutionName: adminSnap.data().institutionName || 'Institución',
+      stats: {
+        teachersWithData: rows.length,
+        gradesCount: countPct,
+        avgPct: countPct > 0 ? Math.round((sumPct / countPct) * 10) / 10 : null,
+        attendancePct: attTotal > 0 ? Math.round((attPresent / attTotal) * 1000) / 10 : null,
+        alertsCount: alerts.length,
+      },
+      insights: {
+        resumen: typeof insights.resumen === 'string' ? insights.resumen : '',
+        patrones: Array.isArray(insights.patrones)
+          ? insights.patrones.slice(0, 4).map((p) => ({
+              titulo: typeof p?.titulo === 'string' ? p.titulo : '',
+              detalle: typeof p?.detalle === 'string' ? p.detalle : '',
+            }))
+          : [],
+        recomendaciones: Array.isArray(insights.recomendaciones)
+          ? insights.recomendaciones.slice(0, 4).map(String)
+          : [],
+      },
+    };
+  }
+);
+
+// ─── Sprint 2: Insights del estudiante ────────────────────────────────────
+exports.adminGenerateStudentInsights = onCall(
+  { timeoutSeconds: 180, memory: '1GiB', secrets: [geminiApiKey] },
+  async (request) => {
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+    const uid = request.auth.uid;
+    await assertAdmin(uid);
+
+    const adminSnap = await getDb().collection('users').doc(uid).get();
+    const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+    if (!adminInstitutionId) {
+      throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+    }
+
+    const studentDocId = typeof request.data?.studentId === 'string' ? request.data.studentId : '';
+    if (!studentDocId) throw new HttpsError('invalid-argument', 'Falta el estudiante.');
+
+    const { person, memberships } = await loadStudentBoletin(adminInstitutionId, studentDocId);
+
+    // Reservar cuota de IA de forma atómica.
+    const quota = await reserveAiQuota(uid, request.auth.token?.email || null);
+    if (quota.exceeded) {
+      throw new HttpsError('resource-exhausted', 'Límite de solicitudes de IA excedido para este mes.');
+    }
+
+    // Construir contexto del estudiante.
+    const studentName = `${person.firstName} ${person.lastName}`.trim();
+    const cedula = person.cedula || '—';
+    const subjects = [];
+    for (const m of memberships) {
+      const [evals, grades, attendance] = await Promise.all([
+        getAllDocsForUserBySubject('evaluations', m.userId, m.subjectId),
+        getAllDocsForUserBySubject('grades', m.userId, m.subjectId),
+        getAllDocsForUserBySubject('attendance', m.userId, m.subjectId),
+      ]);
+      const maxByEval = new Map(evals.map((e) => [e.id, Number(e.maxScore) || 0]));
+      const pcts = grades
+        .filter((g) => g.studentId === m.id)
+        .map((g) => {
+          const max = maxByEval.get(g.evaluationId);
+          return max && max > 0 ? (Number(g.score) / max) * 100 : null;
+        })
+        .filter((v) => v !== null);
+      const gradePct = pcts.length > 0 ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+      const stAtt = attendance.filter((a) => a.studentId === m.id);
+      const attPct = stAtt.length > 0 ? (stAtt.filter((a) => a.status === 'present').length / stAtt.length) * 100 : null;
+      subjects.push({
+        subjectId: m.subjectId,
+        subjectName: m.subjectName || 'Sin nombre',
+        teacherName: m.teacherName || 'Docente',
+        attendance: attPct !== null ? Math.round(attPct * 10) / 10 : null,
+        finalGrade: gradePct !== null ? Math.round(gradePct * 10) / 10 : null,
+      });
+    }
+
+    const prompt = `Eres un orientador pedagógico experto. Analiza los datos académicos de un estudiante y genera un informe breve y accionable.
+
+Estudiante: ${studentName}
+Cédula: ${cedula}
+Materias (${subjects.length}):
+${subjects.map(s => `- ${s.subjectName} (docente: ${s.teacherName}): asistencia ${s.attendance !== null ? s.attendance + '%' : '—'}, nota final ${s.finalGrade !== null ? s.finalGrade : '—'}`).join('\n')}
+
+Instrucciones:
+- Escribe un resumen ejecutivo de 2-3 oraciones.
+- Identifica hasta 3 fortalezas y 3 áreas de mejora.
+- Propón hasta 4 recomendaciones accionables.
+- Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
+{"resumen": string, "fortalezas": [string], "areasMejora": [string], "recomendaciones": [string]}`;
+
+    let generatedText = '';
+    try {
+      const body = {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json' },
+      };
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey.value()}`;
+      const geminiRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!geminiRes.ok) {
+        const geminiErr = await geminiRes.text();
+        console.error('Gemini error (adminGenerateStudentInsights):', geminiErr?.slice(0, 2000));
+        throw new HttpsError('internal', `Error del proveedor de IA: ${geminiRes.status}`);
+      }
+      const data = await geminiRes.json();
+      generatedText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } catch (err) {
+      await releaseAiCall(uid);
+      throw err;
+    }
+
+    let insights;
+    try {
+      insights = JSON.parse(generatedText);
+    } catch {
+      await releaseAiCall(uid);
+      throw new HttpsError('internal', 'No se pudo interpretar la respuesta de la IA.');
+    }
+
+    return {
+      studentName,
+      cedula,
+      subjects: subjects.map(s => ({ subjectName: s.subjectName, teacherName: s.teacherName, attendance: s.attendance, finalGrade: s.finalGrade })),
+      insights: {
+        resumen: typeof insights.resumen === 'string' ? insights.resumen : '',
+        fortalezas: Array.isArray(insights.fortalezas) ? insights.fortalezas.slice(0, 3).map(String) : [],
+        areasMejora: Array.isArray(insights.areasMejora) ? insights.areasMejora.slice(0, 3).map(String) : [],
+        recomendaciones: Array.isArray(insights.recomendaciones) ? insights.recomendaciones.slice(0, 4).map(String) : [],
+      },
+    };
+  }
+);
+
+// ─── Boletín del estudiante con navegación de periodo (admin) ─────────────
+exports.adminGetStudentBoletin = onCall({ timeoutSeconds: 60 }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const studentDocId = typeof request.data?.studentId === 'string' ? request.data.studentId : '';
+  if (!studentDocId) throw new HttpsError('invalid-argument', 'Falta el estudiante.');
+
+  const periodo = typeof request.data?.periodo === 'string' ? request.data.periodo : null;
+  const { person, memberships } = await loadStudentBoletin(adminInstitutionId, studentDocId);
+
+  // Obtener datos académicos de todas las membresías
+  const subjects = [];
+  for (const m of memberships) {
+    const [evals, grades, attendance] = await Promise.all([
+      getAllDocsForUserBySubject('evaluations', m.userId, m.subjectId),
+      getAllDocsForUserBySubject('grades', m.userId, m.subjectId),
+      getAllDocsForUserBySubject('attendance', m.userId, m.subjectId),
+    ]);
+    const maxByEval = new Map(evals.map((e) => [e.id, Number(e.maxScore) || 0]));
+    const pcts = grades
+      .filter((g) => g.studentId === m.id)
+      .map((g) => {
+        const max = maxByEval.get(g.evaluationId);
+        return max && max > 0 ? (Number(g.score) / max) * 100 : null;
+      })
+      .filter((v) => v !== null);
+    const gradePct = pcts.length > 0 ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+    const stAtt = attendance.filter((a) => a.studentId === m.id);
+    const attPct = stAtt.length > 0 ? (stAtt.filter((a) => a.status === 'present').length / stAtt.length) * 100 : null;
+    const gs = deriveGradoSeccion(m.subjectName || '');
+    subjects.push({
+      subjectId: m.subjectId,
+      subjectName: m.subjectName || 'Sin nombre',
+      teacherName: m.teacherName || 'Docente',
+      periodo: m.periodo || null,
+      nivelEducativo: m.nivelEducativo || null,
+      attendance: attPct !== null ? Math.round(attPct * 10) / 10 : null,
+      finalGrade: gradePct !== null ? Math.round(gradePct * 10) / 10 : null,
+      grado: gs.grado,
+      seccion: gs.seccion,
+    });
+  }
+
+  // Filtrar por periodo si se proporciona (I, II, III)
+  let filteredSubjects = subjects;
+  if (periodo && ['I', 'II', 'III'].includes(periodo)) {
+    filteredSubjects = subjects.filter(s => s.periodo === periodo);
+  }
+
+  return {
+    student: {
+      studentId: person.id,
+      cedula: person.cedula || '',
+      firstName: person.firstName || '',
+      lastName: person.lastName || '',
+      grado: filteredSubjects[0]?.grado || null,
+      seccion: filteredSubjects[0]?.seccion || null,
+      correo: null,
+    },
+    subjects: filteredSubjects,
+    periodos: ['I', 'II', 'III'],
+    periodoSeleccionado: periodo || 'todos',
+    institutionName: adminSnap.data().institutionName || 'Institución',
+  };
+});
+
+// ─── Admin: Invitar docente a la institución ──────────────────────────────
+exports.adminInviteTeacher = onCall(async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const email = typeof request.data?.email === 'string' ? request.data.email.trim() : '';
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new HttpsError('invalid-argument', 'Email inválido');
+  }
+
+  // Verificar si ya existe un usuario con ese email
+  const existingSnap = await getDb().collection('users').where('email', '==', email).limit(1).get();
+  if (!existingSnap.empty) {
+    throw new HttpsError('already-exists', 'Ya existe un usuario con ese email');
+  }
+
+  // Crear usuario en Auth (sin contraseña, se le enviará email de configuración)
+  const userRecord = await getAuthInstance().createUser({
+    email,
+    emailVerified: false,
+    disabled: false,
+  });
+
+  // Crear documento en users con plan free y rol teacher
+  await getDb().collection('users').doc(userRecord.uid).set({
+    email,
+    displayName: email.split('@')[0],
+    plan: 'free',
+    role: 'teacher',
+    institutionId: adminInstitutionId,
+    institutionName: adminSnap.data().institutionName || 'Institución',
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  // Enviar email de invitación (opcional: usar Firebase Auth sendPasswordResetEmail o custom)
+  await getAuthInstance().generatePasswordResetLink(email).catch(() => {});
+
+  return { success: true, uid: userRecord.uid, email };
+});
+
+// ─── Búsqueda de estudiantes (admin) ──────────────────────────────────────
+exports.adminSearchStudents = onCall(async (request) => {
+  const { buildSearchRows } = require('./lib/student-search');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const query = typeof request.data?.query === 'string' ? request.data.query.trim() : '';
+  if (query.length < 2) throw new HttpsError('invalid-argument', 'La búsqueda debe tener al menos 2 caracteres');
+
+  const rows = await loadInstitutionData(adminInstitutionId);
+  const result = buildSearchRows(rows, query, { limit: 50 });
+  return result;
+});
+
+// ─── Búsqueda de estudiante por id/cedula (admin, para boletín) ───────────
+exports.searchStudent = onCall(async (request) => {
+  const { buildSearchRows } = require('./lib/student-search');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const query = typeof request.data?.query === 'string' ? request.data.query.trim() : '';
+  if (query.length < 2) throw new HttpsError('invalid-argument', 'La búsqueda debe tener al menos 2 caracteres');
+
+  const rows = await loadInstitutionData(adminInstitutionId);
+  const result = buildSearchRows(rows, query, { limit: 50 });
+  return result;
+});
+
+// ─── Fase 5: Configuración post-login de la institución ──────────────────
+// Carga el documento institutions/{id} (ausente → {}). Usada por
+// adminGetSchoolConfig, adminSaveSchoolConfig y adminRestoreInstitutionBackup.
+async function loadSchoolConfig(institutionId) {
+  const snap = await getDb().collection('institutions').doc(institutionId).get();
+  return snap.exists ? snap.data() : {};
+}
+
+exports.adminGetSchoolConfig = onCall(async (request) => {
+  const { schoolConfigOut } = require('./lib/school-config');
+  const { gradingWeightOut } = require('./lib/grading-weight');
+  const { periodosOut, planRulesOut } = require('./lib/periodos-plan');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const inst = await loadSchoolConfig(adminInstitutionId);
+  return {
+    institutionId: adminInstitutionId,
+    institutionName: inst.name || adminSnap.data().institutionName || 'Institución',
+    schoolConfig: schoolConfigOut(inst),
+    gradingWeight: gradingWeightOut(inst),
+    periodos: periodosOut(inst),
+    planRules: planRulesOut(inst),
+  };
+});
+
+// Guarda la configuración de personalización de la institución. Admin
+// únicamente; el cliente no puede escribir institutions/* directamente.
+exports.adminSaveSchoolConfig = onCall(async (request) => {
+  const { sanitizeSchoolConfigInput, schoolConfigOut } = require('./lib/school-config');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const data = request.data || {};
+  let sanitized;
+  try {
+    sanitized = sanitizeSchoolConfigInput(data);
+  } catch (err) {
+    if (err && err.message === 'LOGO_URL_INVALID') {
+      throw new HttpsError('invalid-argument', 'La URL del logo debe ser una URL http(s) válida.');
+    }
+    if (err && err.message === 'PRIMARY_COLOR_INVALID') {
+      throw new HttpsError('invalid-argument', 'El color primario debe ser un código hexadecimal válido (#RRGGBB).');
+    }
+    throw new HttpsError('invalid-argument', 'Datos de configuración inválidos.');
+  }
+  const { name, schoolConfig } = sanitized;
+  schoolConfig.onboardingDone = true;
+  schoolConfig.updatedAt = FieldValue.serverTimestamp();
+
+  const update = { schoolConfig };
+  if (name) update.name = name;
+  await getDb().collection('institutions').doc(adminInstitutionId).set(update, { merge: true });
+
+  const inst = { name: name || (await loadSchoolConfig(adminInstitutionId)).name, schoolConfig };
+  return {
+    institutionId: adminInstitutionId,
+    institutionName: name || adminSnap.data().institutionName || 'Institución',
+    schoolConfig: schoolConfigOut(inst),
+  };
+});
+
+// Traduce los códigos GRADING_* del módulo puro a mensajes para el cliente.
+function gradingWeightErrorMessage(code) {
+  switch (code) {
+    case 'GRADING_MODE_INVALID': return 'El modo de ponderación no es válido.';
+    case 'GRADING_APPLY_TO_INVALID': return 'La opción de aplicación no es válida.';
+    case 'GRADING_SUM_INVALID': return 'Los porcentajes deben sumar 100.';
+    case 'GRADING_CUSTOM_TOO_FEW': return 'Define al menos 2 categorías de ponderación.';
+    case 'GRADING_CUSTOM_TOO_MANY': return 'Máximo 12 categorías de ponderación.';
+    default: return 'Datos de ponderación inválidos.';
+  }
+}
+
+// Guarda la ponderación global de calificaciones de la institución (Módulo 4).
+// Admin únicamente; el cliente no puede escribir institutions/* directamente.
+// Esta función SOLO añade la capa de configuración: no modifica el cálculo
+// de notas. Un futuro consumidor del cálculo leerá gradingWeight desde
+// institutions/{id} para decidir cómo calcular la nota final (o lo expondrá
+// vía adminGetSchoolConfig).
+exports.adminSaveGradingWeight = onCall(async (request) => {
+  const { sanitizeGradingWeightInput, gradingWeightOut } = require('./lib/grading-weight');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const data = request.data || {};
+  let sanitized;
+  try {
+    sanitized = sanitizeGradingWeightInput(data);
+  } catch (err) {
+    if (err && typeof err.message === 'string' && err.message.startsWith('GRADING_')) {
+      throw new HttpsError('invalid-argument', gradingWeightErrorMessage(err.message));
+    }
+    throw new HttpsError('invalid-argument', 'Datos de ponderación inválidos.');
+  }
+  // Auditoría ligera (política institucional): quién guardó y snapshot del
+  // valor anterior. Sin historial de versiones — solo el último cambio.
+  const instRef = getDb().collection('institutions').doc(adminInstitutionId);
+  const instSnap = await instRef.get();
+  const currentGw = instSnap.exists ? instSnap.data().gradingWeight : null;
+  if (currentGw && typeof currentGw === 'object') {
+    try {
+      const previous = gradingWeightOut({ gradingWeight: currentGw });
+      delete previous.updatedAt;
+      delete previous.updatedBy;
+      sanitized.previousWeight = previous;
+    } catch {
+      // snapshot anterior ilegible: se omite sin bloquear el guardado
+    }
+  }
+  sanitized.updatedAt = getFieldValue().serverTimestamp();
+  sanitized.updatedBy = uid;
+  await instRef.set({ gradingWeight: sanitized }, { merge: true });
+
+  return {
+    institutionId: adminInstitutionId,
+    gradingWeight: gradingWeightOut(sanitized),
+  };
+});
+
+// ─── Módulo 1: Periodos de clase y reglas del plan ───────────────────────
+exports.adminSavePeriodos = onCall(async (request) => {
+  const { sanitizePeriodosInput, periodosOut } = require('./lib/periodos-plan');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const sanitized = sanitizePeriodosInput(request.data || {});
+  await getDb().collection('institutions').doc(adminInstitutionId).set({ periodos: sanitized }, { merge: true });
+
+  return {
+    institutionId: adminInstitutionId,
+    periodos: periodosOut(sanitized),
+  };
+});
+
+// Guarda la regla de planificación institucional (semanal/mensual/trimestral/
+// cuatrimestral/anual) y la opción "Recomendar a docentes" en
+// institutions/{id}.planRules. Admin únicamente; el cliente no puede escribir
+// institutions/* directamente.
+exports.adminSavePlanRules = onCall(async (request) => {
+  const { sanitizePlanRulesInput, planRulesOut } = require('./lib/periodos-plan');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  const data = request.data || {};
+  let sanitized;
+  try {
+    sanitized = sanitizePlanRulesInput(data);
+  } catch (err) {
+    if (err && err.message === 'PLAN_RULE_INVALID') {
+      throw new HttpsError('invalid-argument', 'La regla de planificación seleccionada no es válida.');
+    }
+    throw new HttpsError('invalid-argument', 'Datos de reglas de planificación inválidos.');
+  }
+  await getDb().collection('institutions').doc(adminInstitutionId).set({ planRules: sanitized }, { merge: true });
+
+  return {
+    institutionId: adminInstitutionId,
+    planRules: planRulesOut(sanitized),
+  };
+});
+
+// ─── Respaldo institucional: restauración (operación extraordinaria) ──────
+//
+// SEMÁNTICA: institution-config-restore. Esta función implementa EXCLUSIVAMENTE
+// restauración de CONFIGURACIÓN por upsert (no destructiva). Una hipotética
+// institution-full-restore futura (reemplazo total del estado con documentos
+// crudos) DEBE ser una Cloud Function SEPARADA con su propia validación —
+// NUNCA reutilizar silenciosamente esta misma semántica para ambos propósitos.
+//
+// DECISIÓN DE DISEÑO (documentada): el export actual es ANALÍTICO (agregados +
+// detalle por docente), NO documentos crudos de Firestore. Por eso esta
+// función restaura ÚNICAMENTE la configuración institucional del payload —
+// name, schoolConfig, gradingWeight, periodos y planRules — re-sanitizada en
+// el servidor con los mismos módulos puros que las funciones de guardado.
+//
+// NO se restauran teachers/teacherDetails/students/metrics/etc: son vistas
+// calculadas que pueden venir incompletas (fetches fallidos → null, filtros
+// activos al exportar) y un upsert parcial crearía referencias rotas entre
+// subjects/students/evaluations/grades. Se reportan en `skipped` con avisos.
+// NUNCA se borran colecciones enteras; solo set(..., {merge:true}) upsert.
+//
+// POLÍTICA NO DESTRUCTIVA (documentada): esta función es una restauración de
+// CONFIGURACIÓN por upsert — "restaurar NO elimina registros existentes".
+// Si el respaldo omite información presente en el sistema (o una sección del
+// payload llega corrupta), esa información NO se elimina: solo se actualizan
+// los campos incluidos y válidos en el respaldo. Por lo tanto NO es un
+// snapshot exacto con reemplazo total del estado institucional.
+//
+// COMPATIBILIDAD FUTURA (solo preparación, sin features): export.type
+// ('institution-full-backup') y schemaVersion ('1.0') permanecen ESTABLES.
+// Una futura restauración COMPLETA (docentes/asignaturas/notas como documentos
+// crudos) requeriría un NUEVO tipo de export con documentos crudos (p. ej.
+// 'institution-full-backup-v2') y su propia validación específica.
+exports.adminRestoreInstitutionBackup = onCall(async (request) => {
+  const { validateInstitutionBackup } = require('./lib/backup-validate');
+  const { sanitizeSchoolConfigInput, schoolConfigOut } = require('./lib/school-config');
+  const { sanitizeGradingWeightInput, gradingWeightOut } = require('./lib/grading-weight');
+  const { sanitizePeriodosInput, periodosOut } = require('./lib/periodos-plan');
+  const { sanitizePlanRulesInput, planRulesOut } = require('./lib/periodos-plan');
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Debes iniciar sesión');
+  const uid = request.auth.uid;
+  await assertAdmin(uid);
+
+  const adminSnap = await getDb().collection('users').doc(uid).get();
+  const adminInstitutionId = adminSnap.exists ? adminSnap.data().institutionId : null;
+  if (!adminInstitutionId) {
+    throw new HttpsError('failed-precondition', 'Tu cuenta de administrador no tiene una institución asignada.');
+  }
+
+  // Revalidación COMPLETA en el servidor: nunca confiar en el frontend.
+  const validation = validateInstitutionBackup(request.data || {}, adminInstitutionId);
+  if (!validation.ok) {
+    throw new HttpsError('invalid-argument', validation.userMessage);
+  }
+  const payload = request.data;
+
+  const restored = {};
+  const skipped = [];
+  const warnings = [];
+  const update = {};
+
+  // Nombre de la institución
+  if (typeof payload.institutionName === 'string' && payload.institutionName.trim()) {
+    update.name = payload.institutionName.trim().slice(0, 200);
+    restored.name = 1;
+  }
+
+  // Configuración de personalización (logo, slogan, director, contacto, color)
+  if (payload.schoolConfig && typeof payload.schoolConfig === 'object') {
+    try {
+      const sanitizedSchool = sanitizeSchoolConfigInput({
+        ...payload.schoolConfig,
+        name: update.name,
+      });
+      // Un respaldo procede de una institución ya configurada: el onboarding
+      // se marca hecho para que el wizard no vuelva a abrirse tras restaurar.
+      sanitizedSchool.schoolConfig.onboardingDone = true;
+      sanitizedSchool.schoolConfig.updatedAt = getFieldValue().serverTimestamp();
+      Object.assign(update, { schoolConfig: sanitizedSchool.schoolConfig });
+      restored.schoolConfig = 1;
+    } catch (err) {
+      const code = err && err.message;
+      warnings.push(
+        code === 'LOGO_URL_INVALID' ? 'schoolConfig omitido: URL de logo inválida.' :
+        code === 'PRIMARY_COLOR_INVALID' ? 'schoolConfig omitido: color primario inválido.' :
+        'schoolConfig omitido: datos inválidos.'
+      );
+      skipped.push('schoolConfig');
+    }
+  } else {
+    skipped.push('schoolConfig');
+  }
+
+  // Ponderación global de calificaciones. Inválida en el respaldo → se OMITE
+  // (con aviso exacto) y la restauración continúa con el resto; la vigente se
+  // conserva. Nunca se aplica una ponderación que no sume 100%.
+  if (payload.gradingWeight && typeof payload.gradingWeight === 'object') {
+    try {
+      const sanitizedGrading = sanitizeGradingWeightInput(payload.gradingWeight);
+      sanitizedGrading.updatedAt = getFieldValue().serverTimestamp();
+      Object.assign(update, { gradingWeight: sanitizedGrading });
+      restored.gradingWeight = 1;
+    } catch {
+      warnings.push('La ponderación académica del respaldo es inválida y fue omitida.');
+      skipped.push('gradingWeight');
+    }
+  } else {
+    skipped.push('gradingWeight');
+  }
+
+  // Periodos operativos (sanitizePeriodosInput no lanza: normaliza siempre)
+  if (payload.periodos && typeof payload.periodos === 'object') {
+    Object.assign(update, { periodos: sanitizePeriodosInput(payload.periodos) });
+    restored.periodos = 1;
+  } else {
+    skipped.push('periodos');
+  }
+
+  // Reglas del plan
+  if (payload.planRules && typeof payload.planRules === 'object') {
+    try {
+      Object.assign(update, { planRules: sanitizePlanRulesInput(payload.planRules) });
+      restored.planRules = 1;
+    } catch (err) {
+      if (err && err.message === 'PLAN_RULE_INVALID') {
+        warnings.push('planRules omitido: regla seleccionada inválida.');
+      } else {
+        warnings.push('planRules omitido: datos inválidos.');
+      }
+      skipped.push('planRules');
+    }
+  } else {
+    skipped.push('planRules');
+  }
+
+  // Secciones analíticas SIEMPRE fuera de la restauración (decisión documentada)
+  for (const section of ['metrics', 'alerts', 'teachers', 'teacherDetails', 'students', 'discrepancies', 'stats', 'insights']) {
+    skipped.push(section);
+  }
+  warnings.push(
+    'Los datos académicos del respaldo (docentes, asignaturas, notas, asistencia) son agregados analíticos y no se restauran en esta versión. La configuración institucional sí fue procesada.'
+  );
+
+  if (Object.keys(restored).length === 0) {
+    throw new HttpsError('failed-precondition', 'El respaldo no contenía información institucional restaurable.');
+  }
+
+  await getDb().collection('institutions').doc(adminInstitutionId).set(update, { merge: true });
+
+  const inst = await loadSchoolConfig(adminInstitutionId);
+  return {
+    institutionId: adminInstitutionId,
+    institutionName: inst.name || adminSnap.data().institutionName || 'Institución',
+    restored,
+    skipped,
+    warnings,
+    schoolConfig: schoolConfigOut(inst),
+    gradingWeight: gradingWeightOut(inst),
+    periodos: periodosOut(inst),
+    planRules: planRulesOut(inst),
+  };
+});
+
 // ─── 1. Crear checkout de Lemon Squeezy ──────────────────────────────────
 exports.createLemonSqueezyCheckout = onRequest(
   {
@@ -858,7 +2544,7 @@ exports.createLemonSqueezyCheckout = onRequest(
         return res.status(401).json({ error: 'Debes iniciar sesión' });
       }
       ensureInit();
-      const decoded = await admin.auth().verifyIdToken(idToken);
+      const decoded = await getAuthInstance().verifyIdToken(idToken);
       const uid = decoded.uid;
       const email = decoded.email || '';
 
@@ -964,7 +2650,8 @@ exports.lemonSqueezyWebhook = onRequest(
 
       const event = req.body;
       const eventName = event.meta?.event_name;
-      const eventId = event.data?.id;
+      const subStatus = event.data?.attributes?.status;
+      const eventId = event.meta?.event_id || `${eventName}${subStatus ? `:${subStatus}` : ''}:${event.data?.id}`;
       console.log(`📬 Lemon Squeezy event: ${eventName} (${eventId})`);
 
       // C3: idempotencia — si ya procesamos este evento, no reprocesar
@@ -991,13 +2678,13 @@ exports.lemonSqueezyWebhook = onRequest(
             expiresAt,
             // CR-01: el pago real termina la prueba.
             isTrial: false,
-            trialEndsAt: FieldValue.delete(),
-            trialStartedAt: FieldValue.delete(),
+            trialEndsAt: getFieldValue().delete(),
+            trialStartedAt: getFieldValue().delete(),
             // MEDIUM-5: el pago consume el derecho a prueba gratuita.
             trialUsed: true,
             ...(plan === 'school' ? { role: 'admin', institutionId: uid } : {}),
             ...(plan === 'school' && institutionName ? { institutionName } : {}),
-            updatedAt: FieldValue.serverTimestamp(),
+            updatedAt: getFieldValue().serverTimestamp(),
           }, { merge: true });
           console.log(`✅ Plan actualizado para ${uid} → ${plan}`);
         } else {
@@ -1016,13 +2703,13 @@ exports.lemonSqueezyWebhook = onRequest(
             expiresAt: expiresAtFromRenewsAt(sub.attributes?.renews_at),
             // CR-01: el pago real termina la prueba.
             isTrial: false,
-            trialEndsAt: FieldValue.delete(),
-            trialStartedAt: FieldValue.delete(),
+            trialEndsAt: getFieldValue().delete(),
+            trialStartedAt: getFieldValue().delete(),
             // MEDIUM-5: el pago consume el derecho a prueba gratuita.
             trialUsed: true,
             ...(plan === 'school' ? { role: 'admin', institutionId: uid } : {}),
             ...(plan === 'school' && institutionName ? { institutionName } : {}),
-            updatedAt: FieldValue.serverTimestamp(),
+            updatedAt: getFieldValue().serverTimestamp(),
           }, { merge: true });
           console.log(`✅ Suscripción creada para ${uid} → ${plan}`);
         } else {
@@ -1062,8 +2749,8 @@ exports.lemonSqueezyWebhook = onRequest(
               expiresAt: expiresAtFromRenewsAt(sub.attributes?.renews_at),
               // CR-01: el pago real termina la prueba.
               isTrial: false,
-              trialEndsAt: FieldValue.delete(),
-              trialStartedAt: FieldValue.delete(),
+              trialEndsAt: getFieldValue().delete(),
+              trialStartedAt: getFieldValue().delete(),
               // MEDIUM-5: el pago consume el derecho a prueba gratuita.
               trialUsed: true,
               ...(applySchoolAdmin
@@ -1072,7 +2759,7 @@ exports.lemonSqueezyWebhook = onRequest(
               ...(applySchoolAdmin && institutionName && !existing.institutionName
                 ? { institutionName }
                 : {}),
-              updatedAt: FieldValue.serverTimestamp(),
+              updatedAt: getFieldValue().serverTimestamp(),
             }, { merge: true });
             console.log(`✅ Suscripción reactivada para ${uid} → ${plan}`);
           }
@@ -1104,12 +2791,12 @@ exports.lemonSqueezyWebhook = onRequest(
             // prueba (consistente con los demás paths de pago).
             paymentProvider: 'lemonsqueezy',
             isTrial: false,
-            trialEndsAt: FieldValue.delete(),
-            trialStartedAt: FieldValue.delete(),
+            trialEndsAt: getFieldValue().delete(),
+            trialStartedAt: getFieldValue().delete(),
             // MEDIUM-5: el pago consume el derecho a prueba gratuita.
             trialUsed: true,
             lastPaymentAt: Date.now(),
-            updatedAt: FieldValue.serverTimestamp(),
+            updatedAt: getFieldValue().serverTimestamp(),
           }, { merge: true });
           console.log(`✅ Pago de suscripción recibido para ${uid}`);
         }
@@ -1142,7 +2829,7 @@ exports.createCustomerPortal = onRequest(
       const idToken = authHeader.replace('Bearer ', '');
       if (!idToken) return res.status(401).json({ error: 'Debes iniciar sesión' });
       ensureInit();
-      const decoded = await admin.auth().verifyIdToken(idToken);
+      const decoded = await getAuthInstance().verifyIdToken(idToken);
       const uid = decoded.uid;
 
       const userRef = getDb().collection('users').doc(uid);

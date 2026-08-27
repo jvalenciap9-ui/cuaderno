@@ -21,14 +21,14 @@ test.describe('Fase 5 — Dashboard y Admin', () => {
     test('5.1 Vista Dashboard', async ({ page }) => {
       await login(page, TEACHER_1.email, TEACHER_1.password);
       await page.getByText('Dashboard', { exact: true }).first().click();
-      await expect(page.getByText('Resumen de tu actividad', { exact: false }).first()).toBeVisible();
+await expect(page.getByText('Resumen de actividad', { exact: false }).first()).toBeVisible();
     });
 
-    test('5.2 Resumen de asignaturas (3 asignaturas)', async ({ page }) => {
+    test('5.2 Resumen de asignaturas (4 asignaturas)', async ({ page }) => {
       await login(page, TEACHER_1.email, TEACHER_1.password);
       await page.getByText('Dashboard', { exact: true }).first().click();
       await page.waitForTimeout(1500);
-      const card = page.locator('div').filter({ hasText: 'Asignaturas' }).filter({ hasText: '3' }).first();
+      const card = page.locator('div').filter({ hasText: 'Asignaturas' }).filter({ hasText: '4' }).first();
       await expect(card).toBeVisible({ timeout: 15000 });
     });
 
@@ -52,9 +52,9 @@ test.describe('Fase 5 — Dashboard y Admin', () => {
       await expect(page.getByText('Panel Institucional', { exact: true }).first()).toBeVisible({ timeout: 20000 });
     });
 
-    test('5.6 Listar docentes (3 de la institución)', async ({ page }) => {
+    test('5.6 Listar docentes (2 de la institución)', async ({ page }) => {
       await login(page, ADMIN.email, ADMIN.password);
-      for (const t of [TEACHER_1, TEACHER_2, TEACHER_3]) {
+      for (const t of [TEACHER_1, TEACHER_2]) {
         await expect(page.locator('tbody tr').filter({ hasText: t.email }).first()).toBeVisible({ timeout: 30000 });
       }
     });
@@ -62,8 +62,9 @@ test.describe('Fase 5 — Dashboard y Admin', () => {
     test('5.7 Buscar docente', async ({ page }) => {
       await login(page, ADMIN.email, ADMIN.password);
       await expect(page.locator('tbody tr').filter({ hasText: TEACHER_1.email }).first()).toBeVisible({ timeout: 30000 });
-      await page.getByPlaceholder('Buscar docente por nombre o email...').fill('María');
+      await page.getByPlaceholder('Buscar docente por nombre o email...').fill('Ana');
       await page.waitForTimeout(800);
+      // "ana" coincide con maestra.ana@ediagil.com y Prof. Ana Martínez → 1 fila
       const rowCount = await page.locator('tbody tr').count();
       expect(rowCount).toBe(1);
       await expect(page.locator('tbody tr').first()).toContainText(TEACHER_1.email);

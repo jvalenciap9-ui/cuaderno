@@ -8,7 +8,6 @@ import {
   CalendarDays,
   ClipboardList,
   FileDown,
-  Check,
   ArrowRight,
   Menu,
   X,
@@ -19,8 +18,16 @@ import {
   CheckCircle2,
   Users,
   Infinity as InfinityIcon,
+  Shield,
+  Mail,
 } from 'lucide-react';
 import { navigate } from '../lib/router';
+import {
+  getPublicPlans,
+  getPlanAccentStyles,
+  getPlan,
+  type PricingPlan,
+} from '../lib/pricing';
 
 const NAV_LINKS = [
   { href: '#caracteristicas', label: 'Características' },
@@ -61,65 +68,6 @@ const FEATURES = [
   },
 ];
 
-const PLANS = [
-  {
-    id: 'free',
-    name: 'Gratis',
-    price: '$0',
-    period: '/mes',
-    tagline: 'Para siempre, sin tarjeta',
-    highlight: false,
-    ctaLabel: 'Comenzar Gratis',
-    accent: 'indigo',
-    features: [
-      { text: 'Estudiantes ilimitados por curso', included: true },
-      { text: 'Hasta 2 asignaturas por año', included: true },
-      { text: 'Calificaciones básicas', included: true },
-      { text: 'Registro de asistencia', included: true },
-      { text: 'Informes con IA (15/mes)', included: true },
-      { text: 'Exportar PDF/Excel', included: false },
-      { text: 'Syllabus IA', included: false },
-    ],
-  },
-  {
-    id: 'pro',
-    name: 'Premium Pro',
-    price: '$4.99',
-    period: '/año',
-    tagline: '🔥 14 días gratis · Solo $0.42/mes · Anual',
-    highlight: true,
-    ctaLabel: 'Obtener Premium Pro',
-    accent: 'emerald',
-    features: [
-      { text: 'Hasta 999 estudiantes y cursos', included: true },
-      { text: 'Calificaciones avanzadas con pesos', included: true },
-      { text: 'Asistencia con alertas inteligentes', included: true },
-      { text: '2.000 consultas IA/mes', included: true },
-      { text: 'Exportar PDF/Excel', included: true },
-      { text: 'Syllabus IA', included: true },
-    ],
-  },
-  {
-    id: 'school',
-    name: 'Institucional',
-    price: '$99.99',
-    period: '/año',
-    tagline: '💰 Ahorra +70% en planes grupales',
-    highlight: false,
-    ctaLabel: 'Comprar Institucional',
-    accent: 'blue',
-    features: [
-      { text: 'Hasta 999 estudiantes y cursos', included: true },
-      { text: '9.999 consultas IA/mes', included: true },
-      { text: 'Panel administrativo', included: true },
-      { text: 'Sincronización en la nube', included: true },
-      { text: 'Reportes institucionales', included: true },
-      { text: 'Onboarding personalizado', included: true },
-      { text: 'Facturación centralizada', included: true },
-    ],
-  },
-];
-
 const TESTIMONIALS = [
   {
     name: 'María Fernanda López',
@@ -143,8 +91,236 @@ function CheckIcon({ included }: { included: boolean }) {
   return <X className="w-4 h-4 text-neutral-300 shrink-0" />;
 }
 
-export function LandingPage() {
+export function LandingPage({ pathname = '/' }: { pathname?: string }) {
   const [mobileOpen, setMobileOpen] = useState(false);
+
+  // --- Renderizado de Landing Page detallada de Premium Pro ---
+  if (pathname === '/planes/premium-pro') {
+    const proPlan = getPlan('pro');
+    return (
+      <div className="min-h-screen bg-neutral-50 text-neutral-900 flex flex-col justify-between py-12 px-6">
+        <div className="max-w-4xl mx-auto w-full bg-white rounded-[3rem] border border-neutral-100 p-8 md:p-16 shadow-2xl shadow-neutral-100/50 space-y-12">
+          {/* Cabecera */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 pb-8 border-b border-neutral-100">
+            <div>
+              <button 
+                onClick={() => navigate('/')}
+                className="inline-flex items-center gap-2 text-xs font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-500 mb-4 transition-all"
+              >
+                ← Volver a Inicio
+              </button>
+              <h1 className="text-4xl md:text-5xl font-black tracking-tight text-neutral-900">
+                Premium Pro
+              </h1>
+              <p className="text-neutral-500 font-medium mt-2">
+                Maximiza tu rendimiento docente con el cuaderno digital más potente.
+              </p>
+            </div>
+            <div className="bg-emerald-50 text-emerald-800 border border-emerald-100 px-6 py-4 rounded-[2rem] text-center shrink-0 shadow-sm">
+              <p className="text-[10px] font-black uppercase tracking-widest text-emerald-600 mb-1">Facturación Anual</p>
+              <p className="text-3xl font-black">${proPlan.price.toFixed(2)}<span className="text-xs text-neutral-400">{proPlan.period}</span></p>
+              <p className="text-[9px] font-bold text-neutral-400 mt-1">Equivale a menos de US$1/mes · facturado anualmente</p>
+            </div>
+          </div>
+
+          {/* Características en profundidad */}
+          <div className="grid md:grid-cols-2 gap-8">
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">📊 Calificaciones Avanzadas</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Configura ponderaciones personalizadas por categorías, exámenes o proyectos. Deja que EdiAgil calcule automáticamente la nota final de tus alumnos basándose en tu propio criterio pedagógico.
+              </p>
+            </div>
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">⚡ Syllabus AI Ilimitado</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Genera en segundos planes de estudio y estructuras de módulos adaptadas a la asignatura utilizando el motor inteligente de Gemini. Diseña y distribuye los contenidos de manera ágil.
+              </p>
+            </div>
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">🤖 2.000 Consultas IA/mes</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Asistente personal con inteligencia artificial para la redacción de apuntes, resúmenes, retroalimentación a estudiantes y optimización de materiales directamente desde tu cuaderno.
+              </p>
+            </div>
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">📥 Exportación y Respaldo</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Descarga de informes de calificaciones e inasistencias listos en formatos Excel y PDF para facilitar tus reportes y entregas administrativas institucionales.
+              </p>
+            </div>
+          </div>
+
+          {/* Tabla comparativa Gratis vs Pro */}
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="border-b border-neutral-100">
+                  <th className="text-left py-3 pr-6 font-black text-neutral-900">Característica</th>
+                  <th className="text-center py-3 px-4 font-black text-neutral-400 whitespace-nowrap">Plan Gratis</th>
+                  <th className="text-center py-3 px-4 font-black text-emerald-700 whitespace-nowrap">✦ Premium Pro</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(() => {
+                  const freePlan = getPlan('free');
+                  const proPlanData = getPlan('pro');
+                  const allFeatures = Array.from(
+                    new Set([...freePlan.features.map(f => f.text), ...proPlanData.features.map(f => f.text)])
+                  );
+                  return allFeatures.map(featureText => {
+                    const inFree = freePlan.features.find(f => f.text === featureText)?.included ?? false;
+                    const inPro = proPlanData.features.find(f => f.text === featureText)?.included ?? false;
+                    return (
+                      <tr key={featureText} className="border-b border-neutral-50 hover:bg-neutral-50 transition-colors">
+                        <td className="py-3 pr-6 font-semibold text-neutral-700">{featureText}</td>
+                        <td className="text-center py-3 px-4">
+                          {inFree ? <span className="text-indigo-500 font-black">✓</span> : <span className="text-neutral-300 font-black">✗</span>}
+                        </td>
+                        <td className="text-center py-3 px-4">
+                          {inPro ? <span className="text-emerald-600 font-black">✓</span> : <span className="text-neutral-300 font-black">✗</span>}
+                        </td>
+                      </tr>
+                    );
+                  });
+                })()}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Garantía */}
+          <div className="p-6 bg-emerald-50 border border-emerald-100 rounded-3xl flex items-start gap-4">
+            <ShieldCheck className="w-8 h-8 text-emerald-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h4 className="font-black text-emerald-900 text-sm uppercase tracking-wide">Garantía 30 días</h4>
+              <p className="text-xs text-emerald-800 font-medium leading-relaxed">
+                Si en los primeros 30 días no mejoras tu productividad docente, te devolvemos el dinero — sin preguntas.
+              </p>
+            </div>
+          </div>
+
+          {/* Llamado a la Acción (CTA) */}
+          <div className="pt-8 border-t border-neutral-100 flex flex-col items-center gap-4 text-center">
+            <button
+              onClick={() => navigate('/login?mode=signup&plan=pro')}
+              className="px-10 py-5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-sm font-black uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all w-full md:w-auto"
+            >
+              {proPlan.ctaLabel} · US${proPlan.price.toFixed(2)}{proPlan.period}
+            </button>
+            <p className="text-xs text-neutral-400 font-semibold">
+              Sin permanencia · Cancela cuando quieras
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+// --- Renderizado de Landing Page detallada de plan Institucional ---
+  if (pathname === '/planes/institucional') {
+    const schoolPlan = getPlan('school');
+    return (
+      <div className="min-h-screen bg-neutral-50 text-neutral-900 flex flex-col justify-between py-12 px-6">
+        <div className="max-w-4xl mx-auto w-full bg-white rounded-[3rem] border border-neutral-100 p-8 md:p-16 shadow-2xl shadow-neutral-100/50 space-y-12">
+          {/* Cabecera */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 pb-8 border-b border-neutral-100">
+            <div>
+              <button 
+                onClick={() => navigate('/')}
+                className="inline-flex items-center gap-2 text-xs font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-500 mb-4 transition-all"
+              >
+                ← Volver a Inicio
+              </button>
+              <h1 className="text-4xl md:text-5xl font-black tracking-tight text-neutral-900">
+                Plan Institucional
+              </h1>
+              <p className="text-neutral-500 font-medium mt-2">
+                Unifica, centraliza y personaliza la experiencia académica de todo tu colegio o departamento.
+              </p>
+            </div>
+            <div className="bg-blue-50 text-blue-800 border border-blue-100 px-6 py-4 rounded-[2rem] text-center shrink-0 shadow-sm">
+              <p className="text-[10px] font-black uppercase tracking-widest text-blue-600 mb-1">Facturación Anual</p>
+              <p className="text-3xl font-black">${schoolPlan.price.toFixed(2)}<span className="text-xs text-neutral-400">{schoolPlan.period}</span></p>
+              {schoolPlan.foundersPromo && (
+                <p className="text-[9px] font-bold text-amber-600 mt-1">Promoción Fundadores: ${schoolPlan.foundersPromo.firstYearPrice.toFixed(2)} primer año</p>
+              )}
+            </div>
+          </div>
+
+          {/* Banner de Promoción Fundadores */}
+          {schoolPlan.foundersPromo && (
+            <div className="p-6 bg-amber-50 border-2 border-amber-300 rounded-3xl flex items-start gap-4 shadow-lg shadow-amber-100/50">
+              <div className="text-3xl mt-0.5 animate-bounce">⚡</div>
+              <div className="space-y-2 flex-1">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <h4 className="font-black text-amber-900 text-sm uppercase tracking-wide">Oferta por tiempo limitado · Promoción Fundadores</h4>
+                  <span className="inline-block bg-amber-200 text-amber-900 text-[8px] font-black uppercase tracking-widest px-2 py-1 rounded-full">Cupos limitados</span>
+                </div>
+                <p className="text-2xl font-black text-amber-900">
+                  US${schoolPlan.foundersPromo.firstYearPrice.toFixed(2)}
+                  <span className="text-sm font-bold text-amber-700"> primer año</span>
+                </p>
+                <p className="text-xs text-amber-800 font-bold">
+                  <strong>Ahorra US${(schoolPlan.foundersPromo.renewalPrice - schoolPlan.foundersPromo.firstYearPrice).toFixed(2)} el primer año</strong> — renovación posterior: US${schoolPlan.foundersPromo.renewalPrice.toFixed(2)}/año.
+                </p>
+                <p className="text-xs text-amber-700 font-medium">Ideal para centros escolares de hasta 30 docentes + 1 administrador.</p>
+              </div>
+            </div>
+          )}
+
+          {/* Características en profundidad */}
+          <div className="grid md:grid-cols-2 gap-8">
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">🎨 Personalización Temática</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Establece la identidad visual de tu colegio. Configura el logotipo y el color primario de la institución, los cuales se propagarán automáticamente a las interfaces de todos los docentes miembros.
+              </p>
+            </div>
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">🏢 Panel Administrativo & KPIs</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Acceso a un centro de control global. Visualiza estadísticas de asistencia por grados, promedios generales y tendencias de permanencia sin interferir con el trabajo diario del docente.
+              </p>
+            </div>
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">🕒 Gestión de Horarios y Turnos</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Define los periodos lectivos y horarios operativos activos (Matutino, Vespertino, Nocturno). Evita que los docentes asignen cursos fuera de las jornadas oficiales definidas.
+              </p>
+            </div>
+            <div className="p-6 bg-neutral-50 rounded-3xl space-y-3">
+              <h3 className="font-black text-lg text-neutral-900">⚠️ Control de Riesgo y Discrepancias</h3>
+              <p className="text-sm text-neutral-500 font-medium leading-relaxed">
+                Módulo inteligente que reporta estudiantes en riesgo (baja asistencia o promedio) y detecta discrepancias de matrícula (alumnos inscritos en múltiples turnos o cursos duplicados).
+              </p>
+            </div>
+          </div>
+
+          {/* Llamado a la Acción (CTA) */}
+          <div className="pt-8 border-t border-neutral-100 flex flex-col items-center gap-6 text-center">
+            <button
+              onClick={() => navigate('/login?mode=signup&plan=school')}
+              className="px-10 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl text-sm font-black uppercase tracking-widest shadow-xl shadow-blue-500/20 active:scale-95 transition-all w-full md:w-auto"
+            >
+              {schoolPlan.foundersPromo
+                ? `⚡ Obtener Precio Fundadores · US$${schoolPlan.foundersPromo.firstYearPrice.toFixed(2)} primer año`
+                : schoolPlan.ctaLabel}
+            </button>
+            <a
+              href="mailto:hola@ediagil.com?subject=Demo%20Plan%20Institucional"
+              className="inline-flex items-center gap-2 px-8 py-4 border-2 border-blue-200 text-blue-700 hover:bg-blue-50 rounded-2xl text-sm font-black uppercase tracking-widest transition-all w-full md:w-auto justify-center"
+            >
+              <Mail className="w-4 h-4" />
+              Agendar Demo · hola@ediagil.com
+            </a>
+            <p className="text-xs text-neutral-400 font-semibold">
+              Soporte prioritario y migración de datos de alumnos gratuita incluida
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-white text-neutral-900 scroll-smooth">
@@ -217,10 +393,10 @@ export function LandingPage() {
       </header>
 
       {/* Hero */}
-      <section id="inicio" className="relative overflow-hidden">
-        <div className="absolute inset-0 opacity-[0.05] pointer-events-none">
-          <div className="absolute top-[-20%] left-[-10%] w-[45%] h-[55%] bg-indigo-600 rounded-full blur-[130px]" />
-          <div className="absolute bottom-[-20%] right-[-10%] w-[45%] h-[55%] bg-purple-600 rounded-full blur-[130px]" />
+      <section id="inicio" className="relative overflow-hidden bg-slate-950 text-white">
+        <div className="absolute inset-0 opacity-20 pointer-events-none">
+          <div className="absolute top-[-20%] left-[-10%] w-[45%] h-[55%] bg-indigo-500 rounded-full blur-[130px]" />
+          <div className="absolute bottom-[-20%] right-[-10%] w-[45%] h-[55%] bg-emerald-500 rounded-full blur-[130px]" />
         </div>
 
         <div className="relative max-w-7xl mx-auto px-6 lg:px-8 pt-20 pb-24 grid lg:grid-cols-2 gap-16 items-center">
@@ -229,16 +405,16 @@ export function LandingPage() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, ease: 'easeOut' }}
           >
-            <div className="inline-flex items-center gap-2 bg-indigo-50 border border-indigo-100 text-indigo-700 px-4 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest mb-8">
+            <div className="inline-flex items-center gap-2 bg-indigo-900/30 border border-indigo-500/30 text-indigo-300 px-4 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest mb-8">
               <Sparkles className="w-4 h-4" />
               Hecho para docentes, con IA
             </div>
-            <h1 className="text-5xl lg:text-6xl font-black text-neutral-900 tracking-tight leading-[1.05] mb-8">
+            <h1 className="text-5xl lg:text-6xl font-black text-white tracking-tight leading-[1.05] mb-8">
               Tu cuaderno digital
               <br />
-              docente <span className="text-indigo-600">con IA</span>
+              docente <span className="text-indigo-400">con IA</span>
             </h1>
-            <p className="text-xl text-neutral-500 font-medium leading-relaxed mb-12 max-w-lg">
+            <p className="text-xl text-slate-400 font-medium leading-relaxed mb-12 max-w-lg">
               Gestiona tus clases, asistencias, calificaciones con ponderaciones y apuntes generados por
               inteligencia artificial. Todo en la nube, seguro y disponible sin conexión.
             </p>
@@ -253,23 +429,23 @@ export function LandingPage() {
               </button>
               <a
                 href="#caracteristicas"
-                className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-white border border-neutral-200 hover:border-indigo-200 hover:bg-neutral-50 text-neutral-700 px-10 py-5 rounded-[2rem] text-sm font-black uppercase tracking-widest shadow-sm transition-all active:scale-95"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-slate-900 border border-slate-700 hover:border-indigo-500 hover:bg-slate-800 text-slate-200 px-10 py-5 rounded-[2rem] text-sm font-black uppercase tracking-widest shadow-sm transition-all active:scale-95"
               >
                 Ver Características
               </a>
             </div>
             <div className="flex flex-wrap items-center gap-x-10 gap-y-4">
               <div className="flex items-center gap-3">
-                <Users className="w-5 h-5 text-indigo-600" />
-                <span className="text-sm font-bold text-neutral-500">+2.000 docentes activos</span>
+                <Shield className="w-5 h-5 text-indigo-400" />
+                <span className="text-sm font-bold text-slate-400">Datos cifrados en la nube</span>
               </div>
               <div className="flex items-center gap-3">
-                <ShieldCheck className="w-5 h-5 text-emerald-600" />
-                <span className="text-sm font-bold text-neutral-500">Datos cifrados en la nube</span>
+                <Zap className="w-5 h-5 text-amber-400" />
+                <span className="text-sm font-bold text-slate-400">Funciona sin internet</span>
               </div>
               <div className="flex items-center gap-3">
-                <Zap className="w-5 h-5 text-amber-500" />
-                <span className="text-sm font-bold text-neutral-500">Funciona sin internet</span>
+                <ShieldCheck className="w-5 h-5 text-emerald-400" />
+                <span className="text-sm font-bold text-slate-400">Privacidad garantizada</span>
               </div>
             </div>
           </motion.div>
@@ -410,50 +586,59 @@ export function LandingPage() {
           </div>
 
           <div className="grid lg:grid-cols-3 gap-8 items-stretch">
-            {PLANS.map((plan) => {
-              const accent =
-                plan.accent === 'emerald'
-                  ? { badge: 'bg-amber-400', border: 'border-emerald-600', btn: 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-500/30' }
-                  : plan.accent === 'blue'
-                    ? { badge: 'bg-blue-600', border: 'border-blue-600', btn: 'bg-blue-600 hover:bg-blue-500 shadow-blue-500/30' }
-                    : { badge: '', border: 'border-neutral-200', btn: 'bg-neutral-900 hover:bg-neutral-800 shadow-neutral-900/20' };
+            {getPublicPlans().map((plan: PricingPlan) => {
+              const accent = getPlanAccentStyles(plan.accent);
+              const planUrl = plan.ctaHref;
+              const baseCardClass = 'relative flex flex-col h-full bg-white rounded-[2.5rem] p-8 border-2 transition-all hover:-translate-y-1 hover:shadow-2xl ';
+              const highlightClass = accent.border + ' shadow-2xl shadow-emerald-500/10 ring-2 ring-emerald-500/20';
+              const normalClass = 'border-neutral-100 shadow-sm hover:border-indigo-200 ' + accent.border.replace('border-emerald-600', 'hover:border-emerald-200').replace('border-blue-600', 'hover:border-blue-200').replace('border-neutral-200', 'hover:border-indigo-200');
+              const cardClass = baseCardClass + (plan.highlight ? highlightClass : normalClass);
+              const btnClass = 'w-full inline-flex items-center justify-center gap-2 py-4 rounded-2xl text-xs font-black uppercase tracking-widest text-white shadow-lg transition-all active:scale-95 mt-auto ' + accent.btn;
 
               return (
                 <div
                   key={plan.id}
-                  className={`relative flex flex-col justify-between bg-white rounded-[2.5rem] p-8 border-2 transition-all hover:-translate-y-1 hover:shadow-2xl ${
-                    plan.highlight ? `${accent.border} shadow-2xl shadow-emerald-500/10` : `border-neutral-100 shadow-sm ${accent.border.replace('border-emerald-600', 'hover:border-emerald-200').replace('border-blue-600', 'hover:border-blue-200').replace('border-neutral-200', 'hover:border-indigo-200')}`
-                  }`}
+                  className={cardClass}
                 >
                   {plan.highlight && (
-                    <div className="absolute top-5 right-5 bg-amber-400 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">
+                    <div className="absolute top-5 right-5 bg-amber-400 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg animate-pulse">
                       Más popular
                     </div>
                   )}
-                  <div>
+                  <div className="space-y-3">
                     <h3 className="text-xl font-black text-neutral-900 mb-1">{plan.name}</h3>
-                    <p className="text-4xl font-black text-neutral-900 mb-1">
-                      {plan.price}
-                      <span className="text-sm text-neutral-400">{plan.period}</span>
-                    </p>
-                    <p className="text-[11px] font-bold text-neutral-400 mb-8">{plan.tagline}</p>
-                    <ul className="space-y-3 mb-10">
-                      {plan.features.map((feature) => (
-                        <li key={feature.text} className="flex items-center gap-3 text-sm font-bold text-neutral-600">
-                          <CheckIcon included={feature.included} />
-                          <span className={feature.included ? '' : 'text-neutral-400 line-through decoration-neutral-300'}>{feature.text}</span>
-                        </li>
-                      ))}
-                    </ul>
+                    {plan.price === 0 ? (
+                      <p className="text-4xl font-black text-neutral-900 mb-1">Gratis</p>
+                    ) : (
+                      <p className="text-4xl font-black text-neutral-900 mb-1">
+                        US${plan.price.toFixed(2)}
+                        <span className="text-sm text-neutral-400">{plan.period}</span>
+                      </p>
+                    )}
+                    <p className="text-[11px] font-bold text-neutral-400 mb-2 line-clamp-2">{plan.tagline}</p>
+                    {plan.foundersPromo && (
+                      <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl space-y-2">
+                        <p className="text-[9px] font-black uppercase tracking-widest text-amber-800">⚡ Promoción Fundadores</p>
+                        <p className="text-xl font-black text-amber-900">US${plan.foundersPromo.firstYearPrice.toFixed(2)} <span className="text-sm font-bold text-amber-700">primer año</span></p>
+                        <p className="text-[10px] font-bold text-neutral-600">Renovación: US${plan.foundersPromo.renewalPrice.toFixed(2)}/año</p>
+                      </div>
+                    )}
                   </div>
-                  <button
-                    onClick={() => navigate(`/login?mode=signup&plan=${plan.id}`)}
-                    title={`Elegir plan ${plan.name}`}
-                    className={`w-full inline-flex items-center justify-center gap-2 py-4 rounded-2xl text-xs font-black uppercase tracking-widest text-white shadow-lg transition-all active:scale-95 ${accent.btn}`}
+                  <ul className="space-y-3 my-8 flex-1">
+                    {plan.features.map((feature) => (
+                      <li key={feature.text} className="flex items-center gap-3 text-sm font-bold text-neutral-600">
+                        <CheckIcon included={feature.included} />
+                        <span className={feature.included ? '' : 'text-neutral-400 line-through decoration-neutral-300'}>{feature.text}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <a
+                    href={planUrl}
+                    className={btnClass}
                   >
                     {plan.ctaLabel}
                     <ArrowRight className="w-4 h-4" />
-                  </button>
+                  </a>
                 </div>
               );
             })}
@@ -466,16 +651,16 @@ export function LandingPage() {
       </section>
 
       {/* Testimonios */}
-      <section id="testimonios" className="bg-neutral-50 py-24 scroll-mt-24">
+      <section id="testimonios" className="bg-slate-900 py-24 scroll-mt-24 text-white">
         <div className="max-w-7xl mx-auto px-6 lg:px-8">
           <div className="text-center max-w-2xl mx-auto mb-16">
-            <span className="inline-block text-[10px] font-black uppercase tracking-[0.25em] text-indigo-600 bg-indigo-50 border border-indigo-100 px-4 py-2 rounded-2xl mb-6">
+            <span className="inline-block text-[10px] font-black uppercase tracking-[0.25em] text-indigo-300 bg-indigo-900/40 border border-indigo-500/30 px-4 py-2 rounded-2xl mb-6">
               Testimonios
             </span>
-            <h2 className="text-4xl lg:text-5xl font-black text-neutral-900 tracking-tight mb-6">
+            <h2 className="text-4xl lg:text-5xl font-black text-white tracking-tight mb-6">
               Docentes que ya lo aman
             </h2>
-            <p className="text-lg text-neutral-500 font-medium leading-relaxed">
+            <p className="text-lg text-slate-400 font-medium leading-relaxed">
               Miles de educadores recuperaron horas de su semana con EdiAgil.
             </p>
           </div>
@@ -484,7 +669,7 @@ export function LandingPage() {
             {TESTIMONIALS.map((testimonial) => (
               <div
                 key={testimonial.name}
-                className="bg-white border border-neutral-100 rounded-[2rem] p-8 flex flex-col hover:border-indigo-200 hover:shadow-2xl hover:shadow-indigo-500/10 transition-all"
+                className="bg-slate-800 border border-slate-700 rounded-[2rem] p-8 flex flex-col hover:border-indigo-500 hover:shadow-2xl hover:shadow-indigo-500/20 transition-all"
               >
                 <div className="flex items-center gap-1 mb-6">
                   {Array.from({ length: 5 }).map((_, i) => (
@@ -492,7 +677,7 @@ export function LandingPage() {
                   ))}
                 </div>
                 <Quote className="w-8 h-8 text-indigo-200 mb-4" />
-                <p className="flex-1 text-sm text-neutral-600 font-medium leading-relaxed mb-8">
+                <p className="flex-1 text-sm text-slate-300 font-medium leading-relaxed mb-8">
                   &ldquo;{testimonial.quote}&rdquo;
                 </p>
                 <div className="flex items-center gap-4">
@@ -500,8 +685,8 @@ export function LandingPage() {
                     {testimonial.name.split(' ').slice(0, 2).map((part) => part[0]).join('')}
                   </div>
                   <div>
-                    <p className="text-sm font-black text-neutral-900">{testimonial.name}</p>
-                    <p className="text-[11px] font-bold text-neutral-400">{testimonial.role}</p>
+                    <p className="text-sm font-black text-white">{testimonial.name}</p>
+                    <p className="text-[11px] font-bold text-slate-400">{testimonial.role}</p>
                   </div>
                 </div>
               </div>
@@ -513,7 +698,7 @@ export function LandingPage() {
       {/* CTA final */}
       <section className="py-24">
         <div className="max-w-5xl mx-auto px-6 lg:px-8">
-          <div className="relative overflow-hidden bg-neutral-900 rounded-[3rem] px-8 py-20 text-center">
+          <div className="relative overflow-hidden bg-slate-950 rounded-[3rem] px-8 py-20 text-center border border-slate-800/50 shadow-2xl shadow-slate-900/50">
             <div className="absolute inset-0 opacity-20 pointer-events-none">
               <div className="absolute top-[-30%] left-[-10%] w-[50%] h-[70%] bg-indigo-600 rounded-full blur-[120px]" />
               <div className="absolute bottom-[-30%] right-[-10%] w-[50%] h-[70%] bg-purple-600 rounded-full blur-[120px]" />
@@ -609,6 +794,17 @@ export function LandingPage() {
           </div>
         </div>
       </footer>
+
+      {/* Mobile Floating CTA */}
+      <button
+        onClick={() => navigate('/login?mode=signup')}
+        title="Crear cuenta gratis"
+        className="md:hidden fixed bottom-6 right-6 z-50 inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-4 rounded-[2rem] text-sm font-black uppercase tracking-widest shadow-2xl shadow-indigo-500/40 transition-all active:scale-95 animate-bounce-subtle"
+        aria-label="Crear cuenta gratis"
+      >
+        Empieza Gratis
+        <ArrowRight className="w-5 h-5" />
+      </button>
     </div>
   );
 }

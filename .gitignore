@@ -15,9 +15,19 @@ gemini_key.txt
 firebase functions.json
 *firebase init functions.js
 firebase-applet-config.json.*
+# Firebase service account
+serviceAccountKey.json
+functions/serviceAccountKey.json
 
 # Archivos temporales y de herramientas
 .agents/*.txt
 tour_ids.csv
 "Ediagil Notes/"
 Ediagil Notes/
+test-results/
+playwright-report/
+*-err.txt
+*-log.txt
+*-pid.txt
+
+

@@ -45,7 +45,7 @@ await testEnv.clearFirestore();
 
 // ── Preparación: crear usuarios de auth y sembrar estados con reglas OFF ──
 const u = {};
-for (const [name, email] of [['free', 'free@test.local'], ['pro', 'pro@test.local'], ['trialExp', 'trial-exp@test.local'], ['paidStale', 'paid-stale@test.local'], ['other', 'other@test.local'], ['fresh', 'fresh@test.local']]) {
+for (const [name, email] of [['free', 'free@test.local'], ['pro', 'pro@test.local'], ['trialExp', 'trial-exp@test.local'], ['paidStale', 'paid-stale@test.local'], ['other', 'other@test.local'], ['fresh', 'fresh@test.local'], ['teacherB', 'teacherB@test.local'], ['admin', 'admin@test.local']]) {
   u[name] = await signUp(email);
 }
 
@@ -55,8 +55,12 @@ await testEnv.withSecurityRulesDisabled(async (ctx) => {
   await setDoc(doc(db, 'users', u.trialExp.uid), { ...base(u.trialExp.uid), plan: 'pro', isTrial: true, trialStartedAt: NOW - 20 * DAY, trialEndsAt: NOW - 6 * DAY, trialUsed: true, paymentProvider: 'trial' });
   await setDoc(doc(db, 'users', u.paidStale.uid), { ...base(u.paidStale.uid), plan: 'pro', isTrial: true, trialStartedAt: NOW - 20 * DAY, trialEndsAt: NOW - 6 * DAY, trialUsed: true, paymentProvider: 'lemonsqueezy', expiresAt: NOW + 30 * DAY });
   await setDoc(doc(db, 'users', u.pro.uid), { ...base(u.pro.uid), plan: 'pro' });
+  await setDoc(doc(db, 'users', u.teacherB.uid), { ...base(u.teacherB.uid), plan: 'pro' });
   await setDoc(doc(db, 'users', u.free.uid), base(u.free.uid));
   await setDoc(doc(db, 'users', u.other.uid), base(u.other.uid));
+  await setDoc(doc(db, 'users', u.admin.uid), { ...base(u.admin.uid), plan: 'school', role: 'admin', institutionId: 'inst-test-100' });
+  await setDoc(doc(db, 'institutions', 'inst-test-100'), { name: 'Colegio Test', adminUid: u.admin.uid, createdAt: NOW });
+  await setDoc(doc(db, 'institutionUsers', u.admin.uid), { userId: u.admin.uid, role: 'admin', institutionId: 'inst-test-100', createdAt: NOW });
 });
 
 // ── Helpers ──
@@ -172,6 +176,65 @@ console.log('\n🔒 Aislamiento entre usuarios');
   await expectFails('Actualizar asignatura ajena DENEGADO',
     updateDoc(doc(dbOther, 'subjects', 'sub-sin-contador'), { name: 'Hack' }));
   await expectFails('Leer perfil ajeno DENEGADO', getDoc(doc(dbOther, 'users', u.free.uid)));
+}
+
+// ── 7. Aulas Multiasignatura (classGroups & reglas de seguridad) ──
+console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
+{
+  const ctxA = testEnv.authenticatedContext(u.pro.uid);
+  const dbA = ctxA.firestore();
+  const ctxB = testEnv.authenticatedContext(u.teacherB.uid);
+  const dbB = ctxB.firestore();
+  const dbAnon = testEnv.unauthenticatedContext().firestore();
+
+  // 7.1 Casos permitidos (Docente Propietario A)
+  const groupAData = { userId: u.pro.uid, name: '3.º A', modalidad: 'varias', createdAt: NOW, updatedAt: NOW, nivelEducativo: 'primaria', grado: '3', seccion: 'A' };
+  await expectSucceeds('Docente A: Crear su Aula/Grupo', setDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), groupAData));
+  await expectSucceeds('Docente A: Leer su Aula/Grupo', getDoc(doc(dbA, 'classGroups', 'cg-aula-3a')));
+
+  const subMathA = { userId: u.pro.uid, name: 'Matemáticas', color: '#123456', teacher: 'Prof A', schedule: 'L 8:00', groupId: 'cg-aula-3a' };
+  const subSpanishA = { userId: u.pro.uid, name: 'Español', color: '#654321', teacher: 'Prof A', schedule: 'M 8:00', groupId: 'cg-aula-3a' };
+  await expectSucceeds('Docente A: Crear materia interna Matemáticas', setDoc(doc(dbA, 'subjects', 'sub-math-3a'), subMathA));
+  await expectSucceeds('Docente A: Crear materia interna Español', setDoc(doc(dbA, 'subjects', 'sub-spanish-3a'), subSpanishA));
+  await expectSucceeds('Docente A: Actualizar su materia', updateDoc(doc(dbA, 'subjects', 'sub-math-3a'), { schedule: 'L 9:00' }));
+
+  const studentAData = { userId: u.pro.uid, subjectId: 'sub-math-3a', cedula: 'V-11111111', firstName: 'Juan', lastName: 'Pérez' };
+  await expectSucceeds('Docente A: Crear estudiante compartido bajo canónica', setDoc(doc(dbA, 'students', 'stu-juan-3a'), studentAData));
+  await expectSucceeds('Docente A: Registrar asistencia diaria', setDoc(doc(dbA, 'attendance', 'att-juan-1'), { userId: u.pro.uid, subjectId: 'sub-math-3a', studentId: 'stu-juan-3a', date: '2026-08-27', status: 'present' }));
+
+  const evalMathA = { userId: u.pro.uid, subjectId: 'sub-math-3a', title: 'Examen 1', maxScore: 100, date: '2026-08-27', type: 'teorica' };
+  const evalSpanishA = { userId: u.pro.uid, subjectId: 'sub-spanish-3a', title: 'Lectura 1', maxScore: 100, date: '2026-08-27', type: 'practica' };
+  await expectSucceeds('Docente A: Crear evaluación de Matemáticas', setDoc(doc(dbA, 'evaluations', 'ev-math-1'), evalMathA));
+  await expectSucceeds('Docente A: Crear evaluación de Español', setDoc(doc(dbA, 'evaluations', 'ev-spanish-1'), evalSpanishA));
+
+  await expectSucceeds('Docente A: Guardar nota de Matemáticas (misma materia)', setDoc(doc(dbA, 'grades', 'gr-math-1'), { userId: u.pro.uid, subjectId: 'sub-math-3a', evaluationId: 'ev-math-1', studentId: 'stu-juan-3a', score: 95 }));
+  await expectSucceeds('Docente A: Guardar nota de Español (estudiante canónico en materia hermana del mismo aula)', setDoc(doc(dbA, 'grades', 'gr-spanish-1'), { userId: u.pro.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 88 }));
+
+  // 7.2 Casos prohibidos (Docente No Propietario B)
+  await expectFails('Docente B: Leer el aula de Docente A DENEGADO', getDoc(doc(dbB, 'classGroups', 'cg-aula-3a')));
+  await expectFails('Docente B: Vincular materia propia a groupId ajeno DENEGADO', setDoc(doc(dbB, 'subjects', 'sub-hack-b'), { userId: u.teacherB.uid, name: 'Hack B', color: '#000000', teacher: 'Prof B', schedule: 'V 8:00', groupId: 'cg-aula-3a' }));
+  await expectFails('Docente B: Consultar estudiante de Docente A DENEGADO', getDoc(doc(dbB, 'students', 'stu-juan-3a')));
+  await expectFails('Docente B: Modificar asistencia de Docente A DENEGADA', setDoc(doc(dbB, 'attendance', 'att-juan-1'), { userId: u.teacherB.uid, subjectId: 'sub-math-3a', studentId: 'stu-juan-3a', date: '2026-08-27', status: 'absent' }));
+  await expectFails('Docente B: Leer nota de Docente A DENEGADA', getDoc(doc(dbB, 'grades', 'gr-math-1')));
+  await expectFails('Docente B: Crear nota cruzada con subjectId ajeno DENEGADA', setDoc(doc(dbB, 'grades', 'gr-hack-b'), { userId: u.teacherB.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 100 }));
+  await expectFails('Docente B: Cambiar userId para apropiarse de aula ajena DENEGADO', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), { userId: u.teacherB.uid }));
+
+  // 7.3 Usuario Anónimo / No Autenticado
+  await expectFails('Anónimo: Leer classGroups DENEGADO', getDoc(doc(dbAnon, 'classGroups', 'cg-aula-3a')));
+  await expectFails('Anónimo: Leer materias DENEGADO', getDoc(doc(dbAnon, 'subjects', 'sub-math-3a')));
+  await expectFails('Anónimo: Leer estudiantes DENEGADO', getDoc(doc(dbAnon, 'students', 'stu-juan-3a')));
+  await expectFails('Anónimo: Leer asistencia DENEGADO', getDoc(doc(dbAnon, 'attendance', 'att-juan-1')));
+  await expectFails('Anónimo: Leer evaluaciones DENEGADO', getDoc(doc(dbAnon, 'evaluations', 'ev-math-1')));
+  await expectFails('Anónimo: Leer calificaciones DENEGADO', getDoc(doc(dbAnon, 'grades', 'gr-math-1')));
+  await expectFails('Anónimo: Crear classGroup DENEGADO', setDoc(doc(dbAnon, 'classGroups', 'cg-anon'), groupAData));
+
+  // 7.4 Institucional
+  const ctxAdmin = testEnv.authenticatedContext(u.admin.uid);
+  const dbAdmin = ctxAdmin.firestore();
+  await expectSucceeds('Admin: Consultar su institución', getDoc(doc(dbAdmin, 'institutions', 'inst-test-100')));
+  await expectFails('Admin: Modificar calificaciones directamente DENEGADO', setDoc(doc(dbAdmin, 'grades', 'gr-admin-hack'), { userId: u.admin.uid, subjectId: 'sub-math-3a', evaluationId: 'ev-math-1', studentId: 'stu-juan-3a', score: 100 }));
+  await expectFails('Admin: Modificar asistencia directamente DENEGADA', setDoc(doc(dbAdmin, 'attendance', 'att-admin-hack'), { userId: u.admin.uid, subjectId: 'sub-math-3a', studentId: 'stu-juan-3a', date: '2026-08-27', status: 'present' }));
+  await expectFails('Docente: Modificar institución ajena DENEGADO', updateDoc(doc(dbA, 'institutions', 'inst-test-100'), { name: 'Hack Name' }));
 }
 
 await testEnv.cleanup();

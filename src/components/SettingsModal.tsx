@@ -1,6 +1,6 @@
 import { format } from 'date-fns';
 import React, { useState } from 'react';
-import { X, Settings, Shield, Zap, CreditCard, Bell, Database, Trash2, Download, FileText, BarChart3, Info, Heart, Key, AlertCircle, Loader2, Check, Layers } from 'lucide-react';
+import { X, Settings, Shield, Zap, CreditCard, Bell, Database, Trash2, Download, FileText, BarChart3, Info, Heart, Key, AlertCircle, Loader2, Check, Layers, Sparkles, Upload, ChevronDown, SlidersHorizontal, RotateCcw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { db, auth } from '../lib/firebase';
 import { collection, query, where, getDocs, writeBatch, doc, limit, orderBy, startAfter, setDoc, getDoc } from 'firebase/firestore';
@@ -21,6 +21,9 @@ import { STORAGE_KEYS, getStorageItem, setStorageItem } from '../lib/storageKeys
 import { useGradeSettings } from '../contexts/GradeSettingsContext';
 import { parseWeights, calculateStudentGrades } from '../lib/gradeCalculator';
 import { addSubjectCounterOp } from '../lib/subjectCounter';
+import { exportAdminDataToJSON, triggerAdminJSONDownload, adminRestoreInstitutionBackup, adminGetSchoolConfig, adminSaveGradingWeight, DEFAULT_GRADING_WEIGHT, type GradingWeight } from '../lib/adminApi';
+import { validateInstitutionBackup, type BackupSummary } from '../lib/backupValidation';
+import { GradingWeightEditor } from './GradingWeightEditor';
 
 export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProps) {
   const { plan: dbPlan, profile, limits } = usePlan();
@@ -180,7 +183,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   const [isConfirmingClearCalendar, setIsConfirmingClearCalendar] = useState(false);
   const [isConfirmingClearEvaluations, setIsConfirmingClearEvaluations] = useState(false);
   const [importData, setImportData] = useState<any>(null);
-  const { viewMode, calculationMode, weights, gradingScale, useCheckpoint, setViewMode, setCalculationMode, setWeights, setGradingScale, setUseCheckpoint } = useGradeSettings();
+  const { viewMode, calculationMode, weights, gradingScale, useCheckpoint, setViewMode, setCalculationMode, setWeights, setGradingScale, setUseCheckpoint, canEditWeights, weightsSource } = useGradeSettings();
 
   const handleUpdateWeight = (type: keyof typeof weights, field: 'name' | 'value', value: string) => {
     const newWeights = { ...weights };
@@ -327,6 +330,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
       materials: await getDocsForUser('materials'),
       modules: await getDocsForUser('subjectModules'),
       calendarEvents: await getDocsForUser('calendarEvents'),
+      classGroups: await getDocsForUser('classGroups'),
       extractedEvents,
       uploadedDocs,
       settings,
@@ -370,6 +374,204 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     };
     reader.readAsText(file);
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // ── Respaldo institucional (solo administradores) ────────────────────────
+  // PDF = consumir/compartir; JSON = proteger/recuperar. Este pipeline es la
+  // vía de RECUPERACIÓN: validación → preview → confirmación fuerte
+  // ("RESTAURAR") → backup previo automático → restauración con permiso del
+  // backend. El flujo JSON personal del docente NO se toca.
+  const isAdminUser = profile?.role === 'admin';
+  const adminBackupFileRef = React.useRef<HTMLInputElement>(null);
+  const [backupExportOpen, setBackupExportOpen] = useState(false);
+  const [exportingBackup, setExportingBackup] = useState(false);
+  const [importedBackup, setImportedBackup] = useState<{ payload: any; summary: BackupSummary } | null>(null);
+  const [restoreStage, setRestoreStage] = useState<'preview' | 'confirm'>('preview');
+  const [restoreConfirmText, setRestoreConfirmText] = useState('');
+  const [restoring, setRestoring] = useState(false);
+
+  // ── Ponderaciones académicas (política institucional, solo admin) ────────
+  // La ponderación es configuración institucional: el admin la edita aquí y
+  // los docentes la consultan en solo lectura. La fuente es
+  // institutions/{id}.gradingWeight (escritura SOLO vía adminSaveGradingWeight).
+  const [instWeight, setInstWeight] = useState<GradingWeight | null>(null);
+  const [instWeightLoading, setInstWeightLoading] = useState(false);
+  const [instWeightSaving, setInstWeightSaving] = useState(false);
+  const [weightConfirmOpen, setWeightConfirmOpen] = useState(false);
+
+  React.useEffect(() => {
+    if (!isOpen || !isAdminUser) return;
+    let cancelled = false;
+    setInstWeightLoading(true);
+    adminGetSchoolConfig()
+      .then((res) => {
+        if (!cancelled) setInstWeight(res.gradingWeight ?? { ...DEFAULT_GRADING_WEIGHT });
+      })
+      .catch((err) => {
+        console.warn('No se pudo leer la ponderación institucional:', err?.message || err);
+        if (!cancelled) setInstWeight({ ...DEFAULT_GRADING_WEIGHT });
+      })
+      .finally(() => {
+        if (!cancelled) setInstWeightLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [isOpen, isAdminUser]);
+
+  const instWeightTotal = React.useMemo(() => {
+    if (!instWeight) return 0;
+    if (instWeight.mode === 'personalizada') {
+      return Object.values(instWeight.customWeights).reduce((acc, v) => acc + (typeof v === 'number' && Number.isFinite(v) ? v : 0), 0);
+    }
+    return instWeight.weights.teoria + instWeight.weights.practica + instWeight.weights.apreciativa;
+  }, [instWeight]);
+  const instWeightComplete = Math.abs(instWeightTotal - 100) < 0.01;
+
+  const handleSaveInstWeight = () => {
+    if (!instWeight || instWeightSaving) return;
+    if (!instWeightComplete) {
+      showToast('error', `La suma de las ponderaciones debe ser 100%. Actualmente suma ${Math.round(instWeightTotal * 100) / 100}%.`);
+      return;
+    }
+    // B5: nunca guardar silenciosamente — advertencia de impacto en cálculos.
+    setWeightConfirmOpen(true);
+  };
+
+  const confirmSaveInstWeight = async () => {
+    if (!instWeight || instWeightSaving) return;
+    setWeightConfirmOpen(false);
+    setInstWeightSaving(true);
+    try {
+      const res = await adminSaveGradingWeight(instWeight);
+      setInstWeight(res.gradingWeight ?? instWeight);
+      showToast('success', 'Ponderaciones académicas actualizadas. Los docentes verán los nuevos valores.');
+    } catch (err: any) {
+      console.error('Error guardando ponderación institucional:', err);
+      showToast('error', err?.message && typeof err.message === 'string' && err.message.length < 200 ? err.message : 'No se pudo guardar la ponderación. Intenta de nuevo.');
+    } finally {
+      setInstWeightSaving(false);
+    }
+  };
+
+  const resetInstWeight = () => {
+    setInstWeight((prev) => ({
+      ...(prev ?? DEFAULT_GRADING_WEIGHT),
+      mode: 'tradicional',
+      weights: { ...DEFAULT_GRADING_WEIGHT.weights },
+      customWeights: {},
+    }));
+    showToast('info', 'Valores restablecidos a 30/60/10. Aplica los cambios para guardar.');
+  };
+
+  const sanitizeFilenamePart = (name: string) =>
+    name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'Institucion';
+
+  React.useEffect(() => {
+    if (!backupExportOpen && !importedBackup && !weightConfirmOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || exportingBackup || restoring || instWeightSaving) return;
+      if (weightConfirmOpen) {
+        setWeightConfirmOpen(false);
+        return;
+      }
+      if (importedBackup && restoreStage === 'confirm') {
+        setRestoreStage('preview');
+        return;
+      }
+      setBackupExportOpen(false);
+      setImportedBackup(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [backupExportOpen, importedBackup, restoreStage, exportingBackup, restoring, weightConfirmOpen, instWeightSaving]);
+
+  const fullBackupOptions = {
+    includeMetrics: true,
+    includeAlerts: true,
+    includeTeachers: true,
+    includeStudents: true,
+    includeDiscrepancies: true,
+    includeStats: true,
+  } as const;
+
+  const handleAdminBackupExport = async () => {
+    setExportingBackup(true);
+    try {
+      showToast('info', 'Preparando respaldo...');
+      // SIN filtros turno/nivel: el respaldo es institucional completo.
+      const data = await exportAdminDataToJSON(fullBackupOptions);
+      const instPart = sanitizeFilenamePart(data.institutionName || profile?.institutionName || 'Institucion');
+      triggerAdminJSONDownload(data, `EdiAgil-Respaldo-${instPart}-${format(new Date(), 'yyyy-MM-dd')}.json`);
+      showToast('success', 'Respaldo descargado correctamente.');
+      setBackupExportOpen(false);
+    } catch (err) {
+      console.error('Error exportando respaldo institucional:', err);
+      showToast('error', 'No se pudo generar el respaldo institucional. Intenta de nuevo.');
+    } finally {
+      setExportingBackup(false);
+    }
+  };
+
+  const handleAdminBackupFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (adminBackupFileRef.current) adminBackupFileRef.current.value = '';
+    if (!file) return;
+    if (!profile?.institutionId) {
+      showToast('error', 'Tu cuenta no tiene una institución asignada.');
+      return;
+    }
+    showToast('info', 'Validando archivo...');
+    const reader = new FileReader();
+    reader.onerror = () => {
+      showToast('error', 'No se pudo leer el archivo. Intenta de nuevo.');
+    };
+    reader.onload = (event) => {
+      try {
+        const parsed = safeJSONParse(event.target?.result as string, null);
+        const result = validateInstitutionBackup(parsed, profile!.institutionId!);
+        if (result.ok === false) {
+          console.warn('Respaldo inválido:', result.code);
+          showToast('error', result.userMessage);
+          return;
+        }
+        setImportedBackup({ payload: parsed, summary: result.summary });
+        setRestoreStage('preview');
+        setRestoreConfirmText('');
+      } catch {
+        showToast('error', 'Este archivo no parece ser un respaldo válido de EdiAgil.');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleAdminBackupRestore = async () => {
+    if (!importedBackup || restoring) return;
+    setRestoring(true);
+    try {
+      // BACKUP PREVIO AUTOMÁTICO: nunca restaurar sin completar este paso.
+      showToast('info', 'Preparando respaldo...');
+      const currentState = await exportAdminDataToJSON(fullBackupOptions);
+      const instPart = sanitizeFilenamePart(currentState.institutionName || profile?.institutionName || 'Institucion');
+      triggerAdminJSONDownload(currentState, `EdiAgil-PreRestauracion-${instPart}-${format(new Date(), 'yyyy-MM-dd_HH-mm')}.json`);
+
+      showToast('info', 'Restaurando configuración institucional...');
+      const res = await adminRestoreInstitutionBackup(importedBackup.payload);
+      showToast('success', 'Configuración institucional restaurada correctamente.');
+      // Avisos no fatales del backend (p. ej. ponderación inválida omitida).
+      if (res?.warnings?.length) {
+        res.warnings.forEach((w) => showToast('warning', w));
+      }
+      setImportedBackup(null);
+    } catch (err: any) {
+      console.error('Error restaurando respaldo institucional:', err);
+      showToast(
+        'error',
+        err?.code && typeof err.message === 'string' && err.message.length < 200
+          ? err.message
+          : 'La restauración falló. Usa el archivo de pre-restauración que se descargó para recuperar el estado anterior.',
+      );
+    } finally {
+      setRestoring(false);
+    }
   };
 
   const applySettings = async (settings: any) => {
@@ -450,7 +652,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
       await autoBackupBeforeImport();
       showToast('info', 'Se descargó un respaldo automático antes de importar. Guárdalo por seguridad.');
 
-      const collections = ['subjects', 'notes', 'students', 'evaluations', 'grades', 'attendance', 'materials', 'subjectModules', 'calendarEvents'];
+      const collections = ['subjects', 'notes', 'students', 'evaluations', 'grades', 'attendance', 'materials', 'subjectModules', 'calendarEvents', 'classGroups'];
       await Promise.all(collections.map(col => clearCollection(col)));
 
       const importCol = async (dataList: Record<string, unknown>[], colName: string) => {
@@ -473,18 +675,41 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
         if (count % 400 !== 0) await batch.commit();
       };
 
+      // Las AULAS/GRUPOS se importan ANTES que las asignaturas: cada aula
+      // consume 1 unidad (+1) y sus materias internas luego NO incrementan
+      // (la regla de subjects.create las reconoce por groupId del aula propio).
+      const restoredGroupIds = new Set<string>();
+      if (Array.isArray(data.classGroups)) {
+        for (const group of data.classGroups) {
+          const docId = typeof group.id === 'string' ? group.id : undefined;
+          const { id, ...groupToSave } = group as Record<string, unknown> & { id?: string };
+          groupToSave.userId = auth.currentUser!.uid;
+          const gRef = docId ? doc(db, 'classGroups', docId) : doc(collection(db, 'classGroups'));
+          restoredGroupIds.add(gRef.id);
+          const gBatch = writeBatch(db);
+          gBatch.set(gRef, groupToSave);
+          await addSubjectCounterOp(gBatch, auth.currentUser!.uid, +1);
+          await gBatch.commit();
+        }
+      }
+
       // Las asignaturas se importan una a la vez: la regla de seguridad exige que
       // el contador `userCounters/{uid}` se incremente exactamente +1 por asignatura
-      // en el mismo batch, así que no se pueden importar varias en un único batch.
+      // en el mismo batch, SALVO materias internas de un aula restaurada arriba
+      // (esas no consumen cuota y la reglas las aceptan sin incremento).
       if (data.subjects) {
         for (const subject of data.subjects) {
           const docId = typeof subject.id === 'string' ? subject.id : undefined;
-          const { id, ...subjectToSave } = subject;
+          const { id, ...subjectToSave } = subject as Record<string, unknown> & { id?: string; groupId?: string };
           subjectToSave.userId = auth.currentUser!.uid;
+          const isInternalMateria =
+            typeof subjectToSave.groupId === 'string' && restoredGroupIds.has(subjectToSave.groupId);
           const subjRef = docId ? doc(db, 'subjects', docId) : doc(collection(db, 'subjects'));
           const subjBatch = writeBatch(db);
           subjBatch.set(subjRef, subjectToSave);
-          await addSubjectCounterOp(subjBatch, auth.currentUser!.uid, +1);
+          if (!isInternalMateria) {
+            await addSubjectCounterOp(subjBatch, auth.currentUser!.uid, +1);
+          }
           await subjBatch.commit();
         }
       }
@@ -576,7 +801,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
 
   const handleClearData = async () => {
     try {
-      const collections = ['subjects', 'notes', 'students', 'evaluations', 'grades', 'attendance', 'materials', 'subjectModules', 'calendarEvents'];
+      const collections = ['subjects', 'notes', 'students', 'evaluations', 'grades', 'attendance', 'materials', 'subjectModules', 'calendarEvents', 'classGroups'];
       await Promise.all(collections.map(col => clearCollection(col)));
       window.location.reload();
     } catch (error) {
@@ -586,6 +811,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   };
 
   return (
+    <>
     <AnimatePresence>
       {isOpen && (
         <motion.div
@@ -790,6 +1016,163 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                         )}
                       </div>
                     </section>
+
+                    {isAdminUser && (
+                      <section className="space-y-4">
+                        <div className="flex items-center gap-3">
+                          <h5 className="text-lg font-black text-neutral-900">Respaldo institucional</h5>
+                          <span className="inline-flex items-center gap-1 rounded-full bg-[#F0F7F4] border border-[#1A3C40]/20 text-[#1A3C40] text-[9px] font-black uppercase tracking-widest px-2.5 py-1">
+                            <Shield className="w-3 h-3" />
+                            Administrador
+                          </span>
+                        </div>
+                        <p className="text-xs text-neutral-500 leading-relaxed">
+                          Protege la información académica de tu institución mediante una copia completa de seguridad.
+                          <br />
+                          El archivo de respaldo puede utilizarse para recuperar información en caso de emergencia o migración.
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          <button
+                            onClick={() => setBackupExportOpen(true)}
+                            title="Descargar una copia completa de seguridad institucional"
+                            className="flex items-center gap-4 p-4 bg-[#F0F7F4] rounded-2xl border border-[#1A3C40]/10 hover:bg-white hover:border-[#1A3C40]/30 transition-all text-left group"
+                          >
+                            <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center border border-[#1A3C40]/10 shadow-sm group-hover:scale-110 transition-transform">
+                              <Download className="w-5 h-5 text-[#1A3C40]" />
+                            </div>
+                            <div>
+                              <p className="font-bold text-[#1A3C40]">Exportar respaldo JSON</p>
+                              <p className="text-xs text-neutral-500 leading-snug mt-0.5">Descarga una copia completa de la información institucional.</p>
+                            </div>
+                          </button>
+                          <button
+                            onClick={() => adminBackupFileRef.current?.click()}
+                            title="Restaurar la configuración institucional desde un archivo de respaldo"
+                            className="flex items-center gap-4 p-4 bg-neutral-50 rounded-2xl border border-neutral-100 hover:bg-white hover:border-[#1A3C40]/30 transition-all text-left group"
+                          >
+                            <input
+                              type="file"
+                              ref={adminBackupFileRef}
+                              onChange={handleAdminBackupFileChange}
+                              accept=".json,application/json"
+                              className="hidden"
+                            />
+                            <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center border border-neutral-200 shadow-sm group-hover:scale-110 transition-transform">
+                              <Upload className="w-5 h-5 text-[#2E7D32]" />
+                            </div>
+                            <div>
+                              <p className="font-bold text-neutral-900">Restaurar configuración institucional</p>
+                              <p className="text-xs text-neutral-500 leading-snug mt-0.5">Recupera la configuración desde un respaldo generado por EdiAgil.</p>
+                            </div>
+                          </button>
+                        </div>
+                        <p className="text-xs text-neutral-500 leading-relaxed">
+                          Recupera la configuración institucional guardada en un respaldo de EdiAgil. Esta operación no elimina información existente ni reemplaza automáticamente todos los datos académicos históricos.
+                        </p>
+                        <details className="group rounded-2xl border border-[#1A3C40]/10 bg-[#F0F7F4]/60 px-4 py-3">
+                          <summary className="flex cursor-pointer select-none items-center justify-between gap-3 rounded-lg text-xs font-bold text-[#1A3C40] outline-none focus-visible:ring-2 focus-visible:ring-[#FFC107] [&::-webkit-details-marker]:hidden">
+                            ¿Qué se restaurará?
+                            <ChevronDown className="w-4 h-4 shrink-0 transition-transform duration-200 group-open:rotate-180" />
+                          </summary>
+                          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-4 border-t border-[#1A3C40]/10 pt-3">
+                            <div>
+                              <p className="text-[10px] font-black uppercase tracking-widest text-[#2E7D32]">Sí se restaurará</p>
+                              <ul className="mt-2 space-y-1.5">
+                                {[
+                                  'Configuración institucional (nombre, logo, colores, eslogan y datos del centro).',
+                                  'Parámetros compatibles: ponderación de evaluación, periodos de clase y reglas del plan.',
+                                  'Configuraciones administrativas soportadas.',
+                                ].map(item => (
+                                  <li key={item} className="flex items-start gap-2 text-xs text-neutral-600 leading-snug">
+                                    <CheckCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#2E7D32]" />
+                                    {item}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                            <div>
+                              <p className="text-[10px] font-black uppercase tracking-widest text-[#D32F2F]">No se restaurará automáticamente</p>
+                              <ul className="mt-2 space-y-1.5">
+                                {[
+                                  'Métricas calculadas.',
+                                  'Estadísticas derivadas.',
+                                  'Datos analíticos (listas de docentes/alumnos del informe).',
+                                  'Cualquier información no soportada por el esquema actual.',
+                                ].map(item => (
+                                  <li key={item} className="flex items-start gap-2 text-xs text-neutral-600 leading-snug">
+                                    <X className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#D32F2F]" />
+                                    {item}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          </div>
+                        </details>
+                      </section>
+                    )}
+
+                    {isAdminUser && (
+                      <section className="space-y-4">
+                        <div className="flex items-center gap-3">
+                          <h5 className="text-lg font-black text-neutral-900">Ponderaciones académicas</h5>
+                          <span className="inline-flex items-center gap-1 rounded-full bg-[#F0F7F4] border border-[#1A3C40]/20 text-[#1A3C40] text-[9px] font-black uppercase tracking-widest px-2.5 py-1">
+                            <Shield className="w-3 h-3" />
+                            Administrador
+                          </span>
+                        </div>
+                        <p className="text-xs text-neutral-500 leading-relaxed">
+                          Define cómo se distribuye el peso de las evaluaciones en la institución. Estas reglas serán utilizadas por los docentes vinculados al centro educativo.
+                        </p>
+                        {instWeightLoading ? (
+                          <div className="flex items-center justify-center gap-3 p-8 bg-neutral-50 rounded-3xl border border-neutral-100">
+                            <Loader2 className="w-5 h-5 animate-spin text-[#1A3C40]" />
+                            <span className="text-xs font-bold text-neutral-500 uppercase tracking-widest">Cargando ponderación...</span>
+                          </div>
+                        ) : instWeight ? (
+                          <>
+                            <div className="p-5 bg-[#F0F7F4]/60 border border-[#1A3C40]/10 rounded-3xl">
+                              <GradingWeightEditor value={instWeight} onChange={setInstWeight} />
+                            </div>
+                            {typeof instWeight.updatedAt === 'number' && (
+                              <p className="text-[10px] font-bold text-neutral-400 uppercase tracking-widest">
+                                Última actualización: {format(new Date(instWeight.updatedAt), 'dd/MM/yyyy HH:mm')}
+                                {' · '}Modificado por: Administrador
+                              </p>
+                            )}
+                            <div className="flex flex-col sm:flex-row gap-3">
+                              <button
+                                onClick={resetInstWeight}
+                                title="Restablecer la ponderación a los valores tradicionales 30/60/10"
+                                className="flex items-center justify-center gap-2 bg-white hover:bg-neutral-50 text-neutral-700 font-bold py-3 px-4 rounded-xl text-xs border border-neutral-200 transition-colors"
+                              >
+                                <RotateCcw className="w-4 h-4" />
+                                Restablecer 30/60/10
+                              </button>
+                              <button
+                                onClick={handleSaveInstWeight}
+                                disabled={!instWeightComplete || instWeightSaving}
+                                title="Guardar la ponderación institucional"
+                                className="flex-1 flex items-center justify-center gap-2 bg-[#1A3C40] hover:bg-[#2E7D32] disabled:opacity-50 text-white font-black uppercase tracking-widest py-3 px-4 rounded-xl text-xs transition-all active:scale-95"
+                              >
+                                {instWeightSaving ? (
+                                  <>
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                    Aplicando...
+                                  </>
+                                ) : (
+                                  <>
+                                    <SlidersHorizontal className="w-4 h-4" />
+                                    Guardar ponderación
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <p className="text-xs text-neutral-500">No se pudo cargar la ponderación institucional.</p>
+                        )}
+                      </section>
+                    )}
                   </div>
                 )}
 
@@ -806,6 +1189,42 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                         </div>
                       </div>
 
+                      {!canEditWeights ? (
+                        <>
+                          {/* POLÍTICA INSTITUCIONAL: el docente vinculado a una
+                              institución consulta la ponderación; solo el admin
+                              la edita (Configuración → General). */}
+                          <div className="bg-[#F0F7F4] border border-[#1A3C40]/20 rounded-3xl p-6 space-y-4">
+                            <div className="flex items-center justify-between gap-3 flex-wrap">
+                              <span className="inline-flex items-center gap-1.5 rounded-full bg-white border border-[#1A3C40]/20 text-[#1A3C40] text-[10px] font-black uppercase tracking-widest px-3 py-1.5">
+                                <Shield className="w-3.5 h-3.5 text-[#2E7D32]" />
+                                Definido por tu institución
+                              </span>
+                              <span className="text-xs font-black text-[#1A3C40] tabular-nums">
+                                {weights.teorica.value + weights.practica.value + weights.apreciativa.value}%
+                              </span>
+                            </div>
+                            <p className="text-xs text-neutral-500 font-medium">
+                              Esta configuración es administrada por el centro educativo.
+                            </p>
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                              {([
+                                { id: 'teorica', color: 'bg-blue-500' },
+                                { id: 'practica', color: 'bg-emerald-500' },
+                                { id: 'apreciativa', color: 'bg-amber-500' },
+                              ] as const).map(({ id, color }) => (
+                                <div key={id} className="bg-white border border-neutral-100 rounded-2xl px-4 py-3">
+                                  <div className="flex items-center gap-2 mb-1.5">
+                                    <span className={`w-2 h-2 rounded-full ${color}`} />
+                                    <span className="text-[10px] font-black text-neutral-400 uppercase tracking-widest truncate">{weights[id].name}</span>
+                                  </div>
+                                  <p className="text-lg font-black text-neutral-900 tabular-nums">{weights[id].value}%</p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      ) : (
                       <div className={`grid grid-cols-1 gap-6 ${useCheckpoint ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3'}`}>
                         {([
                           { id: 'teorica', color: 'blue' },
@@ -814,17 +1233,17 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                           ...(useCheckpoint ? [{ id: 'checkpoint', color: 'indigo' }] : [])
                         ] as const).map(type => (
                           <div key={type.id} className="bg-neutral-50 border border-neutral-100 p-6 rounded-3xl space-y-4">
-                            <input 
+                            <input
                               type="text"
                               value={weights[type.id as keyof typeof weights].name}
                               onChange={(e) => handleUpdateWeight(type.id as keyof typeof weights, 'name', e.target.value)}
                               className="block w-full bg-transparent text-[10px] font-black text-neutral-400 uppercase tracking-widest outline-none border-b border-transparent focus:border-neutral-200"
                             />
                             <div className="relative">
-                              <input 
-                                type="number" 
+                              <input
+                                type="number"
                                 step="0.1"
-                                value={weights[type.id as keyof typeof weights].value} 
+                                value={weights[type.id as keyof typeof weights].value}
                                 onChange={(e) => handleUpdateWeight(type.id as keyof typeof weights, 'value', e.target.value)}
                                 className="w-full bg-white border border-neutral-200 rounded-2xl px-4 py-3 font-black text-lg outline-none focus:ring-4 focus:ring-indigo-500/5 focus:border-indigo-500 transition-all"
                               />
@@ -833,6 +1252,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                           </div>
                         ))}
                       </div>
+                      )}
 
                       <div className="p-6 bg-neutral-50 border border-neutral-100 rounded-3xl space-y-4">
                         <div className="flex items-center justify-between">
@@ -956,10 +1376,12 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                         </div>
                       </div>
 
-                      <div className="p-6 bg-amber-50 border border-amber-100 rounded-3xl flex items-start gap-4">
-                        <Info className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                        <p className="text-xs text-amber-900/70 font-medium leading-relaxed">
-                          Las ponderaciones se suman directamente para el cálculo del promedio final (ej. 30% + 60% + 10% = 100%).
+                      <div className={`rounded-3xl flex items-start gap-4 p-6 border ${weightsSource === 'institutional' ? 'bg-[#F0F7F4] border-[#1A3C40]/20' : 'bg-amber-50 border-amber-100'}`}>
+                        <Info className={`w-5 h-5 shrink-0 mt-0.5 ${weightsSource === 'institutional' ? 'text-[#1A3C40]' : 'text-amber-500'}`} />
+                        <p className={`text-xs font-medium leading-relaxed ${weightsSource === 'institutional' ? 'text-[#1A3C40]/80' : 'text-amber-900/70'}`}>
+                          {weightsSource === 'institutional'
+                            ? 'Las ponderaciones de tu institución se aplican al cálculo del promedio final de todos los docentes vinculados. Esta configuración es administrada por el centro educativo.'
+                            : 'Las ponderaciones se suman directamente para el cálculo del promedio final (ej. 30% + 60% + 10% = 100%).'}
                         </p>
                       </div>
                     </section>
@@ -1169,6 +1591,45 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                       </div>
                     )}
 
+                    {profile && (
+                      <div className="p-6 bg-white rounded-3xl border border-neutral-200 space-y-4">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <h6 className="font-black text-neutral-900 flex items-center gap-2">
+                              <Sparkles className="w-5 h-5 text-indigo-600" />
+                              Uso de Inteligencia Artificial (Gemini)
+                            </h6>
+                            <p className="text-xs text-neutral-500 font-medium mt-0.5">
+                              Consumo de consultas inteligentes de este mes
+                            </p>
+                          </div>
+                          <span className="text-sm font-black text-neutral-900 bg-neutral-100 px-3 py-1 rounded-full">
+                            {profile.aiCallsThisMonth || 0} / {limits?.aiCallsPerMonth || 15}
+                          </span>
+                        </div>
+
+                        <div className="w-full bg-neutral-100 rounded-full h-3.5 overflow-hidden border border-neutral-200/50">
+                          <div 
+                            className={`h-full transition-all duration-500 ${
+                              ((profile.aiCallsThisMonth || 0) / (limits?.aiCallsPerMonth || 15)) >= 0.8 
+                                ? 'bg-red-500 shadow-md shadow-red-500/20' 
+                                : ((profile.aiCallsThisMonth || 0) / (limits?.aiCallsPerMonth || 15)) >= 0.5 
+                                  ? 'bg-amber-500 shadow-md shadow-amber-500/20' 
+                                  : 'bg-indigo-600 shadow-md shadow-indigo-500/20'
+                            }`}
+                            style={{ width: `${Math.min(100, ((profile.aiCallsThisMonth || 0) / (limits?.aiCallsPerMonth || 15)) * 100)}%` }}
+                          />
+                        </div>
+
+                        {((profile.aiCallsThisMonth || 0) / (limits?.aiCallsPerMonth || 15)) >= 0.8 && (
+                          <p className="text-[11px] text-red-600 font-bold flex items-center gap-1.5 animate-pulse">
+                            <AlertCircle className="w-3.5 h-3.5" />
+                            ¡Te estás acercando al límite de consultas mensuales! Considera actualizar tu plan.
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {/* Planes Grid */}
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                       {/* Plan Gratis */}
@@ -1192,7 +1653,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-400"><X className="w-3.5 h-3.5 text-neutral-300 shrink-0" />Informes IA</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-400"><X className="w-3.5 h-3.5 text-neutral-300 shrink-0" />Exportar PDF/Excel</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-400"><X className="w-3.5 h-3.5 text-neutral-300 shrink-0" />Syllabus AI</li>
-                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Apuntes locales</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Respaldo Básico</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />15 consultas IA/mes</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className="w-3.5 h-3.5 text-indigo-500 shrink-0" />Copias de seguridad</li>
                           </ul>
@@ -1226,8 +1687,8 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                         <div className="absolute top-4 right-4 bg-amber-400 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">MÁS POPULAR</div>
                         <div>
                           <h6 className="text-xl font-black text-neutral-900 mb-1">Premium Pro</h6>
-                          <p className="text-4xl font-black text-neutral-900 mb-1">$4.99<span className="text-sm text-neutral-400">/año</span></p>
-                          <p className="text-[11px] text-amber-500 font-black mb-1">🔥 Ahorro masivo — ¡Solo $0.42/mes!</p>
+                          <p className="text-4xl font-black text-neutral-900 mb-1">$11.99<span className="text-sm text-neutral-400">/año</span></p>
+                          <p className="text-[11px] text-emerald-600 font-black mb-1">Equivale a menos de US$1/mes · facturado anualmente</p>
                           <p className="text-[10px] text-neutral-400 font-medium mb-6">Facturación anual · Cancelas cuando quieras</p>
                           <ul className="space-y-2.5 mb-8">
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 estudiantes</li>
@@ -1237,7 +1698,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />2.000 consultas IA/mes</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Exportar PDF/Excel</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Syllabus AI</li>
-                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Sincronización en la nube</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'pro' ? 'text-emerald-500' : 'text-neutral-300'} shrink-0`} />Sincronización Multi-dispositivo</li>
                           </ul>
                         </div>
                         {activeSubscription === 'pro' ? (
@@ -1307,15 +1768,18 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                         <div className="absolute top-4 right-4 bg-blue-600 text-white px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest shadow-lg">🏫 Colegios</div>
                         <div>
                           <h6 className="text-xl font-black text-neutral-900 mb-1">Institucional</h6>
-                          <p className="text-4xl font-black text-neutral-900 mb-1">$99.99<span className="text-sm text-neutral-400">/año</span></p>
-                          <p className="text-[11px] text-blue-600 font-black mb-1">💰 Ahorra +70% en planes grupales</p>
-                          <p className="text-[10px] text-neutral-400 font-medium mb-6">Para centros educativos y departamentos</p>
+                          <p className="text-4xl font-black text-neutral-900 mb-1">$199.99<span className="text-sm text-neutral-400">/año</span></p>
+                          <div className="p-2 bg-amber-50 border border-amber-200 rounded-xl space-y-1 mb-4">
+                            <p className="text-[9px] font-black uppercase tracking-widest text-amber-800">Promoción Fundadores activa</p>
+                            <p className="text-lg font-black text-amber-900">$99.99 <span className="text-sm font-bold text-amber-700">primer año</span></p>
+                            <p className="text-[10px] font-bold text-neutral-600">Renovación: $199.99/año</p>
+                          </div>
                           <ul className="space-y-2.5 mb-8">
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 estudiantes</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Hasta 999 cursos</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />9.999 consultas IA/mes</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Panel administrativo</li>
-                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Sincronización Cloud</li>
+                            <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Sincronización Multi-dispositivo</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Copias de seguridad</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Todo lo de Premium Pro incluido</li>
                             <li className="flex items-center gap-2 text-xs font-bold text-neutral-500"><CheckCircle className={`w-3.5 h-3.5 ${activeSubscription === 'school' ? 'text-blue-500' : 'text-neutral-300'} shrink-0`} />Onboarding personalizado</li>
@@ -1435,7 +1899,253 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
           </motion.div>
         </motion.div>
       )}
-    </AnimatePresence>
+      </AnimatePresence>
+
+      {isAdminUser && backupExportOpen && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-neutral-900/50 p-4"
+          onClick={() => { if (!exportingBackup) setBackupExportOpen(false); }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Descargar respaldo institucional"
+            className="w-full max-w-md bg-white rounded-[2rem] shadow-2xl border border-neutral-200 p-8 space-y-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between">
+              <div className="w-12 h-12 bg-[#F0F7F4] rounded-2xl flex items-center justify-center border border-[#1A3C40]/10">
+                <Shield className="w-6 h-6 text-[#1A3C40]" />
+              </div>
+              <button
+                onClick={() => { if (!exportingBackup) setBackupExportOpen(false); }}
+                title="Cerrar ventana"
+                disabled={exportingBackup}
+                className="text-neutral-400 hover:text-neutral-900 transition-colors disabled:opacity-40"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <h6 className="text-xl font-black text-neutral-900 tracking-tight">Descargar respaldo institucional</h6>
+            <p className="text-sm text-neutral-500 leading-relaxed">
+              Este archivo contiene información académica y datos de estudiantes y docentes. Guárdalo en un lugar seguro.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-3 pt-1">
+              <button
+                onClick={() => setBackupExportOpen(false)}
+                title="Cancelar descarga del respaldo"
+                disabled={exportingBackup}
+                className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-3 px-4 rounded-xl text-xs border border-neutral-200 transition-colors disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleAdminBackupExport}
+                title="Generar y descargar el respaldo institucional completo"
+                disabled={exportingBackup}
+                className="flex-1 bg-[#1A3C40] hover:bg-[#2E7D32] disabled:opacity-60 text-white font-black uppercase tracking-widest py-3 px-4 rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-2"
+              >
+                {exportingBackup ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Preparando...
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-4 h-4" />
+                    Descargar respaldo
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isAdminUser && weightConfirmOpen && (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-neutral-900/50 p-4"
+          onClick={() => { if (!instWeightSaving) setWeightConfirmOpen(false); }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cambiar ponderaciones académicas"
+            className="w-full max-w-md bg-white rounded-[2rem] shadow-2xl border border-amber-200 p-8 space-y-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between">
+              <div className="w-12 h-12 bg-amber-50 rounded-2xl flex items-center justify-center border border-amber-100">
+                <AlertCircle className="w-6 h-6 text-amber-500" />
+              </div>
+              <button
+                onClick={() => { if (!instWeightSaving) setWeightConfirmOpen(false); }}
+                title="Cerrar ventana"
+                className="text-neutral-400 hover:text-neutral-900 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <h6 className="text-xl font-black text-neutral-900 tracking-tight">Cambiar ponderaciones académicas</h6>
+            <p className="text-sm text-neutral-500 leading-relaxed">
+              Este cambio puede modificar los promedios calculados de los estudiantes y afectar boletines, métricas y alertas académicas.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-3 pt-1">
+              <button
+                onClick={() => setWeightConfirmOpen(false)}
+                title="Cancelar el cambio de ponderación"
+                className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-3 px-4 rounded-xl text-xs border border-neutral-200 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={confirmSaveInstWeight}
+                title="Aplicar la nueva ponderación institucional"
+                className="flex-1 bg-[#1A3C40] hover:bg-[#2E7D32] text-white font-black uppercase tracking-widest py-3 px-4 rounded-xl text-xs transition-all active:scale-95"
+              >
+                Aplicar cambios
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isAdminUser && importedBackup && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-neutral-900/50 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={restoreStage === 'preview' ? 'Respaldo encontrado' : 'Confirmar restauración de la configuración institucional'}
+            className={`w-full max-w-lg bg-white rounded-[2rem] shadow-2xl border p-8 space-y-5 ${restoreStage === 'confirm' ? 'border-red-200' : 'border-neutral-200'}`}
+          >
+            {restoreStage === 'preview' ? (
+              <>
+                <div className="flex items-start justify-between">
+                  <div className="w-12 h-12 bg-[#F0F7F4] rounded-2xl flex items-center justify-center border border-[#1A3C40]/10">
+                    <Database className="w-6 h-6 text-[#1A3C40]" />
+                  </div>
+                  <button
+                    onClick={() => setImportedBackup(null)}
+                    title="Cerrar ventana"
+                    className="text-neutral-400 hover:text-neutral-900 transition-colors"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <h6 className="text-xl font-black text-neutral-900 tracking-tight">Respaldo encontrado</h6>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                    <p className="text-[9px] font-black uppercase tracking-widest text-neutral-400">Institución</p>
+                    <p className="text-sm font-bold text-neutral-900 mt-0.5 break-words">{importedBackup.summary.institutionName || '—'}</p>
+                  </div>
+                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                    <p className="text-[9px] font-black uppercase tracking-widest text-neutral-400">Fecha de exportación</p>
+                    <p className="text-sm font-bold text-neutral-900 mt-0.5">
+                      {(() => {
+                        const d = importedBackup.summary.exportedAt ? new Date(importedBackup.summary.exportedAt) : null;
+                        return d && !Number.isNaN(d.getTime()) ? format(d, 'dd/MM/yyyy HH:mm') : '—';
+                      })()}
+                    </p>
+                  </div>
+                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                    <p className="text-[9px] font-black uppercase tracking-widest text-neutral-400">Docentes</p>
+                    <p className="text-sm font-bold text-neutral-900 mt-0.5">{importedBackup.summary.counts.teachers ?? '—'}</p>
+                  </div>
+                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                    <p className="text-[9px] font-black uppercase tracking-widest text-neutral-400">Asignaturas</p>
+                    <p className="text-sm font-bold text-neutral-900 mt-0.5">{importedBackup.summary.counts.subjects ?? '—'}</p>
+                  </div>
+                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                    <p className="text-[9px] font-black uppercase tracking-widest text-neutral-400">Evaluaciones</p>
+                    <p className="text-sm font-bold text-neutral-900 mt-0.5">{importedBackup.summary.counts.evaluations ?? '—'}</p>
+                  </div>
+                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-100">
+                    <p className="text-[9px] font-black uppercase tracking-widest text-neutral-400">Registros de asistencia</p>
+                    <p className="text-sm font-bold text-neutral-900 mt-0.5">{importedBackup.summary.counts.attendance ?? '—'}</p>
+                  </div>
+                </div>
+                <p className="-mt-1 text-[10px] text-neutral-400 leading-snug">
+                  Los conteos describen el contenido del informe analítico del respaldo; la restauración aplica únicamente la configuración institucional.
+                </p>
+                <div className="flex items-start gap-3 p-4 bg-[#F0F7F4] border border-[#1A3C40]/20 rounded-2xl">
+                  <Info className="w-5 h-5 text-[#1A3C40] shrink-0 mt-0.5" />
+                  <p className="text-xs text-neutral-700 font-medium leading-relaxed">
+                    Se actualizará la configuración institucional con los valores del respaldo. Los datos académicos existentes no se eliminan ni se modifican.
+                  </p>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3 pt-1">
+                  <button
+                    onClick={() => setImportedBackup(null)}
+                    title="Cancelar la restauración"
+                    className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-3 px-4 rounded-xl text-xs border border-neutral-200 transition-colors"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    onClick={() => setRestoreStage('confirm')}
+                    title="Continuar hacia la confirmación final"
+                    className="flex-1 bg-[#1A3C40] hover:bg-[#2E7D32] text-white font-black uppercase tracking-widest py-3 px-4 rounded-xl text-xs transition-all active:scale-95"
+                  >
+                    Continuar con restauración
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center border border-red-100">
+                  <AlertCircle className="w-6 h-6 text-[#D32F2F]" />
+                </div>
+                <h6 className="text-xl font-black text-neutral-900 tracking-tight">Confirmar restauración de configuración</h6>
+                <p className="text-sm text-neutral-500 leading-relaxed">
+                  Esta operación actualizará la configuración institucional. No puede deshacerse automáticamente.
+                  Antes de restaurar se descargará un respaldo automático del estado actual.
+                </p>
+                <div className="space-y-2">
+                  <label htmlFor="restore-confirm-input" className="block text-[10px] font-black uppercase tracking-widest text-neutral-400">
+                    Escribe RESTAURAR para confirmar
+                  </label>
+                  <input
+                    id="restore-confirm-input"
+                    type="text"
+                    value={restoreConfirmText}
+                    onChange={(e) => setRestoreConfirmText(e.target.value)}
+                    placeholder="RESTAURAR"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full bg-white border border-neutral-200 focus:border-[#D32F2F] rounded-2xl px-4 py-3 font-black tracking-widest outline-none focus:ring-4 focus:ring-red-500/10 transition-all"
+                  />
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3 pt-1">
+                  <button
+                    onClick={() => setRestoreStage('preview')}
+                    title="Volver al resumen del respaldo"
+                    disabled={restoring}
+                    className="flex-1 bg-white hover:bg-neutral-50 text-neutral-900 font-bold py-3 px-4 rounded-xl text-xs border border-neutral-200 transition-colors disabled:opacity-50"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    onClick={handleAdminBackupRestore}
+                    title="Descargar respaldo previo y restaurar la configuración institucional"
+                    disabled={restoring || restoreConfirmText !== 'RESTAURAR'}
+                    className="flex-1 bg-[#D32F2F] hover:bg-red-700 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black uppercase tracking-widest py-3 px-4 rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-2"
+                  >
+                    {restoring ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Restaurando...
+                      </>
+                    ) : (
+                      'Restaurar configuración'
+                    )}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -3,6 +3,8 @@ import { User, createUserWithEmailAndPassword, signInWithEmailAndPassword, signO
 import { auth, db } from '../lib/firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { clearAppStorage } from '../lib/storageKeys';
+// Modo Demo (VITE_DEMO_MODE=true): el usuario se simula, sin Auth/Firestore reales.
+import { IS_DEMO_MODE, getDemoUser } from '../lib/demoAdminData';
 
 interface AuthContextType {
   user: User | null;
@@ -28,6 +30,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     clearAppStorage();
+
+    // Modo Demo: no tocar Auth/Firestore; entrar como usuario demo admin.
+    if (IS_DEMO_MODE) {
+      setUser(getDemoUser());
+      setLoading(false);
+      return;
+    }
 
     const unsubscribe = auth.onAuthStateChanged(async (currentUser) => {
       if (currentUser) {

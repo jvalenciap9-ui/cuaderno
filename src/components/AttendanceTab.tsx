@@ -4,8 +4,11 @@ import { collection, query, where, addDoc, updateDoc, deleteDoc, doc, limit } fr
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthProvider';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
-import { Check, X as XIcon, Clock, ChevronLeft, ChevronRight, Calendar, BarChart3, Info, AlertTriangle } from 'lucide-react';
+import { Check, X as XIcon, Clock, ChevronLeft, ChevronRight, Calendar, BarChart3, Info, AlertTriangle, Download, FileSpreadsheet } from 'lucide-react';
+import { exportSubjectDataToExcel } from '../lib/exportUtils';
+import { exportSubjectToJSON, triggerJSONDownload } from '../lib/jsonSyncUtils';
 import { cn } from '../lib/utils';
+import { useCanonicalSubjectId } from '../lib/classGroups';
 import { 
   startOfWeek, 
   addDays, 
@@ -20,7 +23,14 @@ import {
 } from 'date-fns';
 import { es } from 'date-fns/locale';
 
-export function AttendanceTab({ subjectId }: { subjectId: string }) {
+export function AttendanceTab({ subjectId: rawSubjectId }: { subjectId: string }) {
+  // ── Aula/Grupo multiasignatura: asistencia diaria COMPARTIDA ───────────
+  // La asistencia pertenece al aula (asignatura canónica) y a una fecha,
+  // NO a cada materia: se registra una vez y los porcentajes nunca se
+  // multiplican por materia. Para asignaturas independientes el canonical
+  // es la misma asignatura → comportamiento legacy idéntico.
+  const { canonicalId } = useCanonicalSubjectId(rawSubjectId);
+  const subjectId = canonicalId;
   const { user } = useAuth();
   const [currentWeekStart, setCurrentWeekStart] = useState(startOfWeek(new Date(), { weekStartsOn: 1 }));
   const [showWeekends, setShowWeekends] = useState(false);
@@ -337,6 +347,32 @@ export function AttendanceTab({ subjectId }: { subjectId: string }) {
               </label>
               
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!subject) return;
+                    const json = await exportSubjectToJSON(user?.uid || '', subjectId);
+                    triggerJSONDownload(json, `clase-${subject.name.replace(/\s+/g, '_')}.json`);
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-purple-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                  title="Exportar clase completa en JSON"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (subject) {
+                      exportSubjectDataToExcel(user?.uid || '', user?.displayName || user?.email || null, subjectId);
+                    }
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[10px] font-black uppercase tracking-widest transition-all"
+                  title="Exportar asistencia en Excel"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  Excel
+                </button>
               </div>
             </div>
           </div>

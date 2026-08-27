@@ -5,6 +5,10 @@ import { safeJSONParse, parseLocalDate } from './utils';
 import { STORAGE_KEYS, getStorageItem } from './storageKeys';
 import { parseWeights, calculateStudentGrades, calculateWeightedAverage, DEFAULT_WEIGHTS, DEFAULT_SCALE, type ViewMode, type CalculationMode, type GradingWeights, type GradingScale } from './gradeCalculator';
 import type { AdminTeacherDataResponse, AdminTeacherSummaryResponse } from './adminApi';
+// html2canvas-pro (fork con soporte de oklch/oklab, usado por Tailwind 4):
+// html2canvas 1.4.1 no parsea `oklch(...)` y el export a PDF fallaba.
+import html2canvas from 'html2canvas-pro';
+import { jsPDF } from 'jspdf';
 
 interface SubjectExportData {
   students: any[];
@@ -369,11 +373,46 @@ export async function exportSubjectDataToExcel(userId: string, userName: string 
  * Exporta a Excel el reporte completo de un docente (todas sus asignaturas)
  * usando los datos que devuelve `adminGetTeacherData`. Produce el MISMO
  * reporte que el docente genera desde su cuaderno.
+ *
+ * `filenameSuffix` (opcional) refleja los filtros activos del dashboard en el
+ * nombre del archivo (p.ej. "matutino_secundaria").
  */
-export async function exportTeacherDataToExcel(teacherData: AdminTeacherDataResponse) {
+export async function exportTeacherDataToExcel(teacherData: AdminTeacherDataResponse, filenameSuffix?: string) {
   const { utils, writeFile } = await import('xlsx');
   const wb = utils.book_new();
   const settings = settingsFromUserSettings(teacherData.settings);
+
+  // Hoja institucional con el encabezado personalizado (Fase 5): se agrega
+  // solo si la institución configuró algún dato de identidad/contacto.
+  const cfg = teacherData.schoolConfig;
+  const instRows: any[][] = [];
+  if (cfg && (cfg.slogan || cfg.directorName || cfg.address || cfg.phone || cfg.email)) {
+    instRows.push([teacherData.teacher.institutionName || 'Institución']);
+    if (cfg.slogan) instRows.push([cfg.slogan]);
+    if (cfg.directorName) instRows.push(['Director/a', cfg.directorName]);
+    if (cfg.address) instRows.push(['Dirección', cfg.address]);
+    if (cfg.phone) instRows.push(['Teléfono', cfg.phone]);
+    if (cfg.email) instRows.push(['Correo', cfg.email]);
+    instRows.push([]);
+    instRows.push(['Reporte institucional generado con EdiAgil', 'Fecha', format(new Date(), 'dd/MM/yyyy')]);
+    const wsInst = utils.aoa_to_sheet(instRows);
+    wsInst['!cols'] = [{ wch: 40 }, { wch: 60 }];
+    utils.book_append_sheet(wb, wsInst, 'Institución');
+  }
+
+  // Prefijos de hoja únicos: dos asignaturas pueden tener nombres que
+  // colisionan al truncarse (p. ej. "Matemáticas — 1er Año A/B" → mismo
+  // prefix de 20 chars), lo que hacía fallar book_append_sheet.
+  const usedPrefixes = new Set<string>();
+  const uniquePrefix = (name: string) => {
+    let prefix = name ? name.replace(/[^a-z0-9]/gi, '_').substring(0, 20) : 'asignatura';
+    let candidate = prefix;
+    for (let i = 2; usedPrefixes.has(candidate); i++) {
+      candidate = `${prefix}_${i}`.substring(0, 20);
+    }
+    usedPrefixes.add(candidate);
+    return candidate;
+  };
 
   for (const sub of teacherData.subjects) {
     const subject = {
@@ -382,9 +421,11 @@ export async function exportTeacherDataToExcel(teacherData: AdminTeacherDataResp
       color: sub.color,
       teacher: sub.teacher,
       schedule: sub.schedule,
+      periodo: sub.periodo || null,
+      nivelEducativo: sub.nivelEducativo || null,
       plan: sub.plan,
     };
-    const prefix = sub.name ? sub.name.replace(/[^a-z0-9]/gi, '_').substring(0, 20) : 'asignatura';
+    const prefix = uniquePrefix(sub.name || '');
     buildSubjectWorkbook(utils, wb, subject, {
       students: sub.students || [],
       subjectModules: sub.subjectModules || [],
@@ -395,7 +436,10 @@ export async function exportTeacherDataToExcel(teacherData: AdminTeacherDataResp
   }
 
   const safeName = (teacherData.teacher.displayName || 'docente').replace(/[^a-z0-9]/gi, '_').toLowerCase();
-  const filename = `reporte-docente-${safeName}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`;
+  const safeSuffix = filenameSuffix && filenameSuffix.trim()
+    ? `-${filenameSuffix.replace(/[^a-z0-9]/gi, '_').toLowerCase()}`
+    : '';
+  const filename = `reporte-docente-${safeName}${safeSuffix}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`;
   writeFile(wb, filename);
 }
 
@@ -421,6 +465,7 @@ export async function exportTeacherSubjectToExcel(
     color: sub.color,
     teacher: sub.teacher,
     schedule: sub.schedule,
+    periodo: sub.periodo || null,
     plan: sub.plan,
   };
   const prefix = sub.name ? sub.name.replace(/[^a-z0-9]/gi, '_').substring(0, 20) : 'asignatura';
@@ -435,4 +480,35 @@ export async function exportTeacherSubjectToExcel(
   const safeName = (sub.name || 'asignatura').replace(/[^a-z0-9]/gi, '_').toLowerCase();
   const filename = `reporte-${safeName}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`;
   writeFile(wb, filename);
+}
+
+export async function exportInstitutionalReport(elementId: string, filename: string): Promise<void> {
+  const element = document.getElementById(elementId);
+  if (!element) throw new Error(`Elemento ${elementId} no encontrado`);
+  // Mismo resultado visual que html2pdf.js por defecto: margen 10 mm, A4
+  // vertical, JPEG 0.98, escala 2. html2canvas-pro soporta oklch (Tailwind 4).
+  const canvas = await html2canvas(element, {
+    scale: 2,
+    useCORS: true,
+    logging: false,
+    backgroundColor: '#ffffff',
+  });
+  const imgData = canvas.toDataURL('image/jpeg', 0.98);
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const margin = 10;
+  const imgWidth = pageWidth - margin * 2;
+  const imgHeight = (canvas.height * imgWidth) / canvas.width;
+  const usable = pageHeight - margin * 2;
+  let position = margin;
+  pdf.addImage(imgData, 'JPEG', margin, position, imgWidth, imgHeight);
+  let heightLeft = imgHeight - usable;
+  while (heightLeft > 0) {
+    position = margin - (imgHeight - heightLeft);
+    pdf.addPage();
+    pdf.addImage(imgData, 'JPEG', margin, position, imgWidth, imgHeight);
+    heightLeft -= usable;
+  }
+  pdf.save(filename);
 }

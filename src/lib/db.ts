@@ -15,10 +15,34 @@ export interface Subject {
   color: string;
   teacher: string;
   schedule: string;
+  periodo?: string | null;
+  nivelEducativo?: string | null;
   startDate?: string;
   endDate?: string;
   plan?: SubjectPlan;
   createdAt?: number;
+  /** Aula/Grupo multiasignatura (id Firestore `classGroups/{id}`). Ausente = independiente. */
+  groupId?: string;
+}
+
+/**
+ * Espejo Dexie (caché offline) de la colección Firestore `classGroups`.
+ * La fuente de verdad es Firestore; este espejo alimenta lecturas locales.
+ * `firestoreId` es el id del documento remoto (el `id` local es de Dexie).
+ */
+export interface ClassGroup {
+  id?: number;
+  firestoreId: string;
+  userId: string;
+  name: string;
+  modalidad: 'una' | 'varias';
+  nivelEducativo?: string;
+  grado?: string;
+  seccion?: string;
+  periodo?: string;
+  schemaVersion?: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface Attachment {
@@ -136,6 +160,26 @@ export interface UploadedDocument {
   processedAt: Date;
 }
 
+/**
+ * Observación del boletín (offline-first). Espejo de la colección Firestore
+ * `observations` (escritura solo del autor; lectura de la institución).
+ * `subjectId === ''` = observación GENERAL del docente consejero; con valor =
+ * observación del docente para ESA asignatura.
+ */
+export interface Observation {
+  id?: number;
+  /** Docente autor (users/{uid}). */
+  userId: string;
+  /** Id del documento student al que pertenece. */
+  studentId: string;
+  /** Id de la asignatura; '' = general (docente consejero). */
+  subjectId: string;
+  /** Clave del periodo activo ('I'|'II'|'III', 'C1'|'C2', 'anual', ...). */
+  period: string;
+  text: string;
+  updatedAt: number;
+}
+
 const db = new Dexie("ClassNotebookDB") as Dexie & {
   subjects: EntityTable<Subject, "id">;
   notes: EntityTable<Note, "id">;
@@ -148,6 +192,8 @@ const db = new Dexie("ClassNotebookDB") as Dexie & {
   subjectModules: EntityTable<SubjectModule, "id">;
   extractedEvents: EntityTable<ExtractedEvent, "id">;
   uploadedDocs: EntityTable<UploadedDocument, "id">;
+  observations: EntityTable<Observation, "id">;
+  classGroups: EntityTable<ClassGroup, "id">;
 };
 
 // Schema declaration
@@ -163,6 +209,18 @@ db.version(13).stores({
   subjectModules: "++id, subjectId, order",
   extractedEvents: "++id, courseId, title, sourceDocId, startDate",
   uploadedDocs: "++id, name",
+});
+// v14: observaciones del boletín (offline-first, espejo de la colección
+// Firestore `observations`).
+db.version(14).stores({
+  observations: "++id, userId, studentId, subjectId, period",
+});
+// v15: Aula/Grupo multiasignatura (espejo local de `classGroups`). Migración
+// ADITIVA e idempotente: solo añade una tabla nueva; NO toca subjects ni
+// ningún dato existente (subjects.groupId es opcional y no requiere índice:
+// las materias de un aula se resuelven en memoria sobre ≤500 docs).
+db.version(15).stores({
+  classGroups: "++id, firestoreId, userId",
 });
 
 export { db };

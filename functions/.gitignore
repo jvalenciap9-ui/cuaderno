@@ -1,0 +1,28 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Secretos / config sensible — nunca commitear
+firebase-applet-config.json
+firebase-applet-config.rar
+gemini_key.txt
+.firebase/
+firebase functions.json
+*firebase init functions.js
+firebase-applet-config.json.*
+# Firebase service account
+functions/serviceAccountKey.json
+serviceAccountKey.json
+.secret.local
+
+# Archivos temporales y de herramientas
+.agents/*.txt
+tour_ids.csv
+"Ediagil Notes/"
+Ediagil Notes/
+

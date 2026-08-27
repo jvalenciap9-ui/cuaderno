@@ -26,6 +26,7 @@ const accounts = [
   ['school-teacher', 'school-teacher@test.local'],
   ['other-teacher', 'other-teacher@test.local'],
   ['normal-teacher', 'normal-teacher@test.local'],
+  ['key-user', 'key-user@test.local'],
 ];
 
 const created = {};
@@ -80,9 +81,23 @@ const userDocs = {
     institutionId: 'inst-2', institutionName: 'Otra Escuela',
     lastLoginAt: NOW, updatedAt: NOW,
   },
-  [created['normal-teacher'].uid]: {
+[created['normal-teacher'].uid]: {
     plan: 'free', email: 'normal-teacher@test.local', createdAt: NOW,
     aiCallsThisMonth: 0, aiCallsResetAt: NOW, updatedAt: NOW,
+  },
+  [created['key-user'].uid]: {
+    plan: 'free', email: 'key-user@test.local', createdAt: NOW,
+    aiCallsThisMonth: 0, aiCallsResetAt: NOW, updatedAt: NOW,
+  },
+};
+
+// Institución real del emulador (redeemLicenseKey valida que exista)
+const institutionDocs = {
+  'inst-1': {
+    name: 'Colegio Prueba',
+    adminId: created['school-admin'].uid,
+    createdAt: NOW,
+    subscription: { plan: 'school', docentes: 30, expiresAt: NOW + 365 * DAY },
   },
 };
 
@@ -91,7 +106,11 @@ const licenseKeys = {
   'SCH-TEST-0001': { plan: 'school', used: false, createdAt: NOW },
   'SCH-ADMIN-0001': { plan: 'school_admin', institutionId: 'inst-1', institutionName: 'Colegio Prueba', used: false, createdAt: NOW },
   'SCH-TEACH-0001': { plan: 'school_teacher', institutionId: 'inst-1', institutionName: 'Colegio Prueba', used: false, createdAt: NOW },
+  'SCH-TEACH-0002': { plan: 'school_teacher', institutionId: 'inst-1', institutionName: 'Colegio Prueba', used: false, createdAt: NOW },
   'PRO-USED-0001': { plan: 'pro', used: true, usedBy: 'someone', usedAt: NOW, createdAt: NOW },
+  // Casos de validación de institución (redeemLicenseKey):
+  'SCH-ADMIN-GHOST-0001': { plan: 'school_admin', institutionId: 'inst-fantasma', used: false, createdAt: NOW },
+  'SCH-ADMIN-NOINST-0001': { plan: 'school_admin', used: false, createdAt: NOW },
 };
 
 console.log(`\n🔑 Webhook secret para pruebas: ${WEBHOOK_SECRET}`);
@@ -106,10 +125,13 @@ await testEnv.withSecurityRulesDisabled(async (ctx) => {
   for (const [uid, doc] of Object.entries(userDocs)) {
     await db.collection('users').doc(uid).set(doc);
   }
+  for (const [id, doc] of Object.entries(institutionDocs)) {
+    await db.collection('institutions').doc(id).set(doc);
+  }
   for (const [key, doc] of Object.entries(licenseKeys)) {
     await db.collection('licenseKeys').doc(key).set(doc);
   }
-  console.log(`💾 ${Object.keys(userDocs).length} users + ${Object.keys(licenseKeys).length} licencias sembradas`);
+  console.log(`💾 ${Object.keys(userDocs).length} users + ${Object.keys(institutionDocs).length} instituciones + ${Object.keys(licenseKeys).length} licencias sembradas`);
 });
 
 await testEnv.cleanup();

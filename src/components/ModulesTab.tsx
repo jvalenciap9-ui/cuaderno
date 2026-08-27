@@ -6,6 +6,7 @@ import { db } from "../lib/firebase";
 import { useAuth } from "./AuthProvider";
 import { handleFirestoreError, OperationType } from "../lib/firestoreUtils";
 import { toast } from '../hooks/useToast';
+import { usePlan } from '../hooks/usePlan';
 import {
   Plus,
   Trash2,
@@ -22,7 +23,9 @@ import {
   Video,
   FileQuestion,
 } from "lucide-react";
-import type { NoteDoc, SubjectModuleDoc } from "../types/firestore";
+import * as XLSX from 'xlsx';
+import type { NoteDoc, SubjectModuleDoc, SubjectDoc } from "../types/firestore";
+import { MateriaSelector } from "./MateriaSelector";
 import { cn, parseLocalDate } from "../lib/utils";
 import { format, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
@@ -35,14 +38,21 @@ interface ModulesTabProps {
   subjectId: string;
   onOpenNoteModal: (moduleId?: string, note?: NoteDoc | null) => void;
   onDeleteNote: (id: string) => void;
+  /** Materias hermanas del aula (≥2 activa el selector de materia). */
+  aulaMaterias?: SubjectDoc[];
+  /** Solicita a App cambiar de materia dentro del mismo aula. */
+  onSelectMateria?: (materiaId: string) => void;
 }
 
 export function ModulesTab({
   subjectId,
   onOpenNoteModal,
   onDeleteNote,
+  aulaMaterias,
+  onSelectMateria,
 }: ModulesTabProps) {
   const { user } = useAuth();
+  const { isPro, isAdmin } = usePlan();
   
   const subjectRef = doc(db, 'subjects', subjectId);
   const [subject] = useDocumentData(subjectRef);
@@ -464,6 +474,10 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
   const [isConfirmingGeneratePlan, setIsConfirmingGeneratePlan] = React.useState(false);
 
   const handleGeneratePlanModules = async () => {
+    if (!isPro && !isAdmin) {
+      toast.warning('El Syllabus Automático es una función exclusiva de Premium Pro.');
+      return;
+    }
     if (!subject) return;
     setIsConfirmingGeneratePlan(true);
   };
@@ -795,6 +809,17 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
 
   return (
     <div className="space-y-8">
+      {/* ── Selector de materia del Aula/Grupo (solo aulas reales ≥2 materias).
+          La planificación y los apuntes son POR MATERIA; el cambio es
+          inmediato porque notas/módulos/materiales se guardan al momento. */}
+      {aulaMaterias && aulaMaterias.length >= 2 && onSelectMateria && (
+        <MateriaSelector
+          currentSubject={{ id: subjectId } as SubjectDoc}
+          materias={aulaMaterias}
+          onSwitch={(id) => { if (String(id) !== String(subjectId)) onSelectMateria(String(id)); }}
+          hint="Planificación y apuntes por materia"
+        />
+      )}
       {/* Confirmation Modal for Modules */}
       {moduleToDelete !== null && (
         <div className="fixed inset-0 bg-neutral-900/40 backdrop-blur-md z-50 flex items-center justify-center p-4">
@@ -879,6 +904,29 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
         </div>
 
         <div className="flex items-center gap-4 flex-wrap">
+          {modules.length > 0 && (
+            <button
+              onClick={() => {
+                const data = modules.map((m, idx) => ({
+                  'N°': idx + 1,
+                  Módulo: m.title,
+                  'Descripción': m.description || '—',
+                  'Módulo Padre': m.parentId ? (modules.find(p => p.id === m.parentId)?.title || '—') : '—',
+                  'Fecha Inicio': m.startDate || '—',
+                  'Fecha Fin': m.endDate || '—',
+                }));
+                const ws = XLSX.utils.json_to_sheet(data);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, 'Módulos');
+                XLSX.writeFile(wb, `modulos_${new Date().toISOString().split('T')[0]}.xlsx`);
+              }}
+              className="flex items-center gap-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-6 py-4 rounded-2xl text-sm font-black transition-all shadow-sm active:scale-95 uppercase tracking-widest"
+              title="Exportar la lista de módulos a Excel"
+            >
+              <Download className="w-5 h-5" />
+              Exportar
+            </button>
+          )}
           {modules.length === 0 && (
             <button
               onClick={handleGeneratePlanModules}

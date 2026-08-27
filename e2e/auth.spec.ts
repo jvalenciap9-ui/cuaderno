@@ -20,6 +20,8 @@ async function signupOrLogin(page: Page, email: string, password: string) {
     .then(() => true)
     .catch(() => false);
   if (!ok) {
+    // email ya existe: pasar a modo login y autenticar con las mismas credenciales
+    await page.locator('#login-toggle').click();
     await page.locator('input[placeholder="Email"]').fill(email);
     await page.locator('input[placeholder="Contraseña (mín. 6 caracteres)"]').fill(password);
     await page.locator('#login-button').click();
@@ -122,6 +124,7 @@ test.describe('Fase 1 — Auth y Login', () => {
     const popupPromise = page.waitForEvent('popup', { timeout: 30_000 });
     await page.locator('#google-login-button').click();
     const popup = await popupPromise;
+    await popup.waitForURL('**accounts.google.com**', { timeout: 30_000 });
     expect(popup.url()).toContain('accounts.google.com');
     await popup.close();
   });
