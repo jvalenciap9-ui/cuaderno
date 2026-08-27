@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "ediagil-new-2026"
+    "default": "ediagil-new-2026",
+    "production": "ediagil-new-2026",
+    "staging": "ediagil-rc1-staging"
   }
 }

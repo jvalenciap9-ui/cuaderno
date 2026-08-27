@@ -1692,6 +1692,13 @@ function CuadernoApp() {
           Guía de uso
         </span>
       </button>
+
+      {/* Identificación visual permanente en entorno Staging / RC1 */}
+      {import.meta.env.VITE_SHOW_RC1_BADGE === 'true' && (
+        <div className="fixed bottom-3 right-3 z-[100] bg-amber-500 text-slate-950 font-black text-[11px] uppercase tracking-wider px-3 py-1.5 rounded-full shadow-lg border border-amber-300 pointer-events-none select-none">
+          ENTORNO RC1 — DATOS DE PRUEBA
+        </div>
+      )}
     </div>
   );
 }
