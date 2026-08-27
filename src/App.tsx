@@ -28,6 +28,7 @@ import {
   Upload,
   ArrowLeft,
   Users,
+  Sparkles,
 } from "lucide-react";
 import {
   exportSubjectToJSON,
@@ -370,7 +371,7 @@ function LoginScreen({ onBack }: { onBack: () => void }) {
 
 function CuadernoApp() {
   const { user, logOut } = useAuth();
-  const { plan: dbPlan, loading: loadingPlan, isAdmin, profile } = usePlan();
+  const { plan: dbPlan, loading: loadingPlan, isAdmin, isPro, profile } = usePlan();
   // Personalización institucional (Módulo 5): nombre, logo y color primario
   // del admin, reflejados para TODOS los docentes de la institución.
   const institution = useInstitution();
@@ -1284,6 +1285,24 @@ function CuadernoApp() {
         ) : selectedSubject ? (
           <div className="flex-1 overflow-y-auto custom-scrollbar">
             <div className="max-w-5xl mx-auto p-8 md:p-12">
+              {/* Aviso Pro para Aulas Multiasignatura en cuentas Free */}
+              {selectedSubject.groupId && !isPro && (
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-center justify-between gap-4 mb-8">
+                  <div className="flex items-center gap-3">
+                    <Sparkles className="w-5 h-5 text-amber-500 shrink-0" />
+                    <p className="text-xs font-bold text-amber-900 leading-snug">
+                      Esta Aula Multiasignatura pertenece a Premium Pro. Reactiva tu plan para continuar editando.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setIsSettingsModalOpen(true)}
+                    className="bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider shrink-0 transition-colors"
+                  >
+                    Ver Premium Pro
+                  </button>
+                </div>
+              )}
+
               {/* Subject Header */}
               <div className="mb-12">
                 <div className="flex flex-col md:flex-row md:items-start justify-between gap-8 mb-10">

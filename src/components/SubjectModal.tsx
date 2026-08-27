@@ -11,6 +11,7 @@ import { NIVEL_LABEL, TURNO_LABEL } from '../lib/dashboardFilters';
 import { REGLA_PLAN_LABEL, type ReglaPlan } from '../lib/adminApi';
 import { useInstitution } from '../hooks/useInstitution';
 import { useAuth } from './AuthProvider';
+import { usePlan } from '../hooks/usePlan';
 import { collection, doc, updateDoc, writeBatch, query, where, getDocs, deleteDoc, limit } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { addSubjectCounterOp } from '../lib/subjectCounter';
@@ -67,6 +68,7 @@ export function SubjectModal({
   onCreated,
 }: SubjectModalProps) {
   const { user } = useAuth();
+  const { isPro } = usePlan();
   const { periodos, planRules } = useInstitution();
   
   // ── Campos comunes / legacy ──
@@ -439,7 +441,7 @@ export function SubjectModal({
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       {([
                         { id: 'una', title: 'Una materia', desc: 'Docente especialista (un grupo por materia)' },
-                        { id: 'varias', title: 'Varias materias', desc: 'Docente de aula (mismos participantes)' },
+                        { id: 'varias', title: 'Varias materias', desc: 'Docente de aula (mismos participantes)', proBadge: true },
                       ] as const).map((opt) => (
                         <button
                           key={opt.id}
@@ -451,12 +453,55 @@ export function SubjectModal({
                             ? 'border-indigo-500 bg-indigo-50/60 ring-2 ring-indigo-500/20'
                             : 'border-neutral-200 bg-neutral-50 hover:bg-white hover:border-indigo-200'}`}
                         >
-                          <span className="block text-xs font-black text-neutral-900">{opt.title}</span>
+                          <div className="flex items-center justify-between">
+                            <span className="block text-xs font-black text-neutral-900">{opt.title}</span>
+                            {'proBadge' in opt && (
+                              <span className="bg-amber-100 text-amber-800 text-[9px] font-black uppercase px-2 py-0.5 rounded-full border border-amber-200">
+                                PRO
+                              </span>
+                            )}
+                          </div>
                           <span className="block text-xs font-medium text-neutral-500 mt-0.5 leading-snug">{opt.desc}</span>
                         </button>
                       ))}
                     </div>
                   </div>
+
+                  {/* Upsell para plan Gratis si selecciona Varias materias */}
+                  {modality === 'varias' && !isPro && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-start gap-3">
+                        <Sparkles className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="text-xs font-black text-amber-900">
+                            Aula Multiasignatura · Función Premium Pro
+                          </p>
+                          <p className="text-xs text-amber-800 font-medium mt-1 leading-relaxed">
+                            Organiza varias materias dentro de una misma aula, comparte participantes y asistencia, y mantén las calificaciones separadas. Disponible con Premium Pro.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-end gap-3 pt-2">
+                        <button
+                          type="button"
+                          onClick={() => setModality('una')}
+                          className="px-4 py-2 rounded-xl text-xs font-bold text-neutral-500 hover:text-neutral-900 transition-colors"
+                        >
+                          Ahora no
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            showToast('info', 'Abre Configuración para conocer las ventajas de Premium Pro.');
+                          }}
+                          className="bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-colors shadow-md shadow-amber-500/20"
+                        >
+                          Ver Premium Pro
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Configuración de Grado y Sección con vista previa unificada */}
                   {modality === 'varias' && (
