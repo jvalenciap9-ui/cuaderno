@@ -9,7 +9,9 @@ import { Plus, Trash2, ChevronLeft, BarChart3, UserCheck, UserX, Info, Edit3, Do
 import { safeJSONParse, cn, parseLocalDate } from '../lib/utils';
 import { GradesSummary } from './GradesSummary';
 import { STORAGE_KEYS, getStorageItem } from '../lib/storageKeys';
-import { parseWeights, calculateStudentGrades, type ViewMode, type CalculationMode } from '../lib/gradeCalculator';
+import { parseWeights, calculateStudentGrades, formatDisplayGrade, type ViewMode, type CalculationMode } from '../lib/gradeCalculator';
+import { useGradeSettings } from '../contexts/GradeSettingsContext';
+import { weightedBreakdown } from '../lib/gradingUtils';
 import { executeBatchChunked, createSetOp } from '../lib/batchUtils';
 
 import { ModuleSummaryModal } from './ModuleSummaryModal';
@@ -36,6 +38,7 @@ interface GradesTabProps {
 export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTabProps) {
   const { user } = useAuth();
   const { isPro, isAdmin } = usePlan();
+  const { gradingScale, weights, viewMode, calculationMode, useCheckpoint } = useGradeSettings();
   const [isAddingEval, setIsAddingEval] = useState(false);
   const [editingEvalId, setEditingEvalId] = useState<string | null>(null);
   const [evalTitle, setEvalTitle] = useState('');
@@ -54,6 +57,7 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
   const [localScores, setLocalScores] = useState<Record<string, string>>({});
   const [savingGrades, setSavingGrades] = useState(false);
   const [consolidatedScores, setConsolidatedScores] = useState<Record<string, Record<string, string>>>({});
+  const [pendingEdits, setPendingEdits] = useState<Record<string, { studentId: string; evaluationId: string; subjectId: string; scoreStr: string; maxScore: number }>>({});
 
   // ── Aula/Grupo: los ESTUDIANTES viven en la asignatura canónica del aula
   // (lista compartida); evaluaciones y calificaciones siguen siendo de ESTA
@@ -338,38 +342,73 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
 
   const handleScoreChange = (studentId: string, scoreStr: string) => {
     if (!selectedEvalId || !user) return;
+    const evaluation = (evaluations || []).find(e => e.id === selectedEvalId);
+    const max = evaluation?.maxScore || 100;
+    const key = `${subjectId}::${selectedEvalId}::${studentId}`;
     setLocalScores(prev => ({ ...prev, [studentId]: scoreStr }));
+    setPendingEdits(prev => {
+      const next = { ...prev };
+      if (!scoreStr.trim()) delete next[key];
+      else next[key] = { studentId, evaluationId: selectedEvalId, subjectId, scoreStr, maxScore: max };
+      return next;
+    });
   };
 
-  const handleSaveGrades = async () => {
-    if (!selectedEvalId || !user) return;
+  const handleGroupScoreChange = (groupId: string, studentId: string, evaluationId: string, scoreStr: string) => {
+    if (!user) return;
+    const ev = (evaluations || []).find(e => e.id === evaluationId);
+    const max = ev?.maxScore || 100;
+    const targetSubId = ev?.subjectId || subjectId;
+    const key = `${targetSubId}::${evaluationId}::${studentId}`;
+    setConsolidatedScores(prev => ({
+      ...prev,
+      [groupId]: { ...(prev[groupId] || {}), [`${studentId}::${evaluationId}`]: scoreStr }
+    }));
+    setPendingEdits(prev => {
+      const next = { ...prev };
+      if (!scoreStr.trim()) delete next[key];
+      else next[key] = { studentId, evaluationId, subjectId: targetSubId, scoreStr, maxScore: max };
+      return next;
+    });
+  };
+
+  const pendingGradesCount = Object.keys(pendingEdits).length;
+  const [pendingSwitchId, setPendingSwitchId] = useState<string | null>(null);
+
+  /** Guarda TODO lo pendiente de forma atómica y explícita. */
+  const flushPendingScores = async (): Promise<boolean> => {
+    const entries = Object.values(pendingEdits);
+    if (entries.length === 0 || !user) {
+      setLocalScores({});
+      setConsolidatedScores({});
+      setPendingEdits({});
+      return true;
+    }
     setSavingGrades(true);
     try {
-      const evaluation = (evaluations || []).find(e => e.id === selectedEvalId);
-      if (!evaluation) return;
-      const max = evaluation.maxScore || 100;
-
       const batch = writeBatch(db);
       let opsCount = 0;
 
-      for (const [studentId, scoreStr] of Object.entries(localScores)) {
-        const normalized = scoreStr.trim().replace(',', '.');
+      for (const edit of entries) {
+        const normalized = edit.scoreStr.trim().replace(',', '.');
         let score = Number(normalized);
         if (isNaN(score)) continue;
-        if (score > max) score = max;
+        if (score > edit.maxScore) score = edit.maxScore;
         if (score < 0) score = 0;
 
-        const existingGrade = (grades || []).find(g => g.studentId === studentId);
+        const existing = (allGrades || []).find(
+          g => g.studentId === edit.studentId && g.evaluationId === edit.evaluationId
+        );
 
-        if (existingGrade) {
-          batch.update(doc(db, 'grades', existingGrade.id!), { score, subjectId });
+        if (existing) {
+          batch.update(doc(db, 'grades', existing.id!), { score, subjectId: edit.subjectId });
         } else {
           batch.set(doc(collection(db, 'grades')), {
             userId: user.uid,
-            subjectId,
-            evaluationId: selectedEvalId,
-            studentId,
-            score
+            subjectId: edit.subjectId,
+            evaluationId: edit.evaluationId,
+            studentId: edit.studentId,
+            score,
           });
         }
         opsCount++;
@@ -378,78 +417,21 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
       if (opsCount > 0) {
         await batch.commit();
       }
+      setPendingEdits({});
       setLocalScores({});
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'grades');
+      setConsolidatedScores({});
+      return true;
+    } catch (err: any) {
+      console.error('Error al guardar calificaciones:', err);
+      showToast('error', 'No se pudieron guardar las calificaciones. Tus cambios se conservaron para reintentar.');
+      return false;
     } finally {
       setSavingGrades(false);
     }
   };
 
-  // ── Aula/Grupo: protección de cambios al cambiar de materia ─────────────
-  // Nunca se descartan notas silenciosamente: si hay celdas sin guardar
-  // (evaluación individual o vista consolidada), el cambio de materia pide
-  // confirmación y puede autoguardar todo primero con el mecanismo actual.
-  const pendingGradesCount =
-    Object.keys(localScores).length +
-    Object.values(consolidatedScores || {}).reduce((n, m) => n + Object.keys(m || {}).length, 0);
-  const [pendingSwitchId, setPendingSwitchId] = useState<string | null>(null);
-
-  /** Guarda TODO lo pendiente (individual + consolidado) en un solo batch. */
-  const flushPendingScores = async (): Promise<boolean> => {
-    if (!user) return false;
-    setSavingGrades(true);
-    try {
-      const batch = writeBatch(db);
-      let ops = 0;
-      if (selectedEvalId) {
-        const evaluation = (evaluations || []).find(e => e.id === selectedEvalId);
-        const max = evaluation?.maxScore || 100;
-        for (const [studentId, scoreStr] of Object.entries(localScores)) {
-          const normalized = scoreStr.trim().replace(',', '.');
-          let score = Number(normalized);
-          if (isNaN(score)) continue;
-          if (score > max) score = max;
-          if (score < 0) score = 0;
-          const existingGrade = (grades || []).find(g => g.studentId === studentId);
-          if (existingGrade) {
-            batch.update(doc(db, 'grades', existingGrade.id!), { score, subjectId });
-          } else {
-            batch.set(doc(collection(db, 'grades')), { userId: user.uid, subjectId, evaluationId: selectedEvalId, studentId, score });
-          }
-          ops++;
-        }
-      }
-      for (const groupMap of Object.values(consolidatedScores || {})) {
-        for (const [key, scoreStr] of Object.entries(groupMap || {})) {
-          const [studentId, evaluationId] = key.split('::');
-          const ev = (evaluations || []).find(e => e.id === evaluationId);
-          if (!ev) continue;
-          const max = ev.maxScore || 100;
-          const normalized = scoreStr.trim().replace(',', '.');
-          let score = Number(normalized);
-          if (isNaN(score)) continue;
-          if (score > max) score = max;
-          if (score < 0) score = 0;
-          const existing = (allGrades || []).find(g => g.studentId === studentId && g.evaluationId === evaluationId);
-          if (existing) {
-            batch.update(doc(db, 'grades', existing.id!), { score, subjectId });
-          } else {
-            batch.set(doc(collection(db, 'grades')), { userId: user.uid, subjectId, evaluationId, studentId, score });
-          }
-          ops++;
-        }
-      }
-      if (ops > 0) await batch.commit();
-      setLocalScores({});
-      setConsolidatedScores({});
-      return true;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'grades');
-      return false;
-    } finally {
-      setSavingGrades(false);
-    }
+  const handleSaveGrades = async () => {
+    await flushPendingScores();
   };
 
   const handleMateriaSwitchRequest = (materiaId: string) => {
@@ -470,25 +452,14 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
   };
 
   const discardAndSwitch = () => {
+    setPendingEdits({});
     setLocalScores({});
     setConsolidatedScores({});
-    if (pendingSwitchId && onSelectMateria) onSelectMateria(pendingSwitchId);
+    if (pendingSwitchId && onSelectMateria) {
+      onSelectMateria(pendingSwitchId);
+    }
     setPendingSwitchId(null);
   };
-
-  const [weights, setWeights] = useState(() => parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS)));
-  const [viewMode, setViewMode] = useState<ViewMode>(() => (getStorageItem(STORAGE_KEYS.GRADING_VIEW_MODE) as ViewMode) || 'categories');
-  const [calculationMode, setCalculationMode] = useState<CalculationMode>(() => (getStorageItem(STORAGE_KEYS.GRADING_CALCULATION_MODE) as CalculationMode) || 'average');
-  
-  React.useEffect(() => {
-    const handleStorage = () => {
-      setWeights(parseWeights(getStorageItem(STORAGE_KEYS.GRADING_WEIGHTS)));
-      setViewMode((getStorageItem(STORAGE_KEYS.GRADING_VIEW_MODE) as ViewMode) || 'categories');
-      setCalculationMode((getStorageItem(STORAGE_KEYS.GRADING_CALCULATION_MODE) as CalculationMode) || 'average');
-    };
-    window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
-  }, []);
 
   const calculateFinalGrade = (studentId: string) => {
     const studentGrades = allGrades.filter(g => g.studentId === studentId);
@@ -817,6 +788,10 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                       const grade = (grades || []).find(g => g.studentId === student.id);
                       const isObsOpen = openObsStudentId === student.id;
                       const draft = obsDrafts[student.id] || { general: '', subject: '' };
+                      const scoreValStr = localScores[student.id] ?? (grade?.score !== undefined ? String(grade.score) : '');
+                      const numericScore = scoreValStr !== '' ? Number(scoreValStr) : undefined;
+                      const fmt = formatDisplayGrade(numericScore, evaluation.maxScore, gradingScale);
+
                       return (
                         <React.Fragment key={student.id}>
                         <tr className="hover:bg-neutral-50/50 transition-all group duration-300">
@@ -838,7 +813,7 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                                   }}
                                   className={cn(
                                     "w-32 bg-neutral-50 border rounded-2xl px-5 py-4 outline-none focus:ring-4 transition-all font-black text-lg text-center",
-                                    grade && (grade.score / (evaluation.maxScore || 100) * 100) < 71 
+                                    typeof numericScore === 'number' && !fmt.isPassing 
                                       ? "border-red-200 text-red-600 focus:border-red-500 focus:ring-red-500/5" 
                                       : "border-neutral-200 text-neutral-900 focus:border-indigo-500 focus:ring-indigo-500/5"
                                   )} 
@@ -847,11 +822,13 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                               <span className="text-neutral-300 font-black text-lg">/ {evaluation.maxScore || 100}</span>
                               <span className={cn(
                                 "text-[10px] font-black px-3 py-1.5 rounded-lg border uppercase tracking-widest shadow-sm",
-                                (grade?.score || 0) / (evaluation.maxScore || 100) * 100 >= 71
+                                typeof numericScore === 'number' && fmt.isPassing
                                   ? "bg-emerald-50 text-emerald-600 border-emerald-100"
-                                  : "bg-red-50 text-red-600 border-red-100"
+                                  : typeof numericScore === 'number'
+                                    ? "bg-red-50 text-red-600 border-red-100"
+                                    : "bg-neutral-50 text-neutral-400 border-neutral-100"
                               )}>
-                                {((grade?.score || 0) / (evaluation.maxScore || 100) * 100).toFixed(0)}%
+                                {fmt.displayValue}{gradingScale.type === 'porcentaje' ? '%' : ''}
                               </span>
                             </div>
                           </td>
@@ -990,7 +967,7 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                           </div>
                           <div className="text-left">
                             <h4 className="text-lg font-black text-neutral-900">
-                              {group.parentModule ? group.parentModule.title : 'Otras Evaluaciones'}
+                              {group.parentModule ? group.parentModule.title : 'Evaluaciones'}
                             </h4>
                             {group.parentModule && (group.parentModule.startDate || group.parentModule.endDate) && (
                               <p className="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mt-1">
@@ -1017,43 +994,8 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                         const groupScores = consolidatedScores[groupId] || {};
                         const hasChanges = Object.keys(groupScores).length > 0;
 
-                        const handleGroupScoreChange = (studentId: string, evaluationId: string, value: string) => {
-                          setConsolidatedScores(prev => ({
-                            ...prev,
-                            [groupId]: { ...(prev[groupId] || {}), [`${studentId}::${evaluationId}`]: value }
-                          }));
-                        };
-
                         const handleSaveGroupGrades = async () => {
-                          if (!user) return;
-                          setSavingGrades(true);
-                          try {
-                            const batch = writeBatch(db);
-                            let opsCount = 0;
-                            for (const [key, scoreStr] of Object.entries(groupScores)) {
-                              const [studentId, evaluationId] = key.split('::');
-                              const ev = allGroupEvals.find(e => e.id === evaluationId);
-                              if (!ev) continue;
-                              const max = ev.maxScore || 100;
-                              const normalized = scoreStr.trim().replace(',', '.');
-                              let score = Number(normalized);
-                              if (isNaN(score)) continue;
-                              if (score > max) score = max;
-                              if (score < 0) score = 0;
-
-                              const existing = allGrades.find(g => g.studentId === studentId && g.evaluationId === evaluationId);
-                              if (existing) {
-                                batch.update(doc(db, 'grades', existing.id!), { score, subjectId });
-                              } else {
-                                batch.set(doc(collection(db, 'grades')), {
-                                  userId: user.uid, subjectId, evaluationId, studentId, score
-                                });
-                              }
-                              opsCount++;
-                            }
-                            if (opsCount > 0) await batch.commit();
-                            setConsolidatedScores(prev => ({ ...prev, [groupId]: {} }));
-                          } finally { setSavingGrades(false); }
+                          await flushPendingScores();
                         };
 
                         return (
@@ -1088,14 +1030,17 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                                 <tbody className="divide-y divide-neutral-100">
                                   {students.map(student => {
                                     const studentGrades = allGrades.filter(g => g.studentId === student.id);
-                                    let sumPct = 0; let count = 0;
-                                    const finalPct = allGroupEvals.reduce((acc, ev) => {
-                                      const grade = studentGrades.find(g => g.evaluationId === ev.id);
-                                      const score = grade?.score;
-                                      if (typeof score === 'number') { acc += score / (ev.maxScore || 100); count++; }
-                                      return acc;
-                                    }, 0);
-                                    const avg = count > 0 ? ((finalPct / count) * 100).toFixed(1) : '-';
+                                    const evalInputs = allGroupEvals.map(ev => {
+                                      const scoreKey = `${student.id}::${ev.id}`;
+                                      const overrideVal = groupScores[scoreKey];
+                                      const existing = studentGrades.find(g => g.evaluationId === ev.id);
+                                      const score = overrideVal !== undefined && overrideVal !== '' ? Number(overrideVal) : existing?.score;
+                                      return { type: ev.type, scorePct: typeof score === 'number' ? (score / (ev.maxScore || 100)) * 100 : null };
+                                    });
+                                    const breakdown = weightedBreakdown(evalInputs, { weights: { teoria: weights.teorica.value, practica: weights.practica.value, apreciativa: weights.apreciativa.value } } as any);
+                                    const rawAvg = breakdown.final !== null ? (breakdown.final / 100) * (gradingScale.maxScore || 100) : null;
+                                    const fmtAvg = formatDisplayGrade(rawAvg, gradingScale.maxScore || 100, gradingScale);
+
                                     return (
                                       <tr key={student.id} className="hover:bg-white/80 transition-all group">
                                         <td className="px-4 py-3 sticky left-0 bg-neutral-50/30 z-[5]">
@@ -1107,13 +1052,16 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                                           const overrideVal = groupScores[scoreKey];
                                           const existing = studentGrades.find(g => g.evaluationId === ev.id);
                                           const displayVal = overrideVal ?? existing?.score ?? '';
+                                          const numVal = overrideVal !== undefined && overrideVal !== '' ? Number(overrideVal) : existing?.score;
+                                          const fmtCell = formatDisplayGrade(numVal, ev.maxScore, gradingScale);
+
                                           return (
                                             <td key={ev.id} className="px-3 py-3 text-center">
                                               <input type="number" step="0.1" min="0" max={ev.maxScore || 100}
                                                 value={displayVal}
-                                                onChange={e => handleGroupScoreChange(student.id!, ev.id!, e.target.value)}
+                                                onChange={e => handleGroupScoreChange(groupId, student.id!, ev.id!, e.target.value)}
                                                 className={cn("w-20 bg-white border rounded-xl px-3 py-2 text-center font-black text-sm outline-none focus:ring-4 transition-all",
-                                                  existing && (existing.score / (ev.maxScore || 100)) < 0.71
+                                                  typeof numVal === 'number' && !fmtCell.isPassing
                                                     ? "border-red-200 text-red-600 focus:border-red-500 focus:ring-red-500/5"
                                                     : "border-neutral-200 text-neutral-900 focus:border-indigo-500 focus:ring-indigo-500/5")} />
                                             </td>
@@ -1121,7 +1069,9 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                                         })}
                                         <td className="px-4 py-3 text-center">
                                           <span className={cn("text-sm font-black px-3 py-1 rounded-lg",
-                                            Number(avg) >= 71 ? "text-emerald-600 bg-emerald-50" : "text-red-600 bg-red-50")}>{avg}</span>
+                                            fmtAvg.isPassing ? "text-emerald-600 bg-emerald-50" : "text-red-600 bg-red-50")}>
+                                            {fmtAvg.displayValue}{gradingScale.type === 'porcentaje' ? '%' : ''}
+                                          </span>
                                         </td>
                                       </tr>
                                     );

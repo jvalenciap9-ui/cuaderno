@@ -10,9 +10,14 @@ export interface GradingWeights {
   checkpoint: { name: string; value: number };
 }
 
+export type GradeScaleType = 'porcentaje' | 'numerica_1_5' | 'personalizada';
+
 export interface GradingScale {
+  type?: GradeScaleType;
   maxScore: number;
   minPassingScore: number;
+  minScore?: number;
+  decimals?: number;
 }
 
 export const DEFAULT_WEIGHTS: GradingWeights = {
@@ -23,9 +28,69 @@ export const DEFAULT_WEIGHTS: GradingWeights = {
 };
 
 export const DEFAULT_SCALE: GradingScale = {
+  type: 'porcentaje',
   maxScore: 100,
-  minPassingScore: 71
+  minPassingScore: 71,
+  minScore: 0,
+  decimals: 1,
 };
+
+export const DEFAULT_NUMERICA_SCALE: GradingScale = {
+  type: 'numerica_1_5',
+  maxScore: 5,
+  minPassingScore: 3.0,
+  minScore: 1.0,
+  decimals: 1,
+};
+
+export interface FormattedGradeResult {
+  displayValue: string;
+  numericValue: number | null;
+  isPassing: boolean;
+}
+
+/**
+ * Función canónica para formatear y calcular notas según la escala activa
+ * (porcentual 0-100 o numérica 1-5).
+ */
+export function formatDisplayGrade(
+  score: number | null | undefined,
+  maxScore: number | null | undefined,
+  scale: GradingScale
+): FormattedGradeResult {
+  if (typeof score !== 'number' || !Number.isFinite(score) || score < 0) {
+    return { displayValue: '—', numericValue: null, isPassing: true };
+  }
+
+  const evalMax = typeof maxScore === 'number' && maxScore > 0 ? maxScore : 100;
+  const ratio = Math.min(1, Math.max(0, score / evalMax)); // 0.0 a 1.0
+
+  const decimals = typeof scale.decimals === 'number' ? scale.decimals : 1;
+  const scaleType = scale.type || (scale.maxScore <= 5 ? 'numerica_1_5' : 'porcentaje');
+
+  let numericValue: number;
+  if (scaleType === 'numerica_1_5') {
+    const min = typeof scale.minScore === 'number' ? scale.minScore : 1.0;
+    const max = scale.maxScore || 5.0;
+    numericValue = min + ratio * (max - min);
+  } else {
+    const max = scale.maxScore || 100;
+    numericValue = ratio * max;
+  }
+
+  const factor = Math.pow(10, decimals);
+  numericValue = Math.round(numericValue * factor) / factor;
+
+  const defaultMinPassing = scaleType === 'numerica_1_5' ? 3.0 : 70.0;
+  const minPassing = typeof scale.minPassingScore === 'number' ? scale.minPassingScore : defaultMinPassing;
+  const isPassing = numericValue >= minPassing;
+
+  return {
+    displayValue: numericValue.toFixed(decimals),
+    numericValue,
+    isPassing,
+  };
+}
 
 /**
  * Parsea las ponderaciones guardadas en base de datos local o devuelve las por defecto.
@@ -91,12 +156,24 @@ export function calculateWeightedAverage(
         const max = ev.maxScore || 100;
         sumPct += (score / max);
       });
-      const avg = sumPct / activeEvals.length;
-      weightedSum += avg * cat.weight;
+      const avgRatio = sumPct / activeEvals.length;
+      weightedSum += avgRatio * cat.weight;
     }
   });
 
-  return totalWeightUsed > 0 ? (weightedSum / totalWeightUsed) * (gradingScale.maxScore || 100) : 0;
+  if (totalWeightUsed === 0) return 0;
+
+  const ratio = weightedSum / totalWeightUsed;
+  const scaleType = gradingScale.type || (gradingScale.maxScore <= 5 ? 'numerica_1_5' : 'porcentaje');
+
+  if (scaleType === 'numerica_1_5') {
+    const min = typeof gradingScale.minScore === 'number' ? gradingScale.minScore : 1.0;
+    const max = gradingScale.maxScore || 5.0;
+    return Math.round((min + ratio * (max - min)) * 10) / 10;
+  } else {
+    const max = gradingScale.maxScore || 100;
+    return Math.round((ratio * max) * 10) / 10;
+  }
 }
 
 /**

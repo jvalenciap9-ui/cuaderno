@@ -1298,22 +1298,20 @@ function CuadernoApp() {
                       </h2>
                     </div>
                     <div className="flex flex-wrap items-center gap-4 text-sm text-neutral-500 mt-6">
-                      {/* Chip del Aula/Grupo (solo materias agrupadas): nombre
-                          del aula + grado y sección. */}
-                      {selectedGroup && (
-                        <div className="flex items-center gap-2.5 bg-[#F0F7F4] px-4 py-2 rounded-xl border border-[#1A3C40]/10 shadow-sm">
-                          <Users className="w-4 h-4 text-[#1A3C40]" />
-                          <span className="font-bold text-[#1A3C40] text-xs">
-                            {selectedGroup.name}
-                            {(selectedGroup.grado || selectedGroup.seccion) && (
-                              <span className="text-neutral-500 font-bold">
-                                {' · '}
-                                {[selectedGroup.grado, selectedGroup.seccion].filter(Boolean).join(' ')}
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                      )}
+                      {/* Chip del Aula/Grupo (solo materias agrupadas): no repite III B · III B */}
+                      {selectedGroup && (() => {
+                        const name = (selectedGroup.name || '').trim();
+                        const gs = [selectedGroup.grado, selectedGroup.seccion].map(s => (s || '').trim()).filter(Boolean).join(' ');
+                        const displayLabel = !gs ? name || 'Aula Multiasignatura' : (!name || name.toLowerCase() === gs.toLowerCase()) ? gs : `${name} · ${gs}`;
+                        return (
+                          <div className="flex items-center gap-2.5 bg-[#F0F7F4] px-4 py-2 rounded-xl border border-[#1A3C40]/10 shadow-sm">
+                            <Users className="w-4 h-4 text-[#1A3C40]" />
+                            <span className="font-bold text-[#1A3C40] text-xs">
+                              {displayLabel}
+                            </span>
+                          </div>
+                        );
+                      })()}
                       {selectedSubject.plan &&
                         selectedSubject.plan !== "otro" && (
                           <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-[var(--institution-primary)]/40 transition-colors">

@@ -117,7 +117,9 @@ export function usePlan() {
     && !paidUser
     && typeof profile.trialEndsAt === 'number'
     && profile.trialEndsAt <= now;
-  const plan: PlanType = trialExpired ? 'free' : rawPlan;
+  // En entorno Staging (RC1), las cuentas autenticadas reciben entitlement Pro para pruebas QA
+  const isStaging = import.meta.env.VITE_SHOW_RC1_BADGE === 'true' || import.meta.env.VITE_ENVIRONMENT === 'staging';
+  const plan: PlanType = isStaging ? 'pro' : (trialExpired ? 'free' : rawPlan);
   const limits = PLAN_LIMITS[plan];
   const isAdmin = profile?.role === 'admin';
 
