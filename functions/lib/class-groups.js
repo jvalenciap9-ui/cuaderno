@@ -39,6 +39,7 @@ const SUGERENCIAS_MATERIAS = {
 
 const MIN_MATERIAS_AULA = 2;
 const MAX_MATERIAS_AULA = 20;
+const MAX_PLAN_DRAFT_CHARS = 500_000;
 
 /** Normaliza un nombre: recorta y colapsa espacios internos. */
 function normalizeName(s) {
@@ -335,7 +336,7 @@ function lastMateriaStorageKey(groupId) {
  * ausente se mueve a `unclassified` ("Pendiente de clasificar"). NUNCA se
  * asigna automáticamente a Español u otra materia por defecto.
  */
-function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, validSubjects) {
+function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, validSubjects, defaultMaxScore = 100) {
   const validMap = new Map();
   (Array.isArray(validSubjects) ? validSubjects : []).forEach((s) => {
     if (s && s.id) validMap.set(String(s.id), String(s.name || s.id));
@@ -374,10 +375,15 @@ function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, val
 
     if (subId && validMap.has(subId)) {
       matchedSubjects.add(validMap.get(subId));
-      const maxScore = typeof e.maxScore === 'number' && e.maxScore > 0 ? e.maxScore : Number(e.maxScore) || 100;
+      const configuredMaxScore = Number(defaultMaxScore) > 0 ? Number(defaultMaxScore) : 100;
+      const rawMaxScore = Number(e.maxScore);
+      const hasValidRawMaxScore = Number.isFinite(rawMaxScore) && rawMaxScore > 0;
+      const maxScore = configuredMaxScore !== 100
+        ? configuredMaxScore
+        : (hasValidRawMaxScore ? rawMaxScore : configuredMaxScore);
       const date = typeof e.date === 'string' && e.date.trim() ? e.date.trim() : '';
       const type = ['teorica', 'practica', 'apreciativa'].includes(e.type) ? e.type : 'teorica';
-      const isDraft = !date || maxScore <= 0;
+      const isDraft = !date || !hasValidRawMaxScore;
 
       if (isDraft && !title.toLowerCase().includes('borrador')) {
         title = `${title} (Borrador pendiente de revisión)`;
@@ -413,6 +419,48 @@ function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, val
   };
 }
 
+function buildDistributedModuleWrite(item, context) {
+  return {
+    userId: context.userId,
+    subjectId: context.canonicalSubjectId,
+    assignedSubjectId: String(item.subjectId),
+    classGroupId: context.classGroupId,
+    scope: 'subject',
+    title: normalizeName(item.title),
+    description: String(item.description || '').trim(),
+    order: typeof item.order === 'number' && item.order > 0 ? item.order : 1,
+    planRunId: context.planRunId,
+    createdAt: context.createdAt,
+  };
+}
+
+function filterModulesForMateria(modules, subjectId, scope = 'subject') {
+  if (scope === 'general') return [...(modules || [])];
+  return (modules || []).filter((module) =>
+    !module.assignedSubjectId || String(module.assignedSubjectId) === String(subjectId)
+  );
+}
+
+function distributionDocId(kind, planRunId, subjectId, title, discriminator = '') {
+  const input = [kind, planRunId, subjectId, nameKey(title), String(discriminator)].join('|');
+  const hash = (value, seed) => {
+    let h = seed >>> 0;
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h.toString(16).padStart(8, '0');
+  };
+  const prefix = kind === 'module' ? 'ai_mod' : 'ai_eval';
+  return `${prefix}_${hash(input, 2166136261)}${hash(input, 2246822519)}`;
+}
+
+function buildPlanRunId(groupId, version) {
+  const safeGroupId = String(groupId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+  const safeVersion = Number.isFinite(version) && version > 0 ? Math.floor(version) : 1;
+  return `plan_${safeGroupId || 'aula'}_v${safeVersion}`;
+}
+
 /**
  * Prepara el objeto `originalPlan` para ser guardado con ámbito `classGroupId`.
  */
@@ -435,6 +483,7 @@ module.exports = {
   SUGERENCIAS_MATERIAS,
   MIN_MATERIAS_AULA,
   MAX_MATERIAS_AULA,
+  MAX_PLAN_DRAFT_CHARS,
   normalizeName,
   computeAulaDisplayName,
   nameKey,
@@ -454,5 +503,9 @@ module.exports = {
   planSubjectDeletion,
   lastMateriaStorageKey,
   validateAIDistribution,
+  buildDistributedModuleWrite,
+  filterModulesForMateria,
+  distributionDocId,
+  buildPlanRunId,
   buildOriginalPlanData,
 };

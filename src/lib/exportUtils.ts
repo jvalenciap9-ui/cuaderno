@@ -9,6 +9,7 @@ import type { AdminTeacherDataResponse, AdminTeacherSummaryResponse } from './ad
 // html2canvas 1.4.1 no parsea `oklch(...)` y el export a PDF fallaba.
 import html2canvas from 'html2canvas-pro';
 import { jsPDF } from 'jspdf';
+import { filterModulesForMateria, resolveCanonicalSubjectId } from './classGroups';
 
 interface SubjectExportData {
   students: any[];
@@ -357,12 +358,25 @@ export async function exportSubjectDataToExcel(userId: string, userName: string 
     return exportClassGroupDataToExcel(userId, userName, subject.groupId);
   }
 
+  let sharedSubjectId = subjectId;
+  let sharedModules: any[] | null = null;
+  if (subject.groupId) {
+    const siblingSnap = await getDocs(
+      query(collection(db, 'subjects'), where('userId', '==', userId), where('groupId', '==', subject.groupId))
+    );
+    const siblings = siblingSnap.docs.map(d => ({ id: d.id, ...d.data() })) as any[];
+    sharedSubjectId = resolveCanonicalSubjectId(siblings, subjectId) || subjectId;
+    sharedModules = await getAllDocsForUserSubject('subjectModules', userId, sharedSubjectId);
+  }
+
   const data: SubjectExportData = {
-    students: await getAllDocsForUserSubject('students', userId, subjectId),
-    subjectModules: await getAllDocsForUserSubject('subjectModules', userId, subjectId),
+    students: await getAllDocsForUserSubject('students', userId, sharedSubjectId),
+    subjectModules: sharedModules
+      ? filterModulesForMateria(sharedModules, subjectId, 'subject')
+      : await getAllDocsForUserSubject('subjectModules', userId, subjectId),
     evaluations: await getAllDocsForUserSubject('evaluations', userId, subjectId),
     grades: await getAllDocsForUserSubject('grades', userId, subjectId),
-    attendance: await getAllDocsForUserSubject('attendance', userId, subjectId),
+    attendance: await getAllDocsForUserSubject('attendance', userId, sharedSubjectId),
   };
 
   const wb = utils.book_new();
@@ -390,10 +404,11 @@ export async function exportClassGroupDataToExcel(userId: string, userName: stri
   if (subjects.length === 0) return;
 
   // Canonical subject for shared students & attendance
-  const canonSubjectId = subjects.slice().sort((a, b) => ((a.createdAt || 0) - (b.createdAt || 0)))[0].id;
+  const canonSubjectId = resolveCanonicalSubjectId(subjects, String(subjects[0].id)) || String(subjects[0].id);
 
   const sharedStudents = await getAllDocsForUserSubject('students', userId, canonSubjectId);
   const sharedAttendance = await getAllDocsForUserSubject('attendance', userId, canonSubjectId);
+  const sharedModules = await getAllDocsForUserSubject('subjectModules', userId, canonSubjectId);
 
   const settings = settingsFromStorage();
   const wb = utils.book_new();
@@ -419,7 +434,7 @@ export async function exportClassGroupDataToExcel(userId: string, userName: stri
   for (const sub of subjects) {
     perSubjectData[sub.id] = {
       students: sharedStudents,
-      subjectModules: await getAllDocsForUserSubject('subjectModules', userId, sub.id),
+      subjectModules: filterModulesForMateria(sharedModules, sub.id, 'subject'),
       evaluations: await getAllDocsForUserSubject('evaluations', userId, sub.id),
       grades: await getAllDocsForUserSubject('grades', userId, sub.id),
       attendance: sharedAttendance,
@@ -462,7 +477,37 @@ export async function exportClassGroupDataToExcel(userId: string, userName: stri
   wsSummary['!cols'] = [{ wch: 30 }, { wch: 15 }, ...subjects.map(() => ({ wch: 18 })), { wch: 20 }, { wch: 18 }];
   utils.book_append_sheet(wb, wsSummary, 'Resumen General');
 
-  // 2. Una hoja por cada materia
+  // 2. Hoja de asistencia realmente global (una sesión por aula y fecha).
+  const attendanceDates = Array.from(new Set(sharedAttendance.map((item: any) => String(item.date || '')).filter(Boolean))).sort();
+  const attendanceRows = sortedStudents.map(student => {
+    const records = sharedAttendance.filter((item: any) => item.studentId === student.id);
+    const byDate = new Map(records.map((item: any) => [String(item.date), item.status]));
+    const statuses = attendanceDates.map(date => {
+      const status = byDate.get(date);
+      if (status === 'present') return 'P';
+      if (status === 'late') return 'T';
+      if (status === 'absent') return 'A';
+      if (status === 'justified') return 'J';
+      return '—';
+    });
+    const present = records.filter((item: any) => ['present', 'late', 'justified'].includes(item.status)).length;
+    const pct = records.length > 0 ? (present / records.length) * 100 : 100;
+    return [`${student.lastName || ''}, ${student.firstName || ''}`, student.cedula || '', ...statuses, `${pct.toFixed(0)}%`];
+  });
+  const attendanceSheet = utils.aoa_to_sheet([
+    ['Reporte', 'Asistencia General'],
+    ['Aula', groupTitle],
+    ['Alcance', 'General · Todas las materias'],
+    ['Profesor', userName || 'Profesor Asignado'],
+    ['Fecha', dateStr],
+    [],
+    ['Estudiante', 'Cédula', ...attendanceDates, '% Asistencia'],
+    ...attendanceRows,
+  ]);
+  attendanceSheet['!cols'] = [{ wch: 30 }, { wch: 15 }, ...attendanceDates.map(() => ({ wch: 12 })), { wch: 16 }];
+  utils.book_append_sheet(wb, attendanceSheet, 'Asistencia General');
+
+  // 3. Una hoja por cada materia
   const usedPrefixes = new Set<string>();
   for (const sub of subjects) {
     let prefix = sub.name ? sub.name.replace(/[^a-z0-9]/gi, '_').substring(0, 20) : 'materia';

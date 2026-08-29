@@ -8,7 +8,7 @@ import { initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import * as fs from 'node:fs';
 import { signUp, WEBHOOK_SECRET } from './helpers.mjs';
 
-const PROJECT_ID = 'ediagil-new-2026';
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'demo-ediagil';
 const RULES = fs.readFileSync(new URL('../firestore.rules', import.meta.url), 'utf8');
 
 const NOW = Date.now();
@@ -135,4 +135,3 @@ await testEnv.withSecurityRulesDisabled(async (ctx) => {
 });
 
 await testEnv.cleanup();
-

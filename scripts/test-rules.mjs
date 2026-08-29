@@ -9,7 +9,7 @@ import * as fs from 'node:fs';
 import { doc, setDoc, updateDoc, getDoc, getDocs, deleteDoc, collection, query, where, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { signUp } from './helpers.mjs';
 
-const PROJECT_ID = 'ediagil-new-2026';
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'demo-ediagil';
 const RULES = fs.readFileSync(new URL('../firestore.rules', import.meta.url), 'utf8');
 const YEAR = String(new Date().getFullYear());
 
@@ -45,7 +45,7 @@ await testEnv.clearFirestore();
 
 // ── Preparación: crear usuarios de auth y sembrar estados con reglas OFF ──
 const u = {};
-for (const [name, email] of [['free', 'free@test.local'], ['pro', 'pro@test.local'], ['trialExp', 'trial-exp@test.local'], ['paidStale', 'paid-stale@test.local'], ['other', 'other@test.local'], ['fresh', 'fresh@test.local'], ['teacherB', 'teacherB@test.local'], ['admin', 'admin@test.local']]) {
+for (const [name, email] of [['free', 'free@test.local'], ['pro', 'pro@test.local'], ['expiredPro', 'expired-pro@test.local'], ['pilot', 'pilot@test.local'], ['pilotExpired', 'pilot-expired@test.local'], ['trialExp', 'trial-exp@test.local'], ['paidStale', 'paid-stale@test.local'], ['other', 'other@test.local'], ['fresh', 'fresh@test.local'], ['teacherB', 'teacherB@test.local'], ['admin', 'admin@test.local']]) {
   u[name] = await signUp(email);
 }
 
@@ -55,6 +55,9 @@ await testEnv.withSecurityRulesDisabled(async (ctx) => {
   await setDoc(doc(db, 'users', u.trialExp.uid), { ...base(u.trialExp.uid), plan: 'pro', isTrial: true, trialStartedAt: NOW - 20 * DAY, trialEndsAt: NOW - 6 * DAY, trialUsed: true, paymentProvider: 'trial' });
   await setDoc(doc(db, 'users', u.paidStale.uid), { ...base(u.paidStale.uid), plan: 'pro', isTrial: true, trialStartedAt: NOW - 20 * DAY, trialEndsAt: NOW - 6 * DAY, trialUsed: true, paymentProvider: 'lemonsqueezy', expiresAt: NOW + 30 * DAY });
   await setDoc(doc(db, 'users', u.pro.uid), { ...base(u.pro.uid), plan: 'pro' });
+  await setDoc(doc(db, 'users', u.expiredPro.uid), { ...base(u.expiredPro.uid), plan: 'pro', expiresAt: NOW - DAY });
+  await setDoc(doc(db, 'users', u.pilot.uid), { ...base(u.pilot.uid), isPilot: true, pilotExpiresAt: NOW + 7 * DAY });
+  await setDoc(doc(db, 'users', u.pilotExpired.uid), { ...base(u.pilotExpired.uid), isPilot: true, pilotExpiresAt: NOW - DAY });
   await setDoc(doc(db, 'users', u.teacherB.uid), { ...base(u.teacherB.uid), plan: 'pro' });
   await setDoc(doc(db, 'users', u.free.uid), base(u.free.uid));
   await setDoc(doc(db, 'users', u.other.uid), base(u.other.uid));
@@ -97,6 +100,18 @@ const proCtx = testEnv.authenticatedContext(u.pro.uid);
   await expectSucceeds('Pro: 2ª asignatura PERMITIDA', createSubjectWithCounter(dbPro, u.pro.uid, 2, 2));
   await expectSucceeds('Pro: 3ª asignatura 2→3 PERMITIDA',
     createSubjectWithCounter(dbPro, u.pro.uid, 3, 3));
+
+  const expiredCtx = testEnv.authenticatedContext(u.expiredPro.uid);
+  const dbExpired = expiredCtx.firestore();
+  await expectSucceeds('Pro vencido: 1ª asignatura PERMITIDA como Free', createSubjectWithCounter(dbExpired, u.expiredPro.uid, 1, 1));
+  await expectSucceeds('Pro vencido: 2ª asignatura PERMITIDA como Free', createSubjectWithCounter(dbExpired, u.expiredPro.uid, 2, 2));
+  await expectFails('Pro vencido: 3ª asignatura DENEGADA', createSubjectWithCounter(dbExpired, u.expiredPro.uid, 3, 3));
+
+  const pilotCtx = testEnv.authenticatedContext(u.pilot.uid);
+  const dbPilot = pilotCtx.firestore();
+  await expectSucceeds('Piloto vigente: 1ª asignatura PERMITIDA', createSubjectWithCounter(dbPilot, u.pilot.uid, 1, 1));
+  await expectSucceeds('Piloto vigente: 2ª asignatura PERMITIDA', createSubjectWithCounter(dbPilot, u.pilot.uid, 2, 2));
+  await expectSucceeds('Piloto vigente: 3ª asignatura PERMITIDA como Pro', createSubjectWithCounter(dbPilot, u.pilot.uid, 3, 3));
 }
 
 // ── 2. Trial expirado = free; pagado con trial stale = pro ──
@@ -147,6 +162,7 @@ console.log('\n🛡️ users: campos sensibles backend-only');
   await expectFails('Cliente cambia plan a pro DENEGADO', updateDoc(ref, { plan: 'pro' }));
   await expectFails('Cliente escribe isTrial DENEGADO', updateDoc(ref, { isTrial: true }));
   await expectFails('Cliente escribe trialEndsAt DENEGADO', updateDoc(ref, { trialEndsAt: NOW + 10 * DAY }));
+  await expectFails('Cliente se concede piloto DENEGADO', updateDoc(ref, { isPilot: true, pilotExpiresAt: NOW + 10 * DAY }));
   await expectSucceeds('Cliente actualiza lastLoginAt PERMITIDO', updateDoc(ref, { lastLoginAt: NOW }));
 
   await expectFails('Crear perfil con plan pro DENEGADO',
@@ -191,12 +207,43 @@ console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
   const groupAData = { userId: u.pro.uid, name: '3.º A', modalidad: 'varias', createdAt: NOW, updatedAt: NOW, nivelEducativo: 'primaria', grado: '3', seccion: 'A' };
   await expectSucceeds('Docente A: Crear su Aula/Grupo', setDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), groupAData));
   await expectSucceeds('Docente A: Leer su Aula/Grupo', getDoc(doc(dbA, 'classGroups', 'cg-aula-3a')));
+  await expectSucceeds('Docente A: Guardar plan global válido en el Aula', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), {
+    planDraft: 'Semana 1: lectura y fracciones',
+    planType: 'semanal',
+    planStatus: 'draft_saved',
+    originalPlan: { content: 'Semana 1: lectura y fracciones', fileName: 'plan.txt', fileType: 'text/plain', loadedAt: NOW, version: 1, format: 'semanal', scope: 'classGroup' },
+    updatedAt: NOW + 1,
+  }));
+  await expectFails('Docente A: Plan global sobre el límite seguro DENEGADO', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), {
+    planDraft: 'x'.repeat(500001),
+  }));
 
   const subMathA = { userId: u.pro.uid, name: 'Matemáticas', color: '#123456', teacher: 'Prof A', schedule: 'L 8:00', groupId: 'cg-aula-3a' };
   const subSpanishA = { userId: u.pro.uid, name: 'Español', color: '#654321', teacher: 'Prof A', schedule: 'M 8:00', groupId: 'cg-aula-3a' };
   await expectSucceeds('Docente A: Crear materia interna Matemáticas', setDoc(doc(dbA, 'subjects', 'sub-math-3a'), subMathA));
   await expectSucceeds('Docente A: Crear materia interna Español', setDoc(doc(dbA, 'subjects', 'sub-spanish-3a'), subSpanishA));
   await expectSucceeds('Docente A: Actualizar su materia', updateDoc(doc(dbA, 'subjects', 'sub-math-3a'), { schedule: 'L 9:00' }));
+  await expectSucceeds('Docente A: Guardar módulo global asignado a Español sin convertirlo en Matemáticas', setDoc(doc(dbA, 'subjectModules', 'mod-plan-espanol'), {
+    userId: u.pro.uid,
+    subjectId: 'sub-math-3a',
+    assignedSubjectId: 'sub-spanish-3a',
+    classGroupId: 'cg-aula-3a',
+    scope: 'subject',
+    planRunId: 'plan_cg-aula-3a_v1',
+    title: 'Comprensión lectora',
+    order: 1,
+    createdAt: NOW,
+  }));
+  await expectFails('Docente A: No puede asignar un módulo del aula a una materia ajena', setDoc(doc(dbA, 'subjectModules', 'mod-plan-ajeno'), {
+    userId: u.pro.uid,
+    subjectId: 'sub-math-3a',
+    assignedSubjectId: 'sub-hack-b',
+    classGroupId: 'cg-aula-3a',
+    scope: 'subject',
+    title: 'Contenido ajeno',
+    order: 2,
+    createdAt: NOW,
+  }));
 
   const studentAData = { userId: u.pro.uid, subjectId: 'sub-math-3a', cedula: 'V-11111111', firstName: 'Juan', lastName: 'Pérez' };
   await expectSucceeds('Docente A: Crear estudiante compartido bajo canónica', setDoc(doc(dbA, 'students', 'stu-juan-3a'), studentAData));
@@ -206,9 +253,19 @@ console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
   const evalSpanishA = { userId: u.pro.uid, subjectId: 'sub-spanish-3a', title: 'Lectura 1', maxScore: 100, date: '2026-08-27', type: 'practica' };
   await expectSucceeds('Docente A: Crear evaluación de Matemáticas', setDoc(doc(dbA, 'evaluations', 'ev-math-1'), evalMathA));
   await expectSucceeds('Docente A: Crear evaluación de Español', setDoc(doc(dbA, 'evaluations', 'ev-spanish-1'), evalSpanishA));
+  await expectSucceeds('Docente A: Crear evaluación IA en escala 1–5', setDoc(doc(dbA, 'evaluations', 'ev-spanish-5'), {
+    ...evalSpanishA,
+    title: 'Lectura IA',
+    maxScore: 5,
+    isDraft: false,
+    planRunId: 'plan_cg-aula-3a_v1',
+    createdAt: NOW,
+  }));
 
   await expectSucceeds('Docente A: Guardar nota de Matemáticas (misma materia)', setDoc(doc(dbA, 'grades', 'gr-math-1'), { userId: u.pro.uid, subjectId: 'sub-math-3a', evaluationId: 'ev-math-1', studentId: 'stu-juan-3a', score: 95 }));
   await expectSucceeds('Docente A: Guardar nota de Español (estudiante canónico en materia hermana del mismo aula)', setDoc(doc(dbA, 'grades', 'gr-spanish-1'), { userId: u.pro.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 88 }));
+  await expectSucceeds('Docente A: Guardar 4.5 en evaluación de escala 1–5', setDoc(doc(dbA, 'grades', 'gr-spanish-5'), { userId: u.pro.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-5', studentId: 'stu-juan-3a', score: 4.5 }));
+  await expectFails('Docente A: Rechazar 5.1 en evaluación con máximo 5', setDoc(doc(dbA, 'grades', 'gr-spanish-over-5'), { userId: u.pro.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-5', studentId: 'stu-juan-3a', score: 5.1 }));
   await expectFails('Docente A: Guardar nota con evaluationId de Español en subjectId de Matemáticas DENEGADO por desajuste de materia', setDoc(doc(dbA, 'grades', 'gr-mismatch-1'), { userId: u.pro.uid, subjectId: 'sub-math-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 88 }));
 
   // 7.2 Casos prohibidos (Docente No Propietario B)
@@ -225,6 +282,13 @@ console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
   const dbFree = ctxFree.firestore();
   const freeGroupData = { userId: u.free.uid, name: 'Aula Free', modalidad: 'varias', createdAt: NOW, updatedAt: NOW };
   await expectFails('Usuario Free: Crear Aula Multiasignatura DENEGADO', setDoc(doc(dbFree, 'classGroups', 'cg-free-1'), freeGroupData));
+
+  const dbExpiredPro = testEnv.authenticatedContext(u.expiredPro.uid).firestore();
+  await expectFails('Pro vencido: Crear Aula Multiasignatura DENEGADO', setDoc(doc(dbExpiredPro, 'classGroups', 'cg-expired-pro'), { ...freeGroupData, userId: u.expiredPro.uid }));
+  const dbPilot = testEnv.authenticatedContext(u.pilot.uid).firestore();
+  await expectSucceeds('Piloto Pro vigente: Crear Aula Multiasignatura PERMITIDO', setDoc(doc(dbPilot, 'classGroups', 'cg-pilot-active'), { ...freeGroupData, userId: u.pilot.uid, name: 'Aula Piloto' }));
+  const dbPilotExpired = testEnv.authenticatedContext(u.pilotExpired.uid).firestore();
+  await expectFails('Piloto vencido: Crear Aula Multiasignatura DENEGADO', setDoc(doc(dbPilotExpired, 'classGroups', 'cg-pilot-expired'), { ...freeGroupData, userId: u.pilotExpired.uid }));
 
   // 7.3 Usuario Anónimo / No Autenticado
   await expectFails('Anónimo: Leer classGroups DENEGADO', getDoc(doc(dbAnon, 'classGroups', 'cg-aula-3a')));
@@ -253,4 +317,3 @@ if (failures.length) {
   for (const f of failures) console.log(`\n💥 ${f.name}\n   ${f.err?.message}`);
   process.exit(1);
 }
-

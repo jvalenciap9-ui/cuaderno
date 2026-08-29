@@ -44,13 +44,21 @@ const lemonSqueezySchoolVariantId = defineSecret('LEMON_SQUEEZY_SCHOOL_VARIANT_I
 
 const ALLOWED_ORIGINS = [
   'https://ediagil-new-2026.web.app',
+  'https://ediagil-rc1-staging.web.app',
   'http://localhost:3000',
   'http://localhost:5173',
 ];
 
+function isAllowedOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return false;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  // Canales preview controlados del mismo proyecto Firebase.
+  return /^https:\/\/ediagil-new-2026--[a-z0-9-]+\.web\.app$/i.test(origin);
+}
+
 function setCors(res, req) {
   const origin = req.headers.origin;
-  if (ALLOWED_ORIGINS.includes(origin)) {
+  if (isAllowedOrigin(origin)) {
     res.set('Access-Control-Allow-Origin', origin);
   } else {
     res.set('Access-Control-Allow-Origin', 'https://ediagil-new-2026.web.app');

@@ -11,7 +11,8 @@
 import { signUp } from './helpers.mjs';
 
 const AUTH_EMULATOR = 'http://127.0.0.1:9099';
-const FUNCTIONS_EMULATOR = 'http://127.0.0.1:5001/ediagil-new-2026/us-central1';
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'demo-ediagil';
+const FUNCTIONS_EMULATOR = `http://127.0.0.1:5001/${PROJECT_ID}/us-central1`;
 
 const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL || 'admin@demo.local';
 const ADMIN_PASS = process.env.SEED_ADMIN_PASS || 'test123456';

@@ -382,6 +382,7 @@ function CuadernoApp() {
   const [activeTab, setActiveTab] = useState<
     "planning" | "grades" | "attendance" | "students" | "modules"
   >("modules");
+  const [moduleScope, setModuleScope] = useState<'materia' | 'planificacion'>('materia');
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(
     null,
   );
@@ -694,8 +695,9 @@ function CuadernoApp() {
   /**
    * Aula/Grupo: validación previa de límites según la modalidad elegida en el
    * modal. Fuente central de permisos (usePlan/PLAN_LIMITS + classGroups):
-   * NADA hardcodeado aquí. Gratis = 2 unidades (asignaturas independientes +
-   * aulas) y máximo 1 aula; las materias internas NO consumen cuota.
+   * NADA hardcodeado aquí. Gratis conserva asignaturas independientes, pero
+   * Aula Multiasignatura requiere Pro; las materias internas NO consumen
+   * unidades adicionales.
    */
   const checkCanCreate = (modality: 'una' | 'varias'): string | null => {
     if (activeSubscription !== 'free') return null;
@@ -708,8 +710,10 @@ function CuadernoApp() {
   const handleCreated = (result: { kind: 'subject'; subjectId: string } | { kind: 'group'; groupId: string; firstMateriaId: string }) => {
     if (result.kind === 'group') {
       setSelectedSubjectId(result.firstMateriaId);
+      setModuleScope('planificacion');
     } else {
       setSelectedSubjectId(result.subjectId);
+      setModuleScope('materia');
     }
     setCurrentView('subject');
   };
@@ -1095,12 +1099,14 @@ function CuadernoApp() {
                   } catch { /* storage bloqueado */ }
                   setSelectedSubjectId(targetId);
                   setActiveTab("modules");
+                  setModuleScope('planificacion');
                   setCurrentView("subject");
                   setIsSidebarOpen(false);
                 };
 
                 const openSubject = (subject: SubjectDoc) => {
                   setSelectedSubjectId(String(subject.id));
+                  setModuleScope('materia');
                   setCurrentView("subject");
                   setIsSidebarOpen(false);
                 };
@@ -1283,9 +1289,13 @@ function CuadernoApp() {
           <div className="flex-1 overflow-y-auto custom-scrollbar">
             <Dashboard
               onNavigateToSubject={(id: string, tab: string) => {
+                const target = (subjects as SubjectDoc[]).find((item) => String(item.id) === String(id));
                 setSelectedSubjectId(id);
                 setCurrentView("subject");
-                if (tab) setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules");
+                if (tab) {
+                  setActiveTab(tab as "planning" | "grades" | "attendance" | "students" | "modules");
+                  setModuleScope(tab === 'modules' && target?.groupId ? 'planificacion' : 'materia');
+                }
               }}
               onNewSubject={handleNewSubject}
               onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -1339,7 +1349,13 @@ function CuadernoApp() {
                             <div className="flex flex-wrap items-center gap-2.5 mt-1.5 mb-2">
                               <div className="flex items-center gap-2 text-indigo-900 font-black text-xs md:text-sm bg-indigo-50 border border-indigo-200 px-3.5 py-1.5 rounded-xl shadow-sm">
                                 <BookOpen className="w-4 h-4 text-indigo-600 shrink-0" />
-                                <span>Alcance: General</span>
+                                <span>
+                                  {activeTab === 'modules' && moduleScope === 'planificacion'
+                                    ? 'Alcance: General'
+                                    : activeTab === 'attendance' || activeTab === 'students'
+                                      ? 'Alcance: General'
+                                      : `Materia activa: ${selectedSubject.name}`}
+                                </span>
                               </div>
                               <div className="flex items-center gap-2 text-neutral-700 font-bold text-xs bg-neutral-100 border border-neutral-200 px-3 py-1.5 rounded-xl shadow-sm">
                                 <Users className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
@@ -1397,26 +1413,30 @@ function CuadernoApp() {
                         aria-label="Exportar JSON"
                         onClick={() => handleExportJSON(selectedSubject)}
                         className="p-3 text-neutral-400 hover:text-[var(--institution-primary)] hover:bg-[var(--institution-primary)]/10 rounded-xl transition-all active:scale-90"
-                        title="Exportar asignatura como JSON"
+                        title={selectedGroup ? 'Exportar aula completa como JSON' : 'Exportar asignatura como JSON'}
                       >
                         <Download className="w-6 h-6" />
                       </button>
-                      <button
-                        aria-label="Editar asignatura"
-                        onClick={() => handleEditSubject(selectedSubject)}
-                        className="p-3 text-neutral-400 hover:text-[var(--institution-primary)] hover:bg-[var(--institution-primary)]/10 rounded-xl transition-all active:scale-90"
-                        title="Editar asignatura"
-                      >
-                        <Edit3 className="w-6 h-6" />
-                      </button>
-                      <button
-                        aria-label="Eliminar asignatura"
-                        onClick={() => setSubjectToDelete(selectedSubject.id!)}
-                        className="p-3 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all active:scale-90"
-                        title="Eliminar asignatura"
-                      >
-                        <Trash2 className="w-6 h-6" />
-                      </button>
+                      {!selectedGroup && (
+                        <>
+                          <button
+                            aria-label="Editar asignatura"
+                            onClick={() => handleEditSubject(selectedSubject)}
+                            className="p-3 text-neutral-400 hover:text-[var(--institution-primary)] hover:bg-[var(--institution-primary)]/10 rounded-xl transition-all active:scale-90"
+                            title="Editar asignatura"
+                          >
+                            <Edit3 className="w-6 h-6" />
+                          </button>
+                          <button
+                            aria-label="Eliminar asignatura"
+                            onClick={() => setSubjectToDelete(selectedSubject.id!)}
+                            className="p-3 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all active:scale-90"
+                            title="Eliminar asignatura"
+                          >
+                            <Trash2 className="w-6 h-6" />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1465,6 +1485,8 @@ function CuadernoApp() {
                       onDeleteNote={(id: string) => setNoteToDelete(id)}
                       aulaMaterias={aulaMateriasOf(selectedSubject)}
                       onSelectMateria={handleSelectAulaMateria}
+                      scopeMode={moduleScope}
+                      onScopeModeChange={setModuleScope}
                     />
                   </div>
                 )}

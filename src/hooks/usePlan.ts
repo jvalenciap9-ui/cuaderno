@@ -38,6 +38,10 @@ export interface UserProfile {
   isTrial?: boolean;
   trialEndsAt?: number;
   trialUsed?: boolean;
+  isPilot?: boolean;
+  pilotExpiresAt?: number;
+  disabled?: boolean;
+  isRevoked?: boolean;
 }
 
 export const PLAN_LIMITS: Record<PlanType, { maxSubjects: number; aiCallsPerMonth: number; label: string }> = {
@@ -49,33 +53,28 @@ export const PLAN_LIMITS: Record<PlanType, { maxSubjects: number; aiCallsPerMont
 export function canUseMultiSubject(
   user: { uid?: string } | null | undefined,
   profile: Partial<UserProfile> | null | undefined,
-  env?: { isStaging?: boolean }
+  _env?: { isStaging?: boolean }
 ): boolean {
   if (!user?.uid || !profile) return false;
-  if ((profile as any).disabled === true || (profile as any).isRevoked === true) return false;
+  if (profile.disabled === true || profile.isRevoked === true) return false;
 
   const now = Date.now();
-  const staging = env?.isStaging ?? (import.meta.env.VITE_SHOW_RC1_BADGE === 'true' || import.meta.env.VITE_ENVIRONMENT === 'staging');
-  if (staging) return true;
-
-  // Active pilot code check
-  if ((profile as any).isPilot) {
-    if (typeof (profile as any).pilotExpiresAt === 'number' && (profile as any).pilotExpiresAt <= now) {
-      return false;
-    }
-    return true;
+  // Staging nunca concede permisos por sí mismo: cliente y Rules deben tomar
+  // la misma decisión. Las cuentas QA se siembran con Pro/piloto vigente.
+  if (profile.isPilot === true) {
+    return typeof profile.pilotExpiresAt === 'number' && profile.pilotExpiresAt > now;
   }
 
-  // Active Pro trial check
+  // Prueba Pro vigente. Una prueba sin fecha no concede acceso indefinido.
   if (profile.isTrial) {
     const paidUser = !!profile.paymentProvider && profile.paymentProvider !== 'trial';
-    if (!paidUser && typeof profile.trialEndsAt === 'number' && profile.trialEndsAt <= now) {
-      return false;
+    if (!paidUser) {
+      return typeof profile.trialEndsAt === 'number' && profile.trialEndsAt > now;
     }
-    return true;
   }
 
-  // Active plan check
+  // Plan pagado/Institucional activo. Los documentos legacy sin expiresAt se
+  // conservan activos; si existe una fecha, se respeta estrictamente.
   const effectivePlan = profile.plan || 'free';
   if (effectivePlan === 'pro' || effectivePlan === 'school') {
     if (typeof profile.expiresAt === 'number' && profile.expiresAt <= now) {
@@ -158,9 +157,10 @@ export function usePlan() {
     && !paidUser
     && typeof profile.trialEndsAt === 'number'
     && profile.trialEndsAt <= now;
-  // En entorno Staging (RC1), las cuentas autenticadas reciben entitlement Pro para pruebas QA
-  const isStaging = import.meta.env.VITE_SHOW_RC1_BADGE === 'true' || import.meta.env.VITE_ENVIRONMENT === 'staging';
-  const plan: PlanType = isStaging ? 'pro' : (trialExpired ? 'free' : rawPlan);
+  const canMultiSubject = canUseMultiSubject(user, profile);
+  const plan: PlanType = trialExpired
+    ? 'free'
+    : (canMultiSubject && rawPlan === 'free' ? 'pro' : (canMultiSubject ? rawPlan : 'free'));
   const limits = PLAN_LIMITS[plan];
   const isAdmin = profile?.role === 'admin';
 
@@ -177,8 +177,6 @@ export function usePlan() {
     return currentCount < limits.maxSubjects;
   };
 
-  const canMultiSubject = canUseMultiSubject(user, profile);
-
   return {
     plan,
     profile,
@@ -187,7 +185,7 @@ export function usePlan() {
     canUseAI,
     canCreateSubject,
     canMultiSubject,
-    isPro: canMultiSubject || plan === 'pro' || plan === 'school',
+    isPro: canMultiSubject,
     isSchool: plan === 'school',
     isAdmin,
   };

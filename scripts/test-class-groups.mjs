@@ -9,7 +9,8 @@
  * - Participantes compartidos: resolución canónica única para N materias.
  * - Asistencia diaria: misma lista canónica; porcentajes no se multiplican.
  * - Calificaciones: aislamiento por materia.
- * - Planes: Gratis = 2 unidades O 1 aula; materias internas no consumen.
+ * - Planes: Gratis conserva asignaturas independientes; las aulas requieren
+ *   Pro y sus materias internas no consumen unidades adicionales.
  * - Eliminación inteligente dentro de un aula.
  */
 
@@ -153,6 +154,42 @@ check('mueve ítem con subjectId invalido m99 a unclassified', distResult.unclas
 check('mueve evaluación huerfana a unclassified (NUNCA a Español por defecto)', distResult.unclassified.some(u => u.title.includes('Quiz huerfano')));
 check('evaluación sin fecha se marca como borrador', distResult.validEvaluations.some(e => e.title.includes('Borrador')));
 check('ningún contenido ajeno termina en Español (m1)', distResult.validModules.every(m => m.subjectId === 'm1' ? m.title === 'Lectura comprensiva' : true));
+
+const panamaDistribution = cg.validateAIDistribution(
+  [],
+  [{ subjectId: 'm2', title: 'Prueba de fracciones', maxScore: 100, date: '2026-09-12', type: 'practica' }],
+  [],
+  validSubjectsList,
+  5,
+);
+check('escala institucional 1–5 reemplaza el 100 genérico de la IA', panamaDistribution.validEvaluations[0].maxScore === 5);
+
+const distributedWrite = cg.buildDistributedModuleWrite(
+  { subjectId: 'm2', title: ' Fracciones ', description: ' Operaciones ', order: 2 },
+  { userId: 'teacher-1', canonicalSubjectId: 'm1', classGroupId: 'g1', planRunId: 'plan_g1_v1', createdAt: 123 },
+);
+check('escritura IA conserva la materia real m2 aunque la estructura viva en la canónica m1',
+  distributedWrite.subjectId === 'm1' && distributedWrite.assignedSubjectId === 'm2');
+check('escritura IA queda vinculada al aula y no a Español por defecto',
+  distributedWrite.classGroupId === 'g1' && distributedWrite.title === 'Fracciones');
+
+const scopedModules = [
+  { id: 'global', title: 'Trimestre 1' },
+  { id: 'esp', title: 'Lectura', assignedSubjectId: 'm1' },
+  { id: 'mat', title: 'Fracciones', assignedSubjectId: 'm2' },
+];
+check('contenido de Matemáticas no aparece al abrir Español',
+  cg.filterModulesForMateria(scopedModules, 'm1').map(m => m.id).join(',') === 'global,esp');
+check('alcance General conserva todos los módulos del aula',
+  cg.filterModulesForMateria(scopedModules, 'm1', 'general').length === 3);
+
+const stableModuleId1 = cg.distributionDocId('module', 'plan_g1_v1', 'm2', 'Fracciones', '2');
+const stableModuleId2 = cg.distributionDocId('module', 'plan_g1_v1', 'm2', 'Fracciones', '2');
+const otherSubjectModuleId = cg.distributionDocId('module', 'plan_g1_v1', 'm1', 'Fracciones', '2');
+check('reintentar la misma distribución reutiliza el mismo documentId', stableModuleId1 === stableModuleId2);
+check('el mismo título en materias distintas no colisiona', stableModuleId1 !== otherSubjectModuleId);
+check('runId queda ligado al aula y a la versión del original', cg.buildPlanRunId('g1', 3) === 'plan_g1_v3');
+check('límite seguro del borrador se mantiene bajo 1 MiB', cg.MAX_PLAN_DRAFT_CHARS === 500000);
 
 console.log('──────────────────────────────');
 console.log(`Resultado: ${passed} ✅ / ${failed} ❌`);

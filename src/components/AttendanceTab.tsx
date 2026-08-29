@@ -44,6 +44,8 @@ export function AttendanceTab({ subjectId: rawSubjectId }: { subjectId: string }
   const subjectsQuery = user?.uid ? query(collection(db, 'subjects'), where('userId', '==', user?.uid), limit(500)) : null;
   const [subjects = []] = useCustomCollectionData(subjectsQuery);
   const subject = subjects.find(s => s.id === subjectId);
+  const activeSubject = subjects.find(s => s.id === rawSubjectId);
+  const isAula = !!activeSubject?.groupId;
 
   const studentsQuery = user?.uid ? query(collection(db, 'students'), where('subjectId', '==', subjectId), where('userId', '==', user?.uid), limit(500)) : null;
   const [students = [], loadingStudents] = useCustomCollectionData(studentsQuery);
@@ -364,11 +366,16 @@ export function AttendanceTab({ subjectId: rawSubjectId }: { subjectId: string }
                   type="button"
                   onClick={() => {
                     if (subject) {
-                      exportSubjectDataToExcel(user?.uid || '', user?.displayName || user?.email || null, subjectId);
+                      exportSubjectDataToExcel(
+                        user?.uid || '',
+                        user?.displayName || user?.email || null,
+                        rawSubjectId,
+                        isAula ? 'general' : undefined,
+                      );
                     }
                   }}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[10px] font-black uppercase tracking-widest transition-all"
-                  title="Exportar asistencia en Excel"
+                  title={isAula ? 'Exportar asistencia general y reporte completo del aula' : 'Exportar asistencia en Excel'}
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
                   Excel

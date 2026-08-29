@@ -108,6 +108,9 @@ export interface EvaluationDoc extends FirestoreDoc {
   maxScore: number;
   date: string;
   type: 'teorica' | 'practica' | 'apreciativa';
+  isDraft?: boolean;
+  planRunId?: string;
+  createdAt?: number;
 }
 
 export interface GradeDoc extends FirestoreDoc {
@@ -157,7 +160,13 @@ export interface MaterialDoc extends FirestoreDoc {
 
 export interface SubjectModuleDoc extends FirestoreDoc {
   userId: string;
+  /** Materia canónica que conserva la estructura compartida del aula. */
   subjectId: string;
+  /** Materia real del contenido distribuido; ausente = estructura global. */
+  assignedSubjectId?: string | null;
+  classGroupId?: string;
+  scope?: 'classGroup' | 'subject';
+  planRunId?: string;
   parentId?: string;
   title: string;
   description?: string;

@@ -62,8 +62,23 @@ service cloud.firestore {
         && ('trialEndsAt' in planDoc.data)
         && planDoc.data.trialEndsAt is number
         && planDoc.data.trialEndsAt <= request.time.toMillis();
-      let effectivePlan = trialExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);
-      let max = effectivePlan == 'pro' || effectivePlan == 'school' ? 999 : 2;
+      let paidExpired = planDoc != null
+        && ('expiresAt' in planDoc.data)
+        && planDoc.data.expiresAt is number
+        && planDoc.data.expiresAt <= request.time.toMillis();
+      let pilotActive = planDoc != null
+        && ('isPilot' in planDoc.data)
+        && planDoc.data.isPilot == true
+        && ('pilotExpiresAt' in planDoc.data)
+        && planDoc.data.pilotExpiresAt is number
+        && planDoc.data.pilotExpiresAt > request.time.toMillis()
+        && (!('disabled' in planDoc.data) || planDoc.data.disabled != true)
+        && (!('isRevoked' in planDoc.data) || planDoc.data.isRevoked != true);
+      let effectivePlan = trialExpired || paidExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);
+      // Un código piloto vigente equivale a Pro tanto para Aula
+      // Multiasignatura como para el contador general. Cliente y Rules deben
+      // decidir exactamente lo mismo.
+      let max = pilotActive || effectivePlan == 'pro' || effectivePlan == 'school' ? 999 : 2;
       let before = get(counterPath);
       let after = getAfter(counterPath);
       let year = currentYearKey();
@@ -169,15 +184,30 @@ service cloud.firestore {
     function canUseMultiSubjectRules() {
       let planPath = /databases/$(database)/documents/users/$(request.auth.uid);
       let planDoc = get(planPath);
-      let trialExpired = planDoc != null
+      let blocked = planDoc != null
+        && (
+          (('disabled' in planDoc.data) && planDoc.data.disabled == true)
+          || (('isRevoked' in planDoc.data) && planDoc.data.isRevoked == true)
+        );
+      let pilotActive = planDoc != null
+        && ('isPilot' in planDoc.data)
+        && planDoc.data.isPilot == true
+        && ('pilotExpiresAt' in planDoc.data)
+        && planDoc.data.pilotExpiresAt is number
+        && planDoc.data.pilotExpiresAt > request.time.toMillis();
+      let trialOnly = planDoc != null
         && ('isTrial' in planDoc.data)
         && planDoc.data.isTrial == true
-        && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial')
+        && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial');
+      let trialActive = trialOnly
         && ('trialEndsAt' in planDoc.data)
         && planDoc.data.trialEndsAt is number
-        && planDoc.data.trialEndsAt <= request.time.toMillis();
-      let effectivePlan = trialExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);
-      return effectivePlan == 'pro' || effectivePlan == 'school';
+        && planDoc.data.trialEndsAt > request.time.toMillis();
+      let paidActive = planDoc != null
+        && !trialOnly
+        && (planDoc.data.plan == 'pro' || planDoc.data.plan == 'school')
+        && (!('expiresAt' in planDoc.data) || (planDoc.data.expiresAt is number && planDoc.data.expiresAt > request.time.toMillis()));
+      return !blocked && (pilotActive || trialActive || paidActive);
     }
 
     // ── classGroups (Aula/Grupo multiasignatura) ─────────────────────────
@@ -198,7 +228,23 @@ service cloud.firestore {
           && (!('grado' in data) || (data.grado is string && data.grado.size() <= 60))
           && (!('seccion' in data) || (data.seccion is string && data.seccion.size() <= 60))
           && (!('periodo' in data) || (data.periodo is string && data.periodo.size() <= 40))
-          && (!('schemaVersion' in data) || data.schemaVersion is number);
+          && (!('schemaVersion' in data) || data.schemaVersion is number)
+          && (!('planDraft' in data) || (data.planDraft is string && data.planDraft.size() <= 500000))
+          && (!('planType' in data) || (data.planType is string && data.planType in ['semanal', 'mensual', 'trimestral']))
+          && (!('planStatus' in data) || (data.planStatus is string && data.planStatus in ['idle', 'draft_saved', 'distributed']))
+          && (!('lastPlanRunId' in data) || (data.lastPlanRunId is string && data.lastPlanRunId.size() <= 128))
+          && (!('unclassifiedItems' in data) || (data.unclassifiedItems is list && data.unclassifiedItems.size() <= 200))
+          && (!('originalPlan' in data) || (
+            data.originalPlan is map
+            && data.originalPlan.keys().hasAll(['content', 'loadedAt', 'version'])
+            && data.originalPlan.content is string && data.originalPlan.content.size() <= 500000
+            && data.originalPlan.loadedAt is number
+            && data.originalPlan.version is number && data.originalPlan.version >= 1
+            && (!('fileName' in data.originalPlan) || (data.originalPlan.fileName is string && data.originalPlan.fileName.size() <= 240))
+            && (!('fileType' in data.originalPlan) || (data.originalPlan.fileType is string && data.originalPlan.fileType.size() <= 120))
+            && (!('format' in data.originalPlan) || (data.originalPlan.format is string && data.originalPlan.format.size() <= 40))
+            && (!('scope' in data.originalPlan) || data.originalPlan.scope == 'classGroup')
+          ));
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(groupId) && isExistingOwner();
@@ -311,7 +357,10 @@ service cloud.firestore {
           && data.title is string && data.title.size() > 0 && data.title.size() <= 200
           && data.maxScore is number && data.maxScore >= 0
           && data.date is string && data.date.size() > 0 && data.date.size() <= 30
-          && data.type is string && data.type.size() > 0 && data.type.size() <= 50;
+          && data.type is string && data.type.size() > 0 && data.type.size() <= 50
+          && (!('isDraft' in data) || data.isDraft is bool)
+          && (!('planRunId' in data) || (data.planRunId is string && data.planRunId.size() <= 128))
+          && (!('createdAt' in data) || data.createdAt is number);
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(evaluationId) && isExistingOwner();
@@ -445,14 +494,32 @@ service cloud.firestore {
           && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
           && data.title is string && data.title.size() > 0 && data.title.size() <= 200
           && data.order is number
-          && data.createdAt is number;
+          && data.createdAt is number
+          && (!('assignedSubjectId' in data) || data.assignedSubjectId == null || (data.assignedSubjectId is string && data.assignedSubjectId.size() > 0 && data.assignedSubjectId.size() <= 128))
+          && (!('classGroupId' in data) || (data.classGroupId is string && data.classGroupId.size() > 0 && data.classGroupId.size() <= 128))
+          && (!('scope' in data) || data.scope in ['classGroup', 'subject'])
+          && (!('planRunId' in data) || (data.planRunId is string && data.planRunId.size() <= 128));
+      }
+      function assignmentTargetOk(data) {
+        return !('assignedSubjectId' in data) || data.assignedSubjectId == null || (
+          ('classGroupId' in data)
+          && data.classGroupId is string
+          && exists(/databases/$(database)/documents/subjects/$(data.assignedSubjectId))
+          && get(/databases/$(database)/documents/subjects/$(data.assignedSubjectId)).data.userId == request.auth.uid
+          && ('groupId' in get(/databases/$(database)/documents/subjects/$(data.assignedSubjectId)).data)
+          && get(/databases/$(database)/documents/subjects/$(data.assignedSubjectId)).data.groupId == data.classGroupId
+          && ('groupId' in get(/databases/$(database)/documents/subjects/$(data.subjectId)).data)
+          && get(/databases/$(database)/documents/subjects/$(data.subjectId)).data.groupId == data.classGroupId
+        );
       }
       allow list: if isSignedIn() && request.auth.uid == resource.data.userId;
       allow get: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId;
       allow create: if isSignedIn() && isValidId(subjectModuleId) && isValidSubjectModule(request.resource.data)
         && exists(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId))
-        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid;
-      allow update: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId && isValidSubjectModule(request.resource.data);
+        && get(/databases/$(database)/documents/subjects/$(request.resource.data.subjectId)).data.userId == request.auth.uid
+        && assignmentTargetOk(request.resource.data);
+      allow update: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId
+        && isValidSubjectModule(request.resource.data) && assignmentTargetOk(request.resource.data);
       allow delete: if isSignedIn() && isValidId(subjectModuleId) && request.auth.uid == resource.data.userId;
     }
 
@@ -558,6 +625,10 @@ service cloud.firestore {
         && !('trialEndsAt' in request.resource.data)
         && !('trialUsed' in request.resource.data)
         && !('trialStartedAt' in request.resource.data)
+        && !('isPilot' in request.resource.data)
+        && !('pilotExpiresAt' in request.resource.data)
+        && !('disabled' in request.resource.data)
+        && !('isRevoked' in request.resource.data)
         && request.resource.data.aiCallsThisMonth is number
         && request.resource.data.aiCallsThisMonth == 0;
 
@@ -575,7 +646,7 @@ service cloud.firestore {
         // legítimos del cliente (p.ej. lastLoginAt) a docs que ya contienen
         // campos trial escritos por el backend.
         && !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['isTrial', 'trialEndsAt', 'trialUsed', 'trialStartedAt']);
+            .hasAny(['isTrial', 'trialEndsAt', 'trialUsed', 'trialStartedAt', 'isPilot', 'pilotExpiresAt', 'disabled', 'isRevoked']);
 
       allow delete: if false;
     }

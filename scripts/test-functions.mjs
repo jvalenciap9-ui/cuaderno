@@ -10,7 +10,7 @@ import * as fs from 'node:fs';
 import { doc, setDoc } from 'firebase/firestore';
 import { signUp, callFunction, postFunction, computeSignature, lsEvent, PRO_VARIANT_ID, SCHOOL_VARIANT_ID } from './helpers.mjs';
 
-const PROJECT_ID = 'ediagil-new-2026';
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'demo-ediagil';
 const RULES = fs.readFileSync(new URL('../firestore.rules', import.meta.url), 'utf8');
 const NOW = Date.now();
 const DAY = 24 * 60 * 60 * 1000;
@@ -497,4 +497,3 @@ if (failures.length) {
   for (const f of failures) console.log(`\n💥 ${f}`);
   process.exit(1);
 }
-

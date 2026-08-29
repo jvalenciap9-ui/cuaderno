@@ -13,6 +13,7 @@ const GEMINI_URL = import.meta.env.DEV
   : 'https://geminiproxy-t6k4ah2mva-uc.a.run.app';
 // Health check / others pasan por hosting
 const API_BASE = import.meta.env.DEV ? 'http://localhost:3001' : '';
+const EMULATOR_PROJECT_ID = import.meta.env.VITE_EMULATOR_PROJECT_ID || 'demo-ediagil';
 
 import { auth } from './firebase';
 
@@ -49,9 +50,11 @@ export async function callGemini(options: {
 }): Promise<GeminiResponse> {
   const { model = 'gemini-2.5-flash', contents, config = {} } = options;
 
-  const url = import.meta.env.DEV
-    ? `${API_BASE}/api/gemini`
-    : `${GEMINI_URL}/geminiproxy`;
+  const url = import.meta.env.VITE_EMULATORS === '1'
+    ? `http://127.0.0.1:5001/${EMULATOR_PROJECT_ID}/us-central1/geminiproxy`
+    : import.meta.env.DEV
+      ? `${API_BASE}/api/gemini`
+      : `${GEMINI_URL}/geminiproxy`;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   

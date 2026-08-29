@@ -26,6 +26,8 @@
     "seed:emulator": "node scripts/seed-emulator.mjs",
     "test:rules": "node scripts/test-rules.mjs",
     "test:functions": "node scripts/test-functions.mjs",
+    "test:pilot:core": "node scripts/test-pilot-core.mjs",
+    "test:pilot:emulators": "node scripts/test-pilot-emulators.mjs",
     "dev:demo": "vite --mode demo --port=3000 --host=0.0.0.0",
     "build:demo": "vite build --mode demo",
     "preview:demo": "vite preview --mode demo"

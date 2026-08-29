@@ -4,7 +4,7 @@
  */
 import { createHmac } from 'node:crypto';
 
-export const PROJECT_ID = 'ediagil-new-2026';
+export const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'demo-ediagil';
 export const AUTH_EMULATOR = 'http://127.0.0.1:9099';
 export const FUNCTIONS_EMULATOR = `http://127.0.0.1:5001/${PROJECT_ID}/us-central1`;
 export const WEBHOOK_SECRET = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET || 'emulator-webhook-secret';

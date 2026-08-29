@@ -9,6 +9,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 const env = { ...process.env };
+const emulatorProjectId = env.FIREBASE_PROJECT_ID || 'demo-ediagil';
+env.FIREBASE_PROJECT_ID = emulatorProjectId;
+env.GCLOUD_PROJECT = emulatorProjectId;
+env.GOOGLE_CLOUD_PROJECT = emulatorProjectId;
+env.VITE_EMULATORS = '1';
+env.VITE_EMULATOR_PROJECT_ID = emulatorProjectId;
 
 // Asegurar que JAVA esté visible para el emulador de Firestore.
 try {
@@ -45,7 +51,7 @@ env.GEMINI_API_KEY ??= 'emulator-gemini-key';
 
 const child = spawn(
   'npx',
-  ['firebase', 'emulators:start', '--project', 'ediagil-new-2026'],
+  ['firebase', 'emulators:start', '--only', 'auth,firestore,functions,storage', '--project', emulatorProjectId],
   { stdio: 'inherit', shell: process.platform === 'win32', env },
 );
 child.on('exit', (code) => process.exit(code ?? 0));

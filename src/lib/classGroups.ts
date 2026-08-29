@@ -45,6 +45,8 @@ import { handleFirestoreError, OperationType } from './firestoreUtils';
 
 export const MIN_MATERIAS_AULA = 2;
 export const MAX_MATERIAS_AULA = 20;
+/** Margen seguro bajo el límite de 1 MiB por documento de Firestore. */
+export const MAX_PLAN_DRAFT_CHARS = 500_000;
 
 export const SUGERENCIAS_MATERIAS: Record<'inicial' | 'primaria', string[]> = {
   inicial: [
@@ -413,7 +415,8 @@ export function validateAIDistribution(
   rawModules: any[],
   rawEvaluations: any[],
   rawUnclassified: any[],
-  validSubjects: Array<{ id: string; name: string }>
+  validSubjects: Array<{ id: string; name: string }>,
+  defaultMaxScore = 100,
 ): ValidatedAIDistribution {
   const validMap = new Map<string, string>();
   (Array.isArray(validSubjects) ? validSubjects : []).forEach((s) => {
@@ -453,11 +456,19 @@ export function validateAIDistribution(
 
     if (subId && validMap.has(subId)) {
       matchedSubjects.add(validMap.get(subId)!);
-      const maxScore = typeof e.maxScore === 'number' && e.maxScore > 0 ? e.maxScore : Number(e.maxScore) || 100;
+      const configuredMaxScore = Number(defaultMaxScore) > 0 ? Number(defaultMaxScore) : 100;
+      const rawMaxScore = Number(e.maxScore);
+      const hasValidRawMaxScore = Number.isFinite(rawMaxScore) && rawMaxScore > 0;
+      // Si la institución usa una escala distinta de 100 (por ejemplo 1–5
+      // en Panamá), la evaluación generada debe respetar esa escala aunque
+      // la IA intente devolver el valor genérico 100.
+      const maxScore = configuredMaxScore !== 100
+        ? configuredMaxScore
+        : (hasValidRawMaxScore ? rawMaxScore : configuredMaxScore);
       const date = typeof e.date === 'string' && e.date.trim() ? e.date.trim() : '';
       const rawType = e.type;
       const type: 'teorica' | 'practica' | 'apreciativa' = ['teorica', 'practica', 'apreciativa'].includes(rawType) ? rawType : 'teorica';
-      const isDraft = !date || maxScore <= 0;
+      const isDraft = !date || !hasValidRawMaxScore;
 
       if (isDraft && !title.toLowerCase().includes('borrador')) {
         title = `${title} (Borrador pendiente de revisión)`;
@@ -491,6 +502,87 @@ export function validateAIDistribution(
       unclassifiedCount: unclassified.length,
     },
   };
+}
+
+export interface DistributedModuleWrite {
+  userId: string;
+  /** Propietario de la estructura global: materia canónica del aula. */
+  subjectId: string;
+  /** Materia real a la que la IA asignó el contenido. */
+  assignedSubjectId: string;
+  classGroupId: string;
+  scope: 'subject';
+  title: string;
+  description: string;
+  order: number;
+  planRunId: string;
+  createdAt: number;
+}
+
+/**
+ * Construye la escritura final de un módulo distribuido por IA sin perder la
+ * materia destino. Este contrato evita que todos los contenidos terminen en
+ * la primera materia/canónica (habitualmente Español).
+ */
+export function buildDistributedModuleWrite(
+  item: { subjectId: string; title: string; description?: string; order?: number },
+  context: { userId: string; canonicalSubjectId: string; classGroupId: string; planRunId: string; createdAt: number },
+): DistributedModuleWrite {
+  return {
+    userId: context.userId,
+    subjectId: context.canonicalSubjectId,
+    assignedSubjectId: String(item.subjectId),
+    classGroupId: context.classGroupId,
+    scope: 'subject',
+    title: normalizeName(item.title),
+    description: String(item.description || '').trim(),
+    order: typeof item.order === 'number' && item.order > 0 ? item.order : 1,
+    planRunId: context.planRunId,
+    createdAt: context.createdAt,
+  };
+}
+
+/**
+ * En alcance General se muestran todos los módulos del aula. En alcance de
+ * materia se muestran la estructura global y únicamente el contenido que la
+ * IA asignó a la materia activa.
+ */
+export function filterModulesForMateria<T extends { assignedSubjectId?: string | null }>(
+  modules: T[],
+  subjectId: string,
+  scope: 'general' | 'subject' = 'subject',
+): T[] {
+  if (scope === 'general') return [...(modules || [])];
+  return (modules || []).filter((module) =>
+    !module.assignedSubjectId || String(module.assignedSubjectId) === String(subjectId)
+  );
+}
+
+/** Identificador estable para que reintentar el mismo plan no duplique datos. */
+export function distributionDocId(
+  kind: 'module' | 'evaluation',
+  planRunId: string,
+  subjectId: string,
+  title: string,
+  discriminator = '',
+): string {
+  const input = [kind, planRunId, subjectId, nameKey(title), String(discriminator)].join('|');
+  const hash = (value: string, seed: number) => {
+    let h = seed >>> 0;
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h.toString(16).padStart(8, '0');
+  };
+  const prefix = kind === 'module' ? 'ai_mod' : 'ai_eval';
+  return `${prefix}_${hash(input, 2166136261)}${hash(input, 2246822519)}`;
+}
+
+export function buildPlanRunId(groupId: string, version: number): string {
+  const safeGroupId = String(groupId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+  const safeVersion = Number.isFinite(version) && version > 0 ? Math.floor(version) : 1;
+  return `plan_${safeGroupId || 'aula'}_v${safeVersion}`;
 }
 
 export function buildOriginalPlanData(

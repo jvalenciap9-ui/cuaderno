@@ -7,6 +7,7 @@ import { useAuth } from "./AuthProvider";
 import { handleFirestoreError, OperationType } from "../lib/firestoreUtils";
 import { showToast, toast } from '../hooks/useToast';
 import { usePlan } from '../hooks/usePlan';
+import { useGradeSettings } from '../contexts/GradeSettingsContext';
 import {
   Plus,
   Trash2,
@@ -36,7 +37,16 @@ import { es } from "date-fns/locale";
 import { ai } from "../lib/gemini";
 import { extractTextFromFile } from "../lib/fileParser";
 import { trackEvent, ANALYTICS_CATEGORIES, ANALYTICS_ACTIONS } from "../lib/analytics";
-import { useCanonicalSubjectId, validateAIDistribution, buildOriginalPlanData } from "../lib/classGroups";
+import {
+  MAX_PLAN_DRAFT_CHARS,
+  buildDistributedModuleWrite,
+  buildOriginalPlanData,
+  buildPlanRunId,
+  distributionDocId,
+  filterModulesForMateria,
+  useCanonicalSubjectId,
+  validateAIDistribution,
+} from "../lib/classGroups";
 
 interface ModulesTabProps {
   subjectId: string;
@@ -46,6 +56,9 @@ interface ModulesTabProps {
   aulaMaterias?: SubjectDoc[];
   /** Solicita a App cambiar de materia dentro del mismo aula. */
   onSelectMateria?: (materiaId: string) => void;
+  /** Alcance controlado por App para conservarlo al cambiar de materia. */
+  scopeMode?: 'materia' | 'planificacion';
+  onScopeModeChange?: (mode: 'materia' | 'planificacion') => void;
 }
 
 export function ModulesTab({
@@ -54,9 +67,12 @@ export function ModulesTab({
   onDeleteNote,
   aulaMaterias,
   onSelectMateria,
+  scopeMode,
+  onScopeModeChange,
 }: ModulesTabProps) {
   const { user } = useAuth();
   const { isPro, isAdmin } = usePlan();
+  const { gradingScale } = useGradeSettings();
   
   const subjectRef = doc(db, 'subjects', subjectId);
   const [subject] = useDocumentData(subjectRef);
@@ -65,7 +81,12 @@ export function ModulesTab({
   const targetSubjectIdForModules = subject?.groupId ? sharedModuleSubjectId : subjectId;
 
   // ── Modos de Módulos y Materiales (Sección 10 & 11) ──
-  const [subMode, setSubMode] = useState<'materia' | 'planificacion'>('materia');
+  const [internalSubMode, setInternalSubMode] = useState<'materia' | 'planificacion'>('materia');
+  const subMode = scopeMode ?? internalSubMode;
+  const setSubMode = (mode: 'materia' | 'planificacion') => {
+    setInternalSubMode(mode);
+    onScopeModeChange?.(mode);
+  };
   const [planType, setPlanType] = useState<'semanal' | 'mensual' | 'trimestral'>('semanal');
   const [draftText, setDraftText] = useState('');
   const [loadedFileName, setLoadedFileName] = useState<string | null>(null);
@@ -73,11 +94,13 @@ export function ModulesTab({
   const [isDistributing, setIsDistributing] = useState(false);
   const [planStatus, setPlanStatus] = useState<'idle' | 'draft_saved' | 'distributed'>('idle');
   const planFileInputRef = useRef<HTMLInputElement | null>(null);
+  const lastSavedPlanRef = useRef<any>(null);
 
   const groupRef = subject?.groupId ? doc(db, 'classGroups', subject.groupId) : null;
   const [groupDoc] = useDocumentData(groupRef);
 
   useEffect(() => {
+    lastSavedPlanRef.current = groupDoc?.originalPlan ?? null;
     if (groupDoc?.planDraft) {
       setDraftText(groupDoc.planDraft);
       setPlanStatus('draft_saved');
@@ -93,37 +116,57 @@ export function ModulesTab({
     }
   }, [groupDoc]);
 
-  const handleSaveDraft = async (customContent?: string, fileName?: string, fileType?: string): Promise<boolean> => {
+  const handleSaveDraft = async (customContent?: string, fileName?: string, fileType?: string): Promise<number | null> => {
     const textToSave = typeof customContent === 'string' ? customContent : draftText;
     if (!textToSave.trim()) {
       showToast('warning', 'Escribe o carga el borrador del plan antes de guardar.');
-      return false;
+      return null;
+    }
+    if (textToSave.length > MAX_PLAN_DRAFT_CHARS) {
+      showToast('error', 'El plan es demasiado extenso para guardarlo. Reduce el contenido o divídelo en varios archivos.');
+      return null;
+    }
+    if (!subject?.groupId) {
+      showToast('error', 'No se encontró el aula propietaria de este plan.');
+      return null;
     }
     setIsSavingDraft(true);
     try {
-      if (subject?.groupId) {
-        const originalPlanObj = buildOriginalPlanData(
+      const normalizedContent = textToSave.trim();
+      const effectiveFileName = fileName || loadedFileName || 'Plan General';
+      const effectiveFileType = fileType || 'text/plain';
+      // El ref evita incrementar la versión si el usuario reintenta antes de
+      // que onSnapshot refleje el write anterior.
+      const previousPlan = lastSavedPlanRef.current || groupDoc?.originalPlan;
+      const samePlan = previousPlan
+        && previousPlan.content === normalizedContent
+        && previousPlan.fileName === effectiveFileName
+        && previousPlan.fileType === effectiveFileType
+        && previousPlan.format === planType;
+      const originalPlanObj = samePlan
+        ? previousPlan
+        : buildOriginalPlanData(
           textToSave,
-          fileName || loadedFileName || 'Plan General',
-          fileType || 'text/plain',
+          effectiveFileName,
+          effectiveFileType,
           planType,
-          groupDoc?.originalPlan?.version
+          previousPlan?.version
         );
-        await updateDoc(doc(db, 'classGroups', subject.groupId), {
+      await updateDoc(doc(db, 'classGroups', subject.groupId), {
           planDraft: textToSave,
           originalPlan: originalPlanObj,
           planType,
           planStatus: 'draft_saved',
           updatedAt: Date.now(),
         });
-      }
+      lastSavedPlanRef.current = originalPlanObj;
       setPlanStatus('draft_saved');
       showToast('success', 'Plan original guardado');
-      return true;
+      return originalPlanObj.version;
     } catch (err) {
       console.error('Error guardando borrador del plan:', err);
       showToast('error', 'No se pudo guardar el plan.');
-      return false;
+      return null;
     } finally {
       setIsSavingDraft(false);
     }
@@ -162,8 +205,8 @@ export function ModulesTab({
       return;
     }
     // Paso 1 & 2: Guardar el plan original como borrador + Confirmar "Plan original guardado"
-    const saved = await handleSaveDraft();
-    if (!saved) return;
+    const savedVersion = await handleSaveDraft();
+    if (!savedVersion || !subject?.groupId || !user?.uid) return;
 
     setIsDistributing(true);
     setAiAlertMessage(null);
@@ -173,7 +216,7 @@ export function ModulesTab({
         throw new Error('No hay materias asociadas a este aula.');
       }
 
-      const runId = `run_${Date.now()}`;
+      const runId = buildPlanRunId(subject.groupId, savedVersion);
       const prompt = `Analiza la siguiente planificación general del aula y distribúyela entre las materias existentes del grupo.
 
 LISTA DE MATERIAS EXISTENTES EN EL AULA (USA ÚNICAMENTE ESTOS IDs PARA CADA MATERIA):
@@ -200,7 +243,7 @@ INSTRUCCIONES CRÍTICAS:
     {
       "subjectId": "ID_EXACTO_DE_LA_MATERIA",
       "title": "Título de la evaluación",
-      "maxScore": 100,
+      "maxScore": ${gradingScale.maxScore || 100},
       "date": "YYYY-MM-DD",
       "type": "teorica|practica|apreciativa"
     }
@@ -212,9 +255,13 @@ INSTRUCCIONES CRÍTICAS:
     }
   ]
 }
+5. La puntuación máxima de cada evaluación debe ser ${gradingScale.maxScore || 100}, que es la escala configurada por el docente o la institución.
 NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
 
-      const aiRes = await ai({ contents: prompt });
+      const aiRes = await ai({
+        contents: prompt,
+        config: { temperature: 0, responseMimeType: 'application/json' },
+      });
       const aiResponseText = aiRes.text || '';
       
       const jsonMatch = aiResponseText.match(/\{[\s\S]*\}/);
@@ -233,7 +280,8 @@ NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
         parsed.modules,
         parsed.evaluations,
         parsed.unclassified,
-        availableMaterias
+        availableMaterias,
+        gradingScale.maxScore || 100,
       );
 
       const batch = writeBatch(db);
@@ -242,22 +290,28 @@ NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
 
       // Guardar módulos globales / por materia
       for (const item of validated.validModules) {
-        const modRef = doc(collection(db, 'subjectModules'));
-        batch.set(modRef, {
-          userId: user?.uid,
-          subjectId: targetSubjectIdForModules,
-          title: item.title,
-          description: item.description || '',
-          order: item.order || createdModulesCount + 1,
+        const modRef = doc(
+          db,
+          'subjectModules',
+          distributionDocId('module', runId, item.subjectId, item.title, String(item.order || createdModulesCount + 1)),
+        );
+        batch.set(modRef, buildDistributedModuleWrite(item, {
+          userId: user.uid,
+          canonicalSubjectId: targetSubjectIdForModules,
+          classGroupId: subject.groupId,
           planRunId: runId,
           createdAt: Date.now() + createdModulesCount,
-        });
+        }));
         createdModulesCount++;
       }
 
       // Guardar evaluaciones por materia validada
       for (const ev of validated.validEvaluations) {
-        const evRef = doc(collection(db, 'evaluations'));
+        const evRef = doc(
+          db,
+          'evaluations',
+          distributionDocId('evaluation', runId, ev.subjectId, ev.title, `${ev.date}|${ev.type}`),
+        );
         batch.set(evRef, {
           userId: user?.uid,
           subjectId: ev.subjectId,
@@ -265,6 +319,7 @@ NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
           maxScore: ev.maxScore,
           date: ev.date,
           type: ev.type,
+          isDraft: ev.isDraft === true,
           planRunId: runId,
           createdAt: Date.now() + createdEvalsCount,
         });
@@ -301,7 +356,10 @@ NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
   const modulesRef = collection(db, 'subjectModules');
   const modulesQuery = user?.uid ? query(modulesRef, where('userId', '==', user?.uid), where('subjectId', '==', targetSubjectIdForModules), limit(500)) : null;
   const [modulesData] = useCustomCollectionData(modulesQuery);
-  const modules = Array.isArray(modulesData) ? [...modulesData].sort((a, b) => (a.order || 0) - (b.order || 0)) : [];
+  const allModules = Array.isArray(modulesData) ? [...modulesData].sort((a, b) => (a.order || 0) - (b.order || 0)) : [];
+  const modules = subject?.groupId
+    ? filterModulesForMateria(allModules, subjectId, subMode === 'planificacion' ? 'general' : 'subject')
+    : allModules;
 
   const notesRef = collection(db, 'notes');
   const notesQuery = user?.uid ? query(notesRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
@@ -439,7 +497,7 @@ NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
           "evaluations": [
             {
               "title": "Nombre de la prueba/examen",
-              "maxScore": 100,
+              "maxScore": ${gradingScale.maxScore || 100},
               "date": "YYYY-MM-DD",
               "type": "teorica|practica",
               "moduleId": "string"
@@ -522,7 +580,12 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
           maxOrder++;
           batch.set(modRef, {
             userId: user.uid,
-            subjectId,
+            subjectId: targetSubjectIdForModules,
+            ...(subject?.groupId ? {
+              classGroupId: subject.groupId,
+              scope: 'subject',
+              assignedSubjectId: subjectId,
+            } : {}),
             title: nm.title || 'Módulo Extraído',
             description: nm.description || '',
             startDate: nm.startDate || null,
@@ -589,7 +652,9 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
             subjectId,
             moduleId: resolveModuleId(ev.moduleId),
             title: ev.title || 'Evaluación Extraída',
-            maxScore: ev.maxScore || 100,
+            maxScore: gradingScale.maxScore !== 100
+              ? gradingScale.maxScore
+              : (Number(ev.maxScore) > 0 ? Number(ev.maxScore) : gradingScale.maxScore || 100),
             date: ev.date || note.date,
             type: ev.type || 'teorica'
           });
@@ -633,7 +698,12 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
         const maxOrder = modules.length > 0 ? Math.max(...modules.map((m) => m.order)) : 0;
         await addDoc(collection(db, 'subjectModules'), {
           userId: user.uid,
-          subjectId,
+          subjectId: targetSubjectIdForModules,
+          ...(subject?.groupId ? {
+            classGroupId: subject.groupId,
+            scope: subMode === 'planificacion' ? 'classGroup' : 'subject',
+            assignedSubjectId: subMode === 'planificacion' ? null : subjectId,
+          } : {}),
           title,
           description,
           startDate: startDate || null,
@@ -772,7 +842,12 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
             const docRef = doc(collection(db, 'subjectModules'));
             batch.set(docRef, {
                 userId: user.uid,
-                subjectId,
+                subjectId: targetSubjectIdForModules,
+                ...(subject?.groupId ? {
+                  classGroupId: subject.groupId,
+                  scope: subMode === 'planificacion' ? 'classGroup' : 'subject',
+                  assignedSubjectId: subMode === 'planificacion' ? null : subjectId,
+                } : {}),
                 title: generatedTitle,
                 order: currentMaxOrder + added + 1,
                 createdAt: ts + i,
@@ -1394,7 +1469,9 @@ Semana 2: Los seres vivos y sus hábitats, palabras agudas y llanas, y mapas de 
             </p>
           </div>
         ) : (
-          modules.filter((v,i,a)=>a.findIndex(t=>(t.title === v.title))===i).filter(m => !m.parentId).map((mod, index) => {
+          modules.filter((v,i,a)=>a.findIndex(t =>
+            t.title === v.title && String(t.assignedSubjectId || '') === String(v.assignedSubjectId || '')
+          )===i).filter(m => !m.parentId).map((mod, index) => {
             const isExpanded = expandedModules.includes(mod.id!);
             const moduleNotes = notes.filter((n) => n.moduleId === mod.id);
 
@@ -1434,6 +1511,11 @@ Semana 2: Los seres vivos y sus hábitats, palabras agudas y llanas, y mapas de 
                       <h4 className="text-2xl font-black text-neutral-900 group-hover:text-indigo-600 transition-colors leading-tight">
                         {mod.title}
                       </h4>
+                      {mod.assignedSubjectId && (
+                        <span className="bg-indigo-50 text-indigo-700 text-[10px] font-black px-3 py-1.5 rounded-full uppercase tracking-wider border border-indigo-100 shrink-0">
+                          {aulaMaterias?.find((materia) => String(materia.id) === String(mod.assignedSubjectId))?.name || 'Materia asignada'}
+                        </span>
+                      )}
                     </div>
                     {(mod.startDate || mod.endDate) && (
                       <div className="flex items-center gap-2 mt-3 text-[10px] font-black tracking-widest uppercase bg-indigo-50/50 text-indigo-600 border border-indigo-100 rounded-lg px-3 py-1.5 inline-flex shadow-sm">

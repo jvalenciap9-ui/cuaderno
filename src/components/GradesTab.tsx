@@ -24,7 +24,7 @@ import { loadObservationsForSubject, saveObservation } from '../lib/observations
 import { showToast } from '../hooks/useToast';
 import { usePlan } from '../hooks/usePlan';
 // Aula/Grupo multiasignatura: participantes compartidos + selector de materia.
-import { useCanonicalSubjectId } from '../lib/classGroups';
+import { filterModulesForMateria, useCanonicalSubjectId } from '../lib/classGroups';
 import { MateriaSelector } from './MateriaSelector';
 
 interface GradesTabProps {
@@ -58,6 +58,8 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
   const [savingGrades, setSavingGrades] = useState(false);
   const [consolidatedScores, setConsolidatedScores] = useState<Record<string, Record<string, string>>>({});
   const [pendingEdits, setPendingEdits] = useState<Record<string, { studentId: string; evaluationId: string; subjectId: string; scoreStr: string; maxScore: number }>>({});
+  const isAula = !!(aulaMaterias && aulaMaterias.length >= 2);
+  const [exportScope, setExportScope] = useState<'general' | 'subject'>(isAula ? 'general' : 'subject');
 
   // Resetear estados al cambiar de materia activa para prevenir fugas de id de evaluación
   useEffect(() => {
@@ -66,6 +68,10 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
     setConsolidatedScores({});
     setPendingEdits({});
   }, [subjectId]);
+
+  useEffect(() => {
+    setExportScope(isAula ? 'general' : 'subject');
+  }, [isAula, aulaMaterias?.[0]?.groupId]);
 
   // ── Aula/Grupo: los ESTUDIANTES y MÓDULOS GLOBALES viven en la asignatura canónica del aula
   // (lista compartida); evaluaciones y calificaciones siguen siendo de ESTA materia.
@@ -81,7 +87,8 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
   const [allGrades = []] = useCustomCollectionData(gradesQuery);
 
   const modulesQuery = user?.uid ? query(collection(db, 'subjectModules'), where('userId', '==', user?.uid), where('subjectId', '==', sharedStudentListId), limit(500)) : null;
-  const [modules = []] = useCustomCollectionData(modulesQuery);
+  const [allSharedModules = []] = useCustomCollectionData(modulesQuery);
+  const modules = filterModulesForMateria(allSharedModules, subjectId, 'subject');
 
   const selectedEvalGradesQuery = selectedEvalId && user?.uid ? query(collection(db, 'grades'), where('userId', '==', user?.uid), where('evaluationId', '==', selectedEvalId), limit(500)) : null;
   const [grades = []] = useCustomCollectionData(selectedEvalGradesQuery);
@@ -517,7 +524,6 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
           materias={aulaMaterias}
           onSwitch={handleMateriaSwitchRequest}
           hint="Evaluaciones propias · Participantes compartidos"
-          includeGeneral={true}
         />
       )}
       {pendingSwitchId && (
@@ -587,6 +593,19 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                 </button>
               )}
 
+              {isAula && (
+                <select
+                  value={exportScope}
+                  onChange={(event) => setExportScope(event.target.value as 'general' | 'subject')}
+                  aria-label="Alcance del reporte Excel"
+                  title="Elegir si el Excel incluye toda el aula o solo la materia activa"
+                  className="appearance-none bg-white border border-neutral-200 rounded-2xl px-4 py-4 text-xs font-black text-neutral-800 outline-none focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/5 transition-all cursor-pointer uppercase tracking-wider"
+                >
+                  <option value="general">General · Todas las materias</option>
+                  <option value="subject">Solo materia activa</option>
+                </select>
+              )}
+
               <button
                 id="exporta-tu-informe-de-clases-en-excel-y-editalo-para-tus-entregas"
                 onClick={() => {
@@ -594,10 +613,17 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
                     showToast('warning', '¡Actualiza a Premium Pro para exportar tus calificaciones a Excel!');
                     return;
                   }
-                  exportSubjectDataToExcel(user!.uid, user!.displayName || user!.email!, subjectId);
+                  exportSubjectDataToExcel(
+                    user!.uid,
+                    user!.displayName || user!.email!,
+                    subjectId,
+                    isAula && exportScope === 'general' ? 'general' : undefined,
+                  );
                 }}
                 className={cn("inline-flex items-center gap-2 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 hover:text-emerald-700 px-6 py-4 rounded-2xl text-sm font-black transition-all border border-emerald-200 uppercase tracking-widest active:scale-95 shadow-sm", modules.length < 2 ? "ml-auto" : "")}
-                title="exporta tu informe de clases en excel y editalo para tus entregas"
+                title={isAula && exportScope === 'general'
+                  ? 'Exportar el aula completa: resumen, materias y asistencia general'
+                  : 'Exportar la materia activa en Excel'}
               >
                 <Download className="w-5 h-5" />
                 Exportar Excel
