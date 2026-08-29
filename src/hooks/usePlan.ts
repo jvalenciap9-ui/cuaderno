@@ -46,6 +46,47 @@ export const PLAN_LIMITS: Record<PlanType, { maxSubjects: number; aiCallsPerMont
   school: { maxSubjects: 999,  aiCallsPerMonth: 9999, label: 'Institucional' },
 };
 
+export function canUseMultiSubject(
+  user: { uid?: string } | null | undefined,
+  profile: Partial<UserProfile> | null | undefined,
+  env?: { isStaging?: boolean }
+): boolean {
+  if (!user?.uid || !profile) return false;
+  if ((profile as any).disabled === true || (profile as any).isRevoked === true) return false;
+
+  const now = Date.now();
+  const staging = env?.isStaging ?? (import.meta.env.VITE_SHOW_RC1_BADGE === 'true' || import.meta.env.VITE_ENVIRONMENT === 'staging');
+  if (staging) return true;
+
+  // Active pilot code check
+  if ((profile as any).isPilot) {
+    if (typeof (profile as any).pilotExpiresAt === 'number' && (profile as any).pilotExpiresAt <= now) {
+      return false;
+    }
+    return true;
+  }
+
+  // Active Pro trial check
+  if (profile.isTrial) {
+    const paidUser = !!profile.paymentProvider && profile.paymentProvider !== 'trial';
+    if (!paidUser && typeof profile.trialEndsAt === 'number' && profile.trialEndsAt <= now) {
+      return false;
+    }
+    return true;
+  }
+
+  // Active plan check
+  const effectivePlan = profile.plan || 'free';
+  if (effectivePlan === 'pro' || effectivePlan === 'school') {
+    if (typeof profile.expiresAt === 'number' && profile.expiresAt <= now) {
+      return false;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 export function usePlan() {
   const { user } = useAuth();
   const [profile, setProfile] = useState<UserProfile | null>(null);
@@ -136,6 +177,8 @@ export function usePlan() {
     return currentCount < limits.maxSubjects;
   };
 
+  const canMultiSubject = canUseMultiSubject(user, profile);
+
   return {
     plan,
     profile,
@@ -143,7 +186,8 @@ export function usePlan() {
     limits,
     canUseAI,
     canCreateSubject,
-    isPro: plan === 'pro' || plan === 'school',
+    canMultiSubject,
+    isPro: canMultiSubject || plan === 'pro' || plan === 'school',
     isSchool: plan === 'school',
     isAdmin,
   };

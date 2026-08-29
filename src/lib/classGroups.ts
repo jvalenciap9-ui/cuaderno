@@ -63,13 +63,34 @@ export function normalizeName(s: string): string {
 
 export function computeAulaDisplayName(grado: string, seccion: string, customName?: string): string {
   const custom = normalizeName(customName || '');
-  if (custom) return custom;
-  const g = normalizeName(grado);
-  const s = normalizeName(seccion);
-  if (g && s) return `${g} ${s}`;
-  if (g) return g;
-  if (s) return `Sección ${s}`;
-  return '';
+  let g = normalizeName(grado);
+  let s = normalizeName(seccion);
+
+  if (g && s && g.toLowerCase() === s.toLowerCase()) {
+    s = '';
+  }
+
+  let baseGradeSection = '';
+  if (g && s) {
+    if (s.toLowerCase().startsWith(g.toLowerCase())) {
+      baseGradeSection = s;
+    } else if (g.toLowerCase().endsWith(s.toLowerCase())) {
+      baseGradeSection = g;
+    } else {
+      baseGradeSection = `${g} ${s}`;
+    }
+  } else {
+    baseGradeSection = g || (s ? `Sección ${s}` : '');
+  }
+
+  if (custom) {
+    if (!baseGradeSection) return custom;
+    if (custom.toLowerCase() === baseGradeSection.toLowerCase()) return custom;
+    if (custom.toLowerCase().includes(baseGradeSection.toLowerCase())) return custom;
+    return `${custom} · ${baseGradeSection}`;
+  }
+
+  return baseGradeSection;
 }
 
 export function nameKey(s: string): string {
@@ -206,11 +227,14 @@ export function planUnits(subjects: SubjectDoc[], groups: ClassGroupDoc[]): Plan
 export interface PlanDecision { allowed: boolean; reason?: string }
 
 export function canCreateClassGroup(plan: string, subjects: SubjectDoc[], groups: ClassGroupDoc[]): PlanDecision {
+  if (plan === 'free') {
+    return {
+      allowed: false,
+      reason: 'Aula Multiasignatura es una función exclusiva de Premium Pro. Actualiza tu plan para organizarte por aulas.',
+    };
+  }
   const max = PLAN_UNIT_LIMITS[plan] ?? 2;
   const u = planUnits(subjects, groups);
-  if (plan === 'free' && u.groups >= 1) {
-    return { allowed: false, reason: 'El plan Gratuito permite un único Aula/Grupo multiasignatura. Mejora a Premium para crear más.' };
-  }
   if (u.units + 1 > max) {
     return { allowed: false, reason: `Has alcanzado tu límite de ${max} (asignaturas y/o aulas). Mejora tu plan para ampliarlo.` };
   }
@@ -370,6 +394,123 @@ export async function fetchClassGroups(uid: string): Promise<ClassGroupDoc[]> {
 export function lastMateriaStorageKey(groupId: string | null | undefined): string {
   const safe = String(groupId ?? '').replace(/[^a-zA-Z0-9_:-]/g, '');
   return `ediagil_aula_ultima_materia_${safe}`;
+}
+
+export interface ValidatedAIDistribution {
+  ok: boolean;
+  validModules: Array<{ subjectId: string; title: string; description?: string; order?: number }>;
+  validEvaluations: Array<{ subjectId: string; title: string; maxScore: number; date: string; type: 'teorica' | 'practica' | 'apreciativa'; isDraft?: boolean }>;
+  unclassified: Array<{ title: string; content?: string }>;
+  summary: {
+    matchedSubjects: string[];
+    assignedModulesCount: number;
+    assignedEvalsCount: number;
+    unclassifiedCount: number;
+  };
+}
+
+export function validateAIDistribution(
+  rawModules: any[],
+  rawEvaluations: any[],
+  rawUnclassified: any[],
+  validSubjects: Array<{ id: string; name: string }>
+): ValidatedAIDistribution {
+  const validMap = new Map<string, string>();
+  (Array.isArray(validSubjects) ? validSubjects : []).forEach((s) => {
+    if (s && s.id) validMap.set(String(s.id), String(s.name || s.id));
+  });
+
+  const validModules: Array<{ subjectId: string; title: string; description?: string; order?: number }> = [];
+  const validEvaluations: Array<{ subjectId: string; title: string; maxScore: number; date: string; type: 'teorica' | 'practica' | 'apreciativa'; isDraft?: boolean }> = [];
+  const unclassified = Array.isArray(rawUnclassified) ? [...rawUnclassified] : [];
+  const matchedSubjects = new Set<string>();
+
+  (Array.isArray(rawModules) ? rawModules : []).forEach((m, idx) => {
+    if (!m || typeof m !== 'object') return;
+    const subId = m.subjectId ? String(m.subjectId) : '';
+    const title = normalizeName(m.title || '');
+    if (subId && validMap.has(subId) && title) {
+      matchedSubjects.add(validMap.get(subId)!);
+      validModules.push({
+        subjectId: subId,
+        title,
+        description: String(m.description || '').trim(),
+        order: typeof m.order === 'number' && m.order > 0 ? m.order : idx + 1,
+      });
+    } else if (title) {
+      unclassified.push({
+        title,
+        content: String(m.description || 'Módulo sin materia asignada').trim(),
+      });
+    }
+  });
+
+  (Array.isArray(rawEvaluations) ? rawEvaluations : []).forEach((e) => {
+    if (!e || typeof e !== 'object') return;
+    const subId = e.subjectId ? String(e.subjectId) : '';
+    let title = normalizeName(e.title || '');
+    if (!title) return;
+
+    if (subId && validMap.has(subId)) {
+      matchedSubjects.add(validMap.get(subId)!);
+      const maxScore = typeof e.maxScore === 'number' && e.maxScore > 0 ? e.maxScore : Number(e.maxScore) || 100;
+      const date = typeof e.date === 'string' && e.date.trim() ? e.date.trim() : '';
+      const rawType = e.type;
+      const type: 'teorica' | 'practica' | 'apreciativa' = ['teorica', 'practica', 'apreciativa'].includes(rawType) ? rawType : 'teorica';
+      const isDraft = !date || maxScore <= 0;
+
+      if (isDraft && !title.toLowerCase().includes('borrador')) {
+        title = `${title} (Borrador pendiente de revisión)`;
+      }
+
+      validEvaluations.push({
+        subjectId: subId,
+        title,
+        maxScore,
+        date: date || new Date().toISOString().split('T')[0],
+        type,
+        isDraft,
+      });
+    } else {
+      unclassified.push({
+        title,
+        content: `Evaluación sin materia válida asignada por la IA`,
+      });
+    }
+  });
+
+  return {
+    ok: true,
+    validModules,
+    validEvaluations,
+    unclassified,
+    summary: {
+      matchedSubjects: Array.from(matchedSubjects),
+      assignedModulesCount: validModules.length,
+      assignedEvalsCount: validEvaluations.length,
+      unclassifiedCount: unclassified.length,
+    },
+  };
+}
+
+export function buildOriginalPlanData(
+  content: string,
+  fileName?: string,
+  fileType?: string,
+  planType?: string,
+  previousVersion?: number
+) {
+  const normContent = String(content || '').trim();
+  const v = typeof previousVersion === 'number' && previousVersion > 0 ? previousVersion + 1 : 1;
+  return {
+    content: normContent,
+    fileName: normalizeName(fileName || 'Plan de Aula'),
+    fileType: String(fileType || 'text/plain'),
+    loadedAt: Date.now(),
+    version: v,
+    format: String(planType || 'semanal'),
+    scope: 'classGroup',
+  };
 }
 
 /** Reexport tipo Dexie para uso interno de jsonSyncUtils. */

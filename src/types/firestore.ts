@@ -51,6 +51,22 @@ export interface ClassGroupDoc extends FirestoreDoc {
   periodo?: Periodo | '';
   /** Versión de esquema del aula (1 = inicial). Para futuras migraciones. */
   schemaVersion?: number;
+  planDraft?: string;
+  planType?: 'semanal' | 'mensual' | 'trimestral';
+  planStatus?: 'idle' | 'draft_saved' | 'distributed';
+  originalPlan?: {
+    content: string;
+    fileName?: string;
+    fileType?: string;
+    loadedAt: number;
+    version: number;
+    format?: string;
+    periodo?: string;
+    dates?: string;
+    scope?: string;
+  };
+  lastPlanRunId?: string;
+  unclassifiedItems?: Array<{ title: string; content?: string }>;
   createdAt: number;
   updatedAt: number;
 }

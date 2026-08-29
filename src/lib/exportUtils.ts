@@ -347,11 +347,15 @@ function buildSubjectWorkbook(
   }
 }
 
-export async function exportSubjectDataToExcel(userId: string, userName: string | null, subjectId: string) {
+export async function exportSubjectDataToExcel(userId: string, userName: string | null, subjectId: string, scope?: string) {
   const { utils, writeFile } = await import('xlsx');
   const subjectDoc = await getDoc(doc(db, 'subjects', subjectId));
   if (!subjectDoc.exists()) return;
   const subject = { id: subjectDoc.id, ...subjectDoc.data() } as any;
+
+  if (subject.groupId && scope === 'general') {
+    return exportClassGroupDataToExcel(userId, userName, subject.groupId);
+  }
 
   const data: SubjectExportData = {
     students: await getAllDocsForUserSubject('students', userId, subjectId),
@@ -366,6 +370,112 @@ export async function exportSubjectDataToExcel(userId: string, userName: string 
   buildSubjectWorkbook(utils, wb, subject, data, settings, userName);
 
   const filename = `reporte-${subject.name ? subject.name.replace(/[^a-z0-9]/gi, '_').toLowerCase() : 'asignatura'}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`;
+  writeFile(wb, filename);
+}
+
+/**
+ * Exporta el reporte completo del Aula Multiasignatura (Alcance: General).
+ * Genera la hoja "Resumen General", hojas por cada materia con su nombre real,
+ * y la hoja "Asistencia General" sin atribuir falsamente a una sola materia.
+ */
+export async function exportClassGroupDataToExcel(userId: string, userName: string | null, groupId: string) {
+  const { utils, writeFile } = await import('xlsx');
+  const groupSnap = await getDoc(doc(db, 'classGroups', groupId));
+  const groupData = groupSnap.exists() ? ({ id: groupSnap.id, ...groupSnap.data() } as any) : null;
+
+  const subjectsSnap = await getDocs(
+    query(collection(db, 'subjects'), where('userId', '==', userId), where('groupId', '==', groupId))
+  );
+  const subjects = subjectsSnap.docs.map(d => ({ id: d.id, ...d.data() })) as any[];
+  if (subjects.length === 0) return;
+
+  // Canonical subject for shared students & attendance
+  const canonSubjectId = subjects.slice().sort((a, b) => ((a.createdAt || 0) - (b.createdAt || 0)))[0].id;
+
+  const sharedStudents = await getAllDocsForUserSubject('students', userId, canonSubjectId);
+  const sharedAttendance = await getAllDocsForUserSubject('attendance', userId, canonSubjectId);
+
+  const settings = settingsFromStorage();
+  const wb = utils.book_new();
+
+  // 1. Hoja "Resumen General"
+  const groupTitle = groupData
+    ? (groupData.name || 'Aula')
+    : 'Aula Multiasignatura';
+
+  const dateStr = new Date().toLocaleDateString('es-ES');
+  const summaryHeaders = [
+    ['Reporte', 'Resumen General del Aula'],
+    ['Aula', groupTitle],
+    ['Alcance', 'General · Todas las materias'],
+    ['Profesor', userName || 'Profesor Asignado'],
+    ['Fecha', dateStr],
+    []
+  ];
+
+  const summaryTableHeader = ['Estudiante', 'Cédula', ...subjects.map(s => s.name), 'Promedio General', 'Asistencia Global'];
+
+  const perSubjectData: Record<string, SubjectExportData> = {};
+  for (const sub of subjects) {
+    perSubjectData[sub.id] = {
+      students: sharedStudents,
+      subjectModules: await getAllDocsForUserSubject('subjectModules', userId, sub.id),
+      evaluations: await getAllDocsForUserSubject('evaluations', userId, sub.id),
+      grades: await getAllDocsForUserSubject('grades', userId, sub.id),
+      attendance: sharedAttendance,
+    };
+  }
+
+  const sortedStudents = [...sharedStudents].sort((a, b) => (a.lastName || '').localeCompare(b.lastName || ''));
+
+  const summaryRows = sortedStudents.map(st => {
+    const row: any[] = [`${st.lastName || ''}, ${st.firstName || ''}`, st.cedula || ''];
+    let studentSum = 0;
+    let validSubjectCount = 0;
+
+    for (const sub of subjects) {
+      const subData = perSubjectData[sub.id];
+      const stGrades = subData.grades.filter(g => g.studentId === st.id);
+      const val = calculateWeightedAverage(stGrades, subData.evaluations, settings.weights, settings.gradingScale as any, settings.useCheckpoint);
+      if (stGrades.length > 0) {
+        studentSum += val;
+        validSubjectCount++;
+      }
+      row.push(val > 0 ? val.toFixed(1) : '—');
+    }
+
+    const globalAvg = validSubjectCount > 0 ? (studentSum / validSubjectCount) : 0;
+    row.push(globalAvg > 0 ? globalAvg.toFixed(1) : '—');
+
+    const stAttendance = sharedAttendance.filter(a => a.studentId === st.id);
+    let presentCount = 0;
+    stAttendance.forEach(a => {
+      if (a.status === 'present' || a.status === 'late' || a.status === 'justified') presentCount++;
+    });
+    const attPct = stAttendance.length > 0 ? (presentCount / stAttendance.length) * 100 : 100;
+    row.push(attPct.toFixed(0) + '%');
+
+    return row;
+  });
+
+  const wsSummary = utils.aoa_to_sheet([...summaryHeaders, summaryTableHeader, ...summaryRows]);
+  wsSummary['!cols'] = [{ wch: 30 }, { wch: 15 }, ...subjects.map(() => ({ wch: 18 })), { wch: 20 }, { wch: 18 }];
+  utils.book_append_sheet(wb, wsSummary, 'Resumen General');
+
+  // 2. Una hoja por cada materia
+  const usedPrefixes = new Set<string>();
+  for (const sub of subjects) {
+    let prefix = sub.name ? sub.name.replace(/[^a-z0-9]/gi, '_').substring(0, 20) : 'materia';
+    let candidate = prefix;
+    for (let i = 2; usedPrefixes.has(candidate); i++) {
+      candidate = `${prefix}_${i}`.substring(0, 20);
+    }
+    usedPrefixes.add(candidate);
+
+    buildSubjectWorkbook(utils, wb, sub, perSubjectData[sub.id], settings, userName, candidate);
+  }
+
+  const filename = `reporte-general-aula-${groupTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase()}-${format(new Date(), 'yyyy-MM-dd')}.xlsx`;
   writeFile(wb, filename);
 }
 

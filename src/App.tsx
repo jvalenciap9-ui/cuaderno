@@ -89,6 +89,7 @@ import type { ClassGroupDoc, SubjectDoc, NoteDoc } from "./types/firestore";
 import {
   canCreateClassGroup,
   canCreateStandaloneSubject,
+  computeAulaDisplayName,
   planSubjectDeletion,
   siblingsOf,
   lastMateriaStorageKey,
@@ -1084,103 +1085,111 @@ function CuadernoApp() {
                   if (!inAula.has(String(s.id))) items.push({ kind: 'solo', subject: s });
                 }
 
-                /** Abre una asignatura; si pertenece a un aula, restaura la
-                    última materia usada en ESE aula (memoria por aula). */
-                const openSubject = (subject: SubjectDoc) => {
-                  let targetId = String(subject.id);
-                  if (subject.groupId) {
-                    try {
-                      const last = localStorage.getItem(lastMateriaStorageKey(subject.groupId));
-                      const validLast = last
-                        ? siblingsOf(subjects as SubjectDoc[], subject.groupId).some((m) => m.id === last)
-                        : false;
-                      if (validLast) targetId = last!;
-                    } catch { /* storage bloqueado: usar la materia clicada */ }
-                  }
+                const openAula = (group: ClassGroupDoc, members: SubjectDoc[]) => {
+                  if (members.length === 0) return;
+                  let targetId = String(members[0].id);
+                  try {
+                    const last = localStorage.getItem(lastMateriaStorageKey(group.id));
+                    const validLast = last ? members.some((m) => String(m.id) === last) : false;
+                    if (validLast) targetId = last!;
+                  } catch { /* storage bloqueado */ }
                   setSelectedSubjectId(targetId);
+                  setActiveTab("modules");
                   setCurrentView("subject");
                   setIsSidebarOpen(false);
                 };
 
-                return items.map((item) =>
-                  item.kind === 'aula' ? (
-                    <div key={`aula-${item.group.id}`} className="pt-2">
-                      <div className="flex items-center gap-2 px-4 pb-1.5">
-                        <Users className="w-3 h-3 text-[var(--institution-primary)]" />
-                        <span className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-500 truncate">
-                          Aula · {item.group.name}
-                        </span>
-                        <span className="ml-auto shrink-0 text-[9px] font-black text-neutral-400 bg-neutral-100 rounded-full px-2 py-0.5">
-                          {item.members.length} materias
-                        </span>
-                      </div>
-                      <div className="space-y-2">
-                        {item.members.map((subject) => (
-                          <button
-                            key={subject.id}
-                            title="Abrir esta materia del aula"
-                            onClick={() => openSubject(subject)}
-                            className={cn(
-                              "w-full flex items-center justify-between pl-6 pr-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95",
-                              selectedSubjectId === subject.id &&
-                                currentView === "subject"
-                                ? "bg-neutral-100 text-neutral-900 shadow-sm border border-neutral-200"
-                                : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 border border-transparent",
-                            )}
-                          >
-                            <div className="flex items-center gap-4 truncate">
-                              <div
-                                className="w-3.5 h-3.5 rounded-full shrink-0 shadow-sm border-2 border-white"
-                                style={{ backgroundColor: subject.color }}
-                              />
-                              <span className="truncate font-black text-sm">
-                                {subject.name}
-                              </span>
-                            </div>
-                            <ChevronRight
+                const openSubject = (subject: SubjectDoc) => {
+                  setSelectedSubjectId(String(subject.id));
+                  setCurrentView("subject");
+                  setIsSidebarOpen(false);
+                };
+
+                const aulas = items.filter((i): i is Extract<Item, { kind: 'aula' }> => i.kind === 'aula');
+                const solos = items.filter((i): i is Extract<Item, { kind: 'solo' }> => i.kind === 'solo');
+
+                return (
+                  <div className="space-y-3">
+                    {/* Aulas Multiasignatura (Sección 9: una sola fila por aula) */}
+                    {aulas.map((item) => {
+                      const isAulaActive = currentView === "subject" && selectedSubject?.groupId === item.group.id;
+                      const rawDisplay = computeAulaDisplayName(item.group.grado, item.group.seccion, item.group.name) || 'Aula';
+                      const label = rawDisplay.toLowerCase().startsWith('aula') ? rawDisplay : `Aula ${rawDisplay}`;
+                      return (
+                        <button
+                          key={`aula-${item.group.id}`}
+                          type="button"
+                          aria-current={isAulaActive ? "page" : undefined}
+                          aria-selected={isAulaActive ? true : undefined}
+                          title={`Abrir ${label}`}
+                          onClick={() => openAula(item.group, item.members)}
+                          className={cn(
+                            "w-full flex items-center justify-between px-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95 text-left border",
+                            isAulaActive
+                              ? "bg-[#F0F7F4] text-[#1A3C40] border-[#1A3C40]/20 border-l-4 border-l-[#1A3C40] shadow-sm font-black"
+                              : "text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900 border-transparent font-bold"
+                          )}
+                        >
+                          <div className="flex items-center gap-3 truncate">
+                            <Users className={cn("w-4 h-4 shrink-0", isAulaActive ? "text-[#1A3C40]" : "text-neutral-400 group-hover:text-neutral-600")} />
+                            <span className="truncate text-sm tracking-tight">{label}</span>
+                          </div>
+                          <span className={cn(
+                            "shrink-0 text-[10px] font-black rounded-full px-2.5 py-0.5 border",
+                            isAulaActive
+                              ? "bg-[#1A3C40] text-white border-transparent"
+                              : "bg-neutral-100 text-neutral-500 border-neutral-200"
+                          )}>
+                            {item.members.length} materias
+                          </span>
+                        </button>
+                      );
+                    })}
+
+                    {/* Asignaturas independientes */}
+                    {solos.length > 0 && (
+                      <div className="pt-2 space-y-2">
+                        <div className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400 px-4 pb-1">
+                          Asignaturas independientes
+                        </div>
+                        {solos.map((item) => {
+                          const isSoloActive = currentView === "subject" && selectedSubjectId === item.subject.id;
+                          return (
+                            <button
+                              key={item.subject.id}
+                              type="button"
+                              aria-current={isSoloActive ? "page" : undefined}
+                              aria-selected={isSoloActive ? true : undefined}
+                              title={`Seleccionar ${item.subject.name}`}
+                              onClick={() => openSubject(item.subject)}
                               className={cn(
-                                "w-4 h-4 shrink-0 transition-all duration-300",
-                                selectedSubjectId === subject.id
-                                  ? "opacity-100 translate-x-0 text-[var(--institution-primary)]"
-                                  : "opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0",
+                                "w-full flex items-center justify-between px-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95 border text-left",
+                                isSoloActive
+                                  ? "bg-neutral-100 text-neutral-900 shadow-sm border-neutral-200 font-black"
+                                  : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 border-transparent font-medium"
                               )}
-                            />
-                          </button>
-                        ))}
+                            >
+                              <div className="flex items-center gap-3 truncate">
+                                <div
+                                  className="w-3.5 h-3.5 rounded-full shrink-0 shadow-sm border-2 border-white"
+                                  style={{ backgroundColor: item.subject.color }}
+                                />
+                                <span className="truncate text-sm">{item.subject.name}</span>
+                              </div>
+                              <ChevronRight
+                                className={cn(
+                                  "w-4 h-4 shrink-0 transition-all duration-300",
+                                  isSoloActive
+                                    ? "opacity-100 text-[var(--institution-primary)]"
+                                    : "opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0"
+                                )}
+                              />
+                            </button>
+                          );
+                        })}
                       </div>
-                    </div>
-                  ) : (
-                    <button
-                      key={item.subject.id}
-                      title="Seleccionar esta asignatura"
-                      onClick={() => openSubject(item.subject)}
-                      className={cn(
-                        "w-full flex items-center justify-between px-4 py-3.5 rounded-2xl transition-all group hover:scale-[1.02] active:scale-95",
-                        selectedSubjectId === item.subject.id &&
-                          currentView === "subject"
-                          ? "bg-neutral-100 text-neutral-900 shadow-sm border border-neutral-200"
-                          : "text-neutral-500 hover:bg-neutral-50 hover:text-neutral-900 border border-transparent",
-                      )}
-                    >
-                      <div className="flex items-center gap-4 truncate">
-                        <div
-                          className="w-3.5 h-3.5 rounded-full shrink-0 shadow-sm border-2 border-white"
-                          style={{ backgroundColor: item.subject.color }}
-                        />
-                        <span className="truncate font-black text-sm">
-                          {item.subject.name}
-                        </span>
-                      </div>
-                      <ChevronRight
-                        className={cn(
-                          "w-4 h-4 shrink-0 transition-all duration-300",
-                          selectedSubjectId === item.subject.id
-                            ? "opacity-100 translate-x-0 text-[var(--institution-primary)]"
-                            : "opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0",
-                        )}
-                      />
-                    </button>
-                  ),
+                    )}
+                  </div>
                 );
               })()}
             </div>
@@ -1303,34 +1312,45 @@ function CuadernoApp() {
                 </div>
               )}
 
-              {/* Subject Header */}
+              {/* Subject / Aula Header (Sección 10) */}
               <div className="mb-12">
                 <div className="flex flex-col md:flex-row md:items-start justify-between gap-8 mb-10">
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-4 mb-4">
-                      <div
-                        className="w-6 h-6 rounded-full border-4 border-white shadow-md"
-                        style={{ backgroundColor: selectedSubject.color }}
-                      />
-                      <h2 className="text-4xl md:text-5xl font-black text-neutral-900 tracking-tight leading-tight truncate">
-                        {selectedSubject.name}
-                      </h2>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-4 text-sm text-neutral-500 mt-6">
-                      {/* Chip del Aula/Grupo (solo materias agrupadas): no repite III B · III B */}
-                      {selectedGroup && (() => {
-                        const name = (selectedGroup.name || '').trim();
-                        const gs = [selectedGroup.grado, selectedGroup.seccion].map(s => (s || '').trim()).filter(Boolean).join(' ');
-                        const displayLabel = !gs ? name || 'Aula Multiasignatura' : (!name || name.toLowerCase() === gs.toLowerCase()) ? gs : `${name} · ${gs}`;
-                        return (
-                          <div className="flex items-center gap-2.5 bg-[#F0F7F4] px-4 py-2 rounded-xl border border-[#1A3C40]/10 shadow-sm">
-                            <Users className="w-4 h-4 text-[#1A3C40]" />
-                            <span className="font-bold text-[#1A3C40] text-xs">
-                              {displayLabel}
-                            </span>
+                    {(() => {
+                      const groupTitle = selectedGroup
+                        ? (computeAulaDisplayName(selectedGroup.grado, selectedGroup.seccion, selectedGroup.name) || 'Aula Multiasignatura')
+                        : '';
+                      const fullTitle = selectedGroup
+                        ? (groupTitle.toLowerCase().startsWith('aula') ? groupTitle : `Aula ${groupTitle}`)
+                        : selectedSubject.name;
+
+                      return (
+                        <>
+                          <div className="flex items-center gap-4 mb-2">
+                            <div
+                              className="w-6 h-6 rounded-full border-4 border-white shadow-md shrink-0"
+                              style={{ backgroundColor: selectedSubject.color }}
+                            />
+                            <h2 className="text-3xl md:text-5xl font-black text-neutral-900 tracking-tight leading-tight truncate">
+                              {fullTitle}
+                            </h2>
                           </div>
-                        );
-                      })()}
+                          {selectedGroup && (
+                            <div className="flex flex-wrap items-center gap-2.5 mt-1.5 mb-2">
+                              <div className="flex items-center gap-2 text-indigo-900 font-black text-xs md:text-sm bg-indigo-50 border border-indigo-200 px-3.5 py-1.5 rounded-xl shadow-sm">
+                                <BookOpen className="w-4 h-4 text-indigo-600 shrink-0" />
+                                <span>Alcance: General</span>
+                              </div>
+                              <div className="flex items-center gap-2 text-neutral-700 font-bold text-xs bg-neutral-100 border border-neutral-200 px-3 py-1.5 rounded-xl shadow-sm">
+                                <Users className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                                <span>{aulaMateriasOf(selectedSubject).length} materias</span>
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
+                    <div className="flex flex-wrap items-center gap-4 text-sm text-neutral-500 mt-6">
                       {selectedSubject.plan &&
                         selectedSubject.plan !== "otro" && (
                           <div className="flex items-center gap-2.5 bg-white px-4 py-2 rounded-xl border border-neutral-200 shadow-sm hover:border-[var(--institution-primary)]/40 transition-colors">

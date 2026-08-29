@@ -1,11 +1,11 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useDocumentData } from "react-firebase-hooks/firestore";
 import { useCustomCollectionData } from "../lib/firestoreUtils";
 import { collection, query, where, orderBy, doc, addDoc, updateDoc, deleteDoc, writeBatch, getDocs, limit } from "firebase/firestore";
 import { db } from "../lib/firebase";
 import { useAuth } from "./AuthProvider";
 import { handleFirestoreError, OperationType } from "../lib/firestoreUtils";
-import { toast } from '../hooks/useToast';
+import { showToast, toast } from '../hooks/useToast';
 import { usePlan } from '../hooks/usePlan';
 import {
   Plus,
@@ -22,6 +22,9 @@ import {
   Link,
   Video,
   FileQuestion,
+  Upload,
+  CheckCircle2,
+  AlertTriangle,
 } from "lucide-react";
 import * as XLSX from 'xlsx';
 import type { NoteDoc, SubjectModuleDoc, SubjectDoc } from "../types/firestore";
@@ -33,6 +36,7 @@ import { es } from "date-fns/locale";
 import { ai } from "../lib/gemini";
 import { extractTextFromFile } from "../lib/fileParser";
 import { trackEvent, ANALYTICS_CATEGORIES, ANALYTICS_ACTIONS } from "../lib/analytics";
+import { useCanonicalSubjectId, validateAIDistribution, buildOriginalPlanData } from "../lib/classGroups";
 
 interface ModulesTabProps {
   subjectId: string;
@@ -57,8 +61,245 @@ export function ModulesTab({
   const subjectRef = doc(db, 'subjects', subjectId);
   const [subject] = useDocumentData(subjectRef);
 
+  const { canonicalId: sharedModuleSubjectId } = useCanonicalSubjectId(subjectId);
+  const targetSubjectIdForModules = subject?.groupId ? sharedModuleSubjectId : subjectId;
+
+  // ── Modos de Módulos y Materiales (Sección 10 & 11) ──
+  const [subMode, setSubMode] = useState<'materia' | 'planificacion'>('materia');
+  const [planType, setPlanType] = useState<'semanal' | 'mensual' | 'trimestral'>('semanal');
+  const [draftText, setDraftText] = useState('');
+  const [loadedFileName, setLoadedFileName] = useState<string | null>(null);
+  const [isSavingDraft, setIsSavingDraft] = useState(false);
+  const [isDistributing, setIsDistributing] = useState(false);
+  const [planStatus, setPlanStatus] = useState<'idle' | 'draft_saved' | 'distributed'>('idle');
+  const planFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const groupRef = subject?.groupId ? doc(db, 'classGroups', subject.groupId) : null;
+  const [groupDoc] = useDocumentData(groupRef);
+
+  useEffect(() => {
+    if (groupDoc?.planDraft) {
+      setDraftText(groupDoc.planDraft);
+      setPlanStatus('draft_saved');
+    }
+    if (groupDoc?.originalPlan?.fileName) {
+      setLoadedFileName(groupDoc.originalPlan.fileName);
+    }
+    if (groupDoc?.planType) {
+      setPlanType(groupDoc.planType as any);
+    }
+    if (groupDoc?.planStatus) {
+      setPlanStatus(groupDoc.planStatus as any);
+    }
+  }, [groupDoc]);
+
+  const handleSaveDraft = async (customContent?: string, fileName?: string, fileType?: string): Promise<boolean> => {
+    const textToSave = typeof customContent === 'string' ? customContent : draftText;
+    if (!textToSave.trim()) {
+      showToast('warning', 'Escribe o carga el borrador del plan antes de guardar.');
+      return false;
+    }
+    setIsSavingDraft(true);
+    try {
+      if (subject?.groupId) {
+        const originalPlanObj = buildOriginalPlanData(
+          textToSave,
+          fileName || loadedFileName || 'Plan General',
+          fileType || 'text/plain',
+          planType,
+          groupDoc?.originalPlan?.version
+        );
+        await updateDoc(doc(db, 'classGroups', subject.groupId), {
+          planDraft: textToSave,
+          originalPlan: originalPlanObj,
+          planType,
+          planStatus: 'draft_saved',
+          updatedAt: Date.now(),
+        });
+      }
+      setPlanStatus('draft_saved');
+      showToast('success', 'Plan original guardado');
+      return true;
+    } catch (err) {
+      console.error('Error guardando borrador del plan:', err);
+      showToast('error', 'No se pudo guardar el plan.');
+      return false;
+    } finally {
+      setIsSavingDraft(false);
+    }
+  };
+
+  const handlePlanFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      showToast('info', `Cargando archivo ${file.name}...`);
+      let extractedText = '';
+      if (file.type.startsWith('text/') || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
+        extractedText = await file.text();
+      } else {
+        const buffer = await file.arrayBuffer();
+        extractedText = await extractTextFromFile(buffer, file.type);
+      }
+      if (!extractedText.trim()) {
+        showToast('warning', 'No se pudo extraer texto legible del archivo.');
+        return;
+      }
+      setDraftText(extractedText);
+      setLoadedFileName(file.name);
+      await handleSaveDraft(extractedText, file.name, file.type);
+    } catch (err: any) {
+      console.error('Error al leer archivo de plan:', err);
+      showToast('error', 'Error al leer el archivo. Intenta pegar el texto manualmente.');
+    } finally {
+      if (planFileInputRef.current) planFileInputRef.current.value = '';
+    }
+  };
+
+  const handleDistributeWithAI = async () => {
+    if (!draftText.trim()) {
+      showToast('warning', 'Ingresa la planificación que deseas distribuir.');
+      return;
+    }
+    // Paso 1 & 2: Guardar el plan original como borrador + Confirmar "Plan original guardado"
+    const saved = await handleSaveDraft();
+    if (!saved) return;
+
+    setIsDistributing(true);
+    setAiAlertMessage(null);
+    try {
+      const availableMaterias = (aulaMaterias || []).map((m) => ({ id: String(m.id), name: m.name }));
+      if (availableMaterias.length === 0) {
+        throw new Error('No hay materias asociadas a este aula.');
+      }
+
+      const runId = `run_${Date.now()}`;
+      const prompt = `Analiza la siguiente planificación general del aula y distribúyela entre las materias existentes del grupo.
+
+LISTA DE MATERIAS EXISTENTES EN EL AULA (USA ÚNICAMENTE ESTOS IDs PARA CADA MATERIA):
+${JSON.stringify(availableMaterias, null, 2)}
+
+PLANIFICACIÓN A DISTRIBUIR (${planType.toUpperCase()}):
+"${draftText}"
+
+INSTRUCCIONES CRÍTICAS:
+1. Para cada tema o unidad, asígnalo a UNA de las materias de la lista según corresponda.
+2. Extrae también las ACTIVIDADES EVALUATIVAS (dictados, exámenes, prácticas, quices) y asígnalas a su materia correspondiente.
+3. USA EXCLUSIVAMENTE los identificadores "id" provistos.
+4. Responde ÚNICA Y EXCLUSIVAMENTE con un objeto JSON puro con la siguiente estructura:
+{
+  "modules": [
+    {
+      "subjectId": "ID_EXACTO_DE_LA_MATERIA",
+      "title": "Título del Módulo o Unidad",
+      "description": "Descripción breve de los temas",
+      "order": 1
+    }
+  ],
+  "evaluations": [
+    {
+      "subjectId": "ID_EXACTO_DE_LA_MATERIA",
+      "title": "Título de la evaluación",
+      "maxScore": 100,
+      "date": "YYYY-MM-DD",
+      "type": "teorica|practica|apreciativa"
+    }
+  ],
+  "unclassified": [
+    {
+      "title": "Título del elemento no clasificado",
+      "content": "Descripción"
+    }
+  ]
+}
+NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
+
+      const aiRes = await ai({ contents: prompt });
+      const aiResponseText = aiRes.text || '';
+      
+      const jsonMatch = aiResponseText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error('Formato de respuesta IA no válido.');
+      }
+
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch (e) {
+        throw new Error('No se pudo interpretar el JSON devuelto por la IA.');
+      }
+
+      const validated = validateAIDistribution(
+        parsed.modules,
+        parsed.evaluations,
+        parsed.unclassified,
+        availableMaterias
+      );
+
+      const batch = writeBatch(db);
+      let createdModulesCount = 0;
+      let createdEvalsCount = 0;
+
+      // Guardar módulos globales / por materia
+      for (const item of validated.validModules) {
+        const modRef = doc(collection(db, 'subjectModules'));
+        batch.set(modRef, {
+          userId: user?.uid,
+          subjectId: targetSubjectIdForModules,
+          title: item.title,
+          description: item.description || '',
+          order: item.order || createdModulesCount + 1,
+          planRunId: runId,
+          createdAt: Date.now() + createdModulesCount,
+        });
+        createdModulesCount++;
+      }
+
+      // Guardar evaluaciones por materia validada
+      for (const ev of validated.validEvaluations) {
+        const evRef = doc(collection(db, 'evaluations'));
+        batch.set(evRef, {
+          userId: user?.uid,
+          subjectId: ev.subjectId,
+          title: ev.title,
+          maxScore: ev.maxScore,
+          date: ev.date,
+          type: ev.type,
+          planRunId: runId,
+          createdAt: Date.now() + createdEvalsCount,
+        });
+        createdEvalsCount++;
+      }
+
+      if (subject?.groupId) {
+        batch.update(doc(db, 'classGroups', subject.groupId), {
+          planStatus: 'distributed',
+          lastPlanRunId: runId,
+          unclassifiedItems: validated.unclassified,
+          updatedAt: Date.now(),
+        });
+      }
+
+      await batch.commit();
+      setPlanStatus('distributed');
+
+      const summaryText = `Plan distribuido: ${validated.summary.matchedSubjects.length} materias reconocidas (${createdModulesCount} módulos, ${createdEvalsCount} evaluaciones). ${validated.unclassified.length > 0 ? `${validated.unclassified.length} ítems en Pendiente de clasificar.` : ''}`;
+      showToast('success', summaryText);
+      setAiAlertMessage(summaryText);
+      trackEvent(ANALYTICS_CATEGORIES.MODULE, ANALYTICS_ACTIONS.CREATE);
+    } catch (error: any) {
+      console.error('Error en Magia IA al distribuir plan:', error);
+      // Requisito de fallback de error de la instrucción:
+      const msg = 'No fue posible distribuir el plan. El original está guardado y puedes reintentar.';
+      setAiAlertMessage(msg);
+      showToast('error', msg);
+    } finally {
+      setIsDistributing(false);
+    }
+  };
+
   const modulesRef = collection(db, 'subjectModules');
-  const modulesQuery = user?.uid ? query(modulesRef, where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
+  const modulesQuery = user?.uid ? query(modulesRef, where('userId', '==', user?.uid), where('subjectId', '==', targetSubjectIdForModules), limit(500)) : null;
   const [modulesData] = useCustomCollectionData(modulesQuery);
   const modules = Array.isArray(modulesData) ? [...modulesData].sort((a, b) => (a.order || 0) - (b.order || 0)) : [];
 
@@ -809,17 +1050,202 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
 
   return (
     <div className="space-y-8">
-      {/* ── Selector de materia del Aula/Grupo (solo aulas reales ≥2 materias).
-          La planificación y los apuntes son POR MATERIA; el cambio es
-          inmediato porque notas/módulos/materiales se guardan al momento. */}
-      {aulaMaterias && aulaMaterias.length >= 2 && onSelectMateria && (
-        <MateriaSelector
-          currentSubject={{ id: subjectId } as SubjectDoc}
-          materias={aulaMaterias}
-          onSwitch={(id) => { if (String(id) !== String(subjectId)) onSelectMateria(String(id)); }}
-          hint="Planificación y apuntes por materia"
-        />
+      {/* ── Sub-modos para Aula Multiasignatura (Sección 10): Planificación del aula / Contenido por materia */}
+      {aulaMaterias && aulaMaterias.length >= 2 && (
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-neutral-50 p-2 rounded-2xl border border-neutral-200">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSubMode('planificacion')}
+              className={cn(
+                "px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all min-h-[40px]",
+                subMode === 'planificacion'
+                  ? "bg-[#1A3C40] text-white shadow-sm"
+                  : "text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100"
+              )}
+            >
+              Planificación del aula
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubMode('materia')}
+              className={cn(
+                "px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all min-h-[40px]",
+                subMode === 'materia'
+                  ? "bg-[#1A3C40] text-white shadow-sm"
+                  : "text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100"
+              )}
+            >
+              Contenido por materia
+            </button>
+          </div>
+          {subMode === 'materia' && onSelectMateria && (
+            <MateriaSelector
+              currentSubject={{ id: subjectId } as SubjectDoc}
+              materias={aulaMaterias}
+              onSwitch={(id) => { if (String(id) !== String(subjectId)) onSelectMateria(String(id)); }}
+              hint="Seleccionar materia activa"
+            />
+          )}
+        </div>
       )}
+
+      {/* ══════════ VISTA: PLANIFICACIÓN DEL AULA (Sección 11) ══════════ */}
+      {aulaMaterias && aulaMaterias.length >= 2 && subMode === 'planificacion' ? (
+        <div className="bg-white border border-neutral-200 rounded-[2.5rem] p-6 md:p-8 space-y-6 shadow-sm">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-neutral-100">
+            <div>
+              <div className="flex items-center gap-3">
+                <h3 className="text-xl md:text-2xl font-black text-neutral-900 tracking-tight">
+                  Planificación General del Aula
+                </h3>
+                <span className="bg-[#1A3C40] text-white text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-wider">
+                  Alcance: General
+                </span>
+              </div>
+              <p className="text-xs md:text-sm text-neutral-500 font-medium mt-1">
+                Escribe, pega o carga un documento con el plan del aula y distribúyelo entre sus {aulaMaterias.length} materias con Magia IA.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0 flex-wrap">
+              {planStatus === 'draft_saved' && (
+                <span className="inline-flex items-center gap-1.5 bg-amber-100 text-amber-900 text-xs font-black px-3.5 py-1.5 rounded-full border border-amber-300 uppercase tracking-wider">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-amber-700" />
+                  Plan original guardado
+                </span>
+              )}
+              {planStatus === 'distributed' && (
+                <span className="inline-flex items-center gap-1.5 bg-emerald-100 text-emerald-900 text-xs font-black px-3.5 py-1.5 rounded-full border border-emerald-300 uppercase tracking-wider">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" />
+                  Plan distribuido
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+            <div>
+              <label className="block text-xs font-bold text-neutral-700 uppercase tracking-wider mb-2">
+                Tipo de Plan
+              </label>
+              <select
+                value={planType}
+                onChange={(e) => setPlanType(e.target.value as any)}
+                className="w-full h-11 px-3.5 text-sm font-bold border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+              >
+                <option value="semanal">Plan Semanal</option>
+                <option value="mensual">Plan Mensual</option>
+                <option value="trimestral">Plan Trimestral</option>
+              </select>
+            </div>
+            <div className="md:col-span-2 flex items-center justify-end gap-3 flex-wrap">
+              <input
+                ref={planFileInputRef}
+                type="file"
+                accept=".txt,.md,.docx,.xlsx,.pdf,.json,image/*"
+                onChange={handlePlanFileUpload}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={() => planFileInputRef.current?.click()}
+                disabled={isSavingDraft || isDistributing}
+                className="bg-white border border-neutral-300 hover:bg-neutral-50 disabled:opacity-50 text-neutral-800 px-4 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-colors min-h-[44px] flex items-center gap-2"
+                title="Cargar un documento, PDF, Excel o imagen con el plan de aula"
+              >
+                <Upload className="w-4 h-4 text-neutral-600" />
+                Cargar plan / archivo
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSaveDraft()}
+                disabled={isSavingDraft || isDistributing}
+                className="bg-neutral-100 hover:bg-neutral-200 disabled:opacity-50 text-neutral-800 px-5 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-colors min-h-[44px]"
+              >
+                {isSavingDraft ? 'Guardando...' : '1. Guardar borrador'}
+              </button>
+              <button
+                type="button"
+                onClick={handleDistributeWithAI}
+                disabled={isDistributing || isSavingDraft}
+                className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-colors shadow-lg shadow-indigo-500/20 min-h-[44px] flex items-center gap-2"
+              >
+                <Book className="w-4 h-4" />
+                {isDistributing ? 'Procesando con Magia IA...' : '2. Procesar con Magia IA'}
+              </button>
+            </div>
+          </div>
+
+          {groupDoc?.originalPlan && (
+            <div className="bg-amber-50/80 border border-amber-200/80 rounded-2xl p-4 text-xs font-medium text-amber-900 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <FileText className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>
+                  <strong>Plan original guardado:</strong> {groupDoc.originalPlan.fileName || 'Documento'} (v{groupDoc.originalPlan.version}) — Ámbito: <strong className="uppercase">{groupDoc.originalPlan.scope || 'classGroup'}</strong>
+                </span>
+              </div>
+              <span className="text-[10px] uppercase font-bold text-amber-700">
+                Idempotente y persistido
+              </span>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-bold text-neutral-700 uppercase tracking-wider mb-2">
+              Borrador / Texto del Plan Académico
+            </label>
+            <textarea
+              rows={8}
+              value={draftText}
+              onChange={(e) => setDraftText(e.target.value)}
+              placeholder="Ingresa aquí los temas, semanas o módulos generales del aula. Por ejemplo:
+Semana 1: Comprensión lectora de cuentos cortos y sumas con llevadas de 2 dígitos.
+Semana 2: Los seres vivos y sus hábitats, palabras agudas y llanas, y mapas de Panamá..."
+              className="w-full p-4 text-sm font-medium border border-neutral-200 rounded-2xl bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-neutral-900 placeholder:text-neutral-300"
+            />
+          </div>
+
+          {groupDoc?.unclassifiedItems && groupDoc.unclassifiedItems.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-2xl p-4 space-y-2">
+              <div className="flex items-center gap-2 text-red-800 text-xs font-black uppercase tracking-wider">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                <span>Pendiente de clasificar ({groupDoc.unclassifiedItems.length})</span>
+              </div>
+              <p className="text-xs text-red-700">
+                Los siguientes elementos no pudieron asignarse con certeza a una materia y se guardaron aquí para revisión manual:
+              </p>
+              <ul className="list-disc list-inside text-xs text-red-900 space-y-1 font-medium pl-1">
+                {groupDoc.unclassifiedItems.map((item: any, idx: number) => (
+                  <li key={idx}>
+                    <strong>{item.title}</strong>{item.content ? `: ${item.content}` : ''}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="bg-neutral-50 border border-neutral-200 rounded-2xl p-4">
+            <h4 className="text-xs font-black text-neutral-700 uppercase tracking-wider mb-2">
+              Materias destino en este aula ({aulaMaterias.length}):
+            </h4>
+            <div className="flex flex-wrap gap-2">
+              {aulaMaterias.map((m) => (
+                <span
+                  key={m.id}
+                  className="inline-flex items-center gap-2 bg-white border border-neutral-200 px-3 py-1.5 rounded-xl text-xs font-bold text-neutral-800"
+                >
+                  <span
+                    className="w-2.5 h-2.5 rounded-full"
+                    style={{ backgroundColor: m.color || '#3b82f6' }}
+                  />
+                  {m.name}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {/* Confirmation Modal for Modules */}
       {moduleToDelete !== null && (
         <div className="fixed inset-0 bg-neutral-900/40 backdrop-blur-md z-50 flex items-center justify-center p-4">

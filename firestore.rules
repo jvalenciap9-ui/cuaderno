@@ -166,6 +166,20 @@ service cloud.firestore {
       allow delete: if isSignedIn() && isValidId(subjectId) && isExistingOwner();
     }
 
+    function canUseMultiSubjectRules() {
+      let planPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      let planDoc = get(planPath);
+      let trialExpired = planDoc != null
+        && ('isTrial' in planDoc.data)
+        && planDoc.data.isTrial == true
+        && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial')
+        && ('trialEndsAt' in planDoc.data)
+        && planDoc.data.trialEndsAt is number
+        && planDoc.data.trialEndsAt <= request.time.toMillis();
+      let effectivePlan = trialExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);
+      return effectivePlan == 'pro' || effectivePlan == 'school';
+    }
+
     // ── classGroups (Aula/Grupo multiasignatura) ─────────────────────────
     // Contenedor de varias materias que comparten participantes y asistencia
     // diaria. El docente dueño es el ÚNICO que lee/escribe sus aulas. La
@@ -188,8 +202,8 @@ service cloud.firestore {
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(groupId) && isExistingOwner();
-      allow create: if isSignedIn() && isValidId(groupId) && isValidClassGroup(request.resource.data);
-      allow update: if isSignedIn() && isValidId(groupId) && isExistingOwner() && isValidClassGroup(request.resource.data);
+      allow create: if isSignedIn() && isValidId(groupId) && isValidClassGroup(request.resource.data) && canUseMultiSubjectRules();
+      allow update: if isSignedIn() && isValidId(groupId) && isExistingOwner() && isValidClassGroup(request.resource.data) && canUseMultiSubjectRules();
       allow delete: if isSignedIn() && isValidId(groupId) && isExistingOwner();
     }
 

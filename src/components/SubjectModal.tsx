@@ -68,7 +68,8 @@ export function SubjectModal({
   onCreated,
 }: SubjectModalProps) {
   const { user } = useAuth();
-  const { isPro } = usePlan();
+  const { isPro, canMultiSubject } = usePlan();
+  const hasMultiAccess = canMultiSubject ?? isPro;
   const { periodos, planRules } = useInstitution();
   
   // ── Campos comunes / legacy ──
@@ -197,6 +198,10 @@ export function SubjectModal({
 
     // ── Paso 1 → Paso 2 (solo creación multiasignatura) ──
     if (!isEditing && step === 1 && modality === 'varias') {
+      if (!hasMultiAccess) {
+        showToast('warning', 'Aula Multiasignatura es una función exclusiva de Premium Pro.');
+        return;
+      }
       const finalName = effectiveAulaName;
       if (!finalName) {
         const err = 'Selecciona el Grado y Sección o escribe un nombre para el Aula.';
@@ -468,7 +473,7 @@ export function SubjectModal({
                   </div>
 
                   {/* Upsell para plan Gratis si selecciona Varias materias */}
-                  {modality === 'varias' && !isPro && (
+                  {modality === 'varias' && !hasMultiAccess && (
                     <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-3">
                       <div className="flex items-start gap-3">
                         <Sparkles className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />

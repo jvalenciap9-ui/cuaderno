@@ -209,6 +209,7 @@ console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
 
   await expectSucceeds('Docente A: Guardar nota de Matemáticas (misma materia)', setDoc(doc(dbA, 'grades', 'gr-math-1'), { userId: u.pro.uid, subjectId: 'sub-math-3a', evaluationId: 'ev-math-1', studentId: 'stu-juan-3a', score: 95 }));
   await expectSucceeds('Docente A: Guardar nota de Español (estudiante canónico en materia hermana del mismo aula)', setDoc(doc(dbA, 'grades', 'gr-spanish-1'), { userId: u.pro.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 88 }));
+  await expectFails('Docente A: Guardar nota con evaluationId de Español en subjectId de Matemáticas DENEGADO por desajuste de materia', setDoc(doc(dbA, 'grades', 'gr-mismatch-1'), { userId: u.pro.uid, subjectId: 'sub-math-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 88 }));
 
   // 7.2 Casos prohibidos (Docente No Propietario B)
   await expectFails('Docente B: Leer el aula de Docente A DENEGADO', getDoc(doc(dbB, 'classGroups', 'cg-aula-3a')));
@@ -218,6 +219,12 @@ console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
   await expectFails('Docente B: Leer nota de Docente A DENEGADA', getDoc(doc(dbB, 'grades', 'gr-math-1')));
   await expectFails('Docente B: Crear nota cruzada con subjectId ajeno DENEGADA', setDoc(doc(dbB, 'grades', 'gr-hack-b'), { userId: u.teacherB.uid, subjectId: 'sub-spanish-3a', evaluationId: 'ev-spanish-1', studentId: 'stu-juan-3a', score: 100 }));
   await expectFails('Docente B: Cambiar userId para apropiarse de aula ajena DENEGADO', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), { userId: u.teacherB.uid }));
+
+  // 7.3 Usuario Free
+  const ctxFree = testEnv.authenticatedContext(u.free.uid);
+  const dbFree = ctxFree.firestore();
+  const freeGroupData = { userId: u.free.uid, name: 'Aula Free', modalidad: 'varias', createdAt: NOW, updatedAt: NOW };
+  await expectFails('Usuario Free: Crear Aula Multiasignatura DENEGADO', setDoc(doc(dbFree, 'classGroups', 'cg-free-1'), freeGroupData));
 
   // 7.3 Usuario Anónimo / No Autenticado
   await expectFails('Anónimo: Leer classGroups DENEGADO', getDoc(doc(dbAnon, 'classGroups', 'cg-aula-3a')));

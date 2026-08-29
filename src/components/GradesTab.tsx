@@ -59,10 +59,16 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
   const [consolidatedScores, setConsolidatedScores] = useState<Record<string, Record<string, string>>>({});
   const [pendingEdits, setPendingEdits] = useState<Record<string, { studentId: string; evaluationId: string; subjectId: string; scoreStr: string; maxScore: number }>>({});
 
-  // ── Aula/Grupo: los ESTUDIANTES viven en la asignatura canónica del aula
-  // (lista compartida); evaluaciones y calificaciones siguen siendo de ESTA
-  // materia. La nota se escribe con subjectId = materia y studentId del doc
-  // canónico (las reglas de Firestore aceptan hermanos del mismo aula).
+  // Resetear estados al cambiar de materia activa para prevenir fugas de id de evaluación
+  useEffect(() => {
+    setSelectedEvalId(null);
+    setLocalScores({});
+    setConsolidatedScores({});
+    setPendingEdits({});
+  }, [subjectId]);
+
+  // ── Aula/Grupo: los ESTUDIANTES y MÓDULOS GLOBALES viven en la asignatura canónica del aula
+  // (lista compartida); evaluaciones y calificaciones siguen siendo de ESTA materia.
   const { canonicalId: sharedStudentListId } = useCanonicalSubjectId(subjectId);
 
   const studentsQuery = user?.uid ? query(collection(db, 'students'), where('userId', '==', user?.uid), where('subjectId', '==', sharedStudentListId), limit(500)) : null;
@@ -74,7 +80,7 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
   const gradesQuery = user?.uid ? query(collection(db, 'grades'), where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
   const [allGrades = []] = useCustomCollectionData(gradesQuery);
 
-  const modulesQuery = user?.uid ? query(collection(db, 'subjectModules'), where('userId', '==', user?.uid), where('subjectId', '==', subjectId), limit(500)) : null;
+  const modulesQuery = user?.uid ? query(collection(db, 'subjectModules'), where('userId', '==', user?.uid), where('subjectId', '==', sharedStudentListId), limit(500)) : null;
   const [modules = []] = useCustomCollectionData(modulesQuery);
 
   const selectedEvalGradesQuery = selectedEvalId && user?.uid ? query(collection(db, 'grades'), where('userId', '==', user?.uid), where('evaluationId', '==', selectedEvalId), limit(500)) : null;
@@ -396,16 +402,22 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
         if (score > edit.maxScore) score = edit.maxScore;
         if (score < 0) score = 0;
 
-        const existing = (allGrades || []).find(
+        // Asegurar que subjectId coincida con la materia propietaria de la evaluación
+        const targetEval = (evaluations || []).find(e => e.id === edit.evaluationId);
+        const targetSubjectId = targetEval?.subjectId || edit.subjectId || subjectId;
+
+        const existing = (grades || []).find(
+          g => g.studentId === edit.studentId && g.evaluationId === edit.evaluationId
+        ) || (allGrades || []).find(
           g => g.studentId === edit.studentId && g.evaluationId === edit.evaluationId
         );
 
         if (existing) {
-          batch.update(doc(db, 'grades', existing.id!), { score, subjectId: edit.subjectId });
+          batch.update(doc(db, 'grades', existing.id!), { score, subjectId: targetSubjectId });
         } else {
           batch.set(doc(collection(db, 'grades')), {
             userId: user.uid,
-            subjectId: edit.subjectId,
+            subjectId: targetSubjectId,
             evaluationId: edit.evaluationId,
             studentId: edit.studentId,
             score,
@@ -505,6 +517,7 @@ export function GradesTab({ subjectId, aulaMaterias, onSelectMateria }: GradesTa
           materias={aulaMaterias}
           onSwitch={handleMateriaSwitchRequest}
           hint="Evaluaciones propias · Participantes compartidos"
+          includeGeneral={true}
         />
       )}
       {pendingSwitchId && (

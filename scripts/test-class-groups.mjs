@@ -100,10 +100,10 @@ const groups = [{ id: 'g1' }];
 const uFree1 = cg.planUnits(subjects, groups);
 check('unidades = independientes + aulas (1 indep + 1 grupo = 2)', uFree1.units === 2 && uFree1.groups === 1);
 check('las 3 materias internas NO consumen cuota adicional', uFree1.internalMaterias === 3 && uFree1.standaloneSubjects === 1);
+check('free bloquea aula siempre (exclusivo Pro)', cg.canCreateClassGroup('free', [], []).allowed === false);
 check('free bloquea 2.º aula', cg.canCreateClassGroup('free', [], [{ id: 'g1' }]).allowed === false);
-check('free permite el PRIMER aula con 0 asignaturas', cg.canCreateClassGroup('free', [], []).allowed === true);
 check('free bloquea aula cuando ya hay 2 unidades', cg.canCreateClassGroup('free', [{ id: 'a' }, { id: 'b' }], []).allowed === false);
-check('free permite aula con 1 unidad usada', cg.canCreateClassGroup('free', [{ id: 'a' }], []).allowed === true);
+check('free bloquea aula con 1 unidad usada', cg.canCreateClassGroup('free', [{ id: 'a' }], []).allowed === false);
 check('free permite asignatura independiente junto a 1 aula (2 unidades)', cg.canCreateStandaloneSubject('free', subjects.slice(0, 3), groups).allowed === true);
 check('free bloquea independiente al llegar a 2 unidades', cg.canCreateStandaloneSubject('free', [...subjects.slice(0, 3)], [{ id: 'g1' }, { id: 'g9' }]).allowed === false);
 check('pro permite múltiples aulas', cg.canCreateClassGroup('pro', [], [{ id: 'g1' }, { id: 'g2' }]).allowed === true);
@@ -122,6 +122,37 @@ check('planSubjectDeletion de id inexistente marca found:false', cg.planSubjectD
 
 console.log('── Clave de memoria por aula ──');
 check('clave estable y sanitizada', cg.lastMateriaStorageKey('g1') === 'ediagil_aula_ultima_materia_g1');
+
+console.log('── Distribución IA y Plan Original ──');
+const originalPlan = cg.buildOriginalPlanData('Plan de 2 semanas', 'plan-semanal.pdf', 'application/pdf', 'semanal', 1);
+check('buildOriginalPlanData establece scope = classGroup', originalPlan.scope === 'classGroup');
+check('buildOriginalPlanData incrementa versión (v2)', originalPlan.version === 2);
+
+const validSubjectsList = [
+  { id: 'm1', name: 'Español' },
+  { id: 'm2', name: 'Matemáticas' },
+  { id: 'm3', name: 'Ciencias Naturales' },
+];
+
+const rawModules = [
+  { subjectId: 'm1', title: 'Lectura comprensiva', description: 'Cuentos' },
+  { subjectId: 'm2', title: 'Fracciones', description: 'Operaciones' },
+  { subjectId: 'm99', title: 'Tema sin materia válida', description: 'Desconocido' },
+];
+
+const rawEvals = [
+  { subjectId: 'm1', title: 'Dictado #1', maxScore: 100, date: '2026-09-10', type: 'teorica' },
+  { subjectId: 'm3', title: 'Experimento de fotosíntesis' }, // sin date/maxScore -> borrador
+  { subjectId: 'invalid', title: 'Quiz huerfano' },
+];
+
+const distResult = cg.validateAIDistribution(rawModules, rawEvals, [], validSubjectsList);
+check('asigna 2 módulos a materias válidas', distResult.validModules.length === 2);
+check('asigna 2 evaluaciones a materias válidas', distResult.validEvaluations.length === 2);
+check('mueve ítem con subjectId invalido m99 a unclassified', distResult.unclassified.some(u => u.title.includes('Tema sin materia')));
+check('mueve evaluación huerfana a unclassified (NUNCA a Español por defecto)', distResult.unclassified.some(u => u.title.includes('Quiz huerfano')));
+check('evaluación sin fecha se marca como borrador', distResult.validEvaluations.some(e => e.title.includes('Borrador')));
+check('ningún contenido ajeno termina en Español (m1)', distResult.validModules.every(m => m.subjectId === 'm1' ? m.title === 'Lectura comprensiva' : true));
 
 console.log('──────────────────────────────');
 console.log(`Resultado: ${passed} ✅ / ${failed} ❌`);

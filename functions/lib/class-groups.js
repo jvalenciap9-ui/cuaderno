@@ -45,6 +45,38 @@ function normalizeName(s) {
   return String(s == null ? '' : s).trim().replace(/\s+/g, ' ');
 }
 
+function computeAulaDisplayName(grado, seccion, customName) {
+  const custom = normalizeName(customName || '');
+  let g = normalizeName(grado || '');
+  let s = normalizeName(seccion || '');
+
+  if (g && s && g.toLowerCase() === s.toLowerCase()) {
+    s = '';
+  }
+
+  let baseGradeSection = '';
+  if (g && s) {
+    if (s.toLowerCase().startsWith(g.toLowerCase())) {
+      baseGradeSection = s;
+    } else if (g.toLowerCase().endsWith(s.toLowerCase())) {
+      baseGradeSection = g;
+    } else {
+      baseGradeSection = `${g} ${s}`;
+    }
+  } else {
+    baseGradeSection = g || (s ? `Sección ${s}` : '');
+  }
+
+  if (custom) {
+    if (!baseGradeSection) return custom;
+    if (custom.toLowerCase() === baseGradeSection.toLowerCase()) return custom;
+    if (custom.toLowerCase().includes(baseGradeSection.toLowerCase())) return custom;
+    return `${custom} · ${baseGradeSection}`;
+  }
+
+  return baseGradeSection;
+}
+
 /** Clave de comparación insensible a mayúsculas/tildes para detectar duplicados. */
 function nameKey(s) {
   const n = normalizeName(s).toLowerCase();
@@ -208,11 +240,14 @@ const PLAN_UNIT_LIMITS = { free: 2, pro: 999, school: 999 };
  * Free: máx 2 unidades Y máx 1 aula en total.
  */
 function canCreateClassGroup(plan, subjects, groups) {
+  if (plan === 'free') {
+    return {
+      allowed: false,
+      reason: 'Aula Multiasignatura es una función exclusiva de Premium Pro. Actualiza tu plan para crear aulas multiasignatura.',
+    };
+  }
   const max = PLAN_UNIT_LIMITS[plan] != null ? PLAN_UNIT_LIMITS[plan] : 2;
   const u = planUnits(subjects, groups);
-  if (plan === 'free' && u.groups >= 1) {
-    return { allowed: false, reason: 'El plan Gratuito permite un único Aula/Grupo multiasignatura. Mejora a Premium para crear más.' };
-  }
   if (u.units + 1 > max) {
     return { allowed: false, reason: `Has alcanzado tu límite de ${max} (asignaturas y/o aulas). Mejora tu plan para ampliarlo.` };
   }
@@ -294,12 +329,114 @@ function lastMateriaStorageKey(groupId) {
   return `ediagil_aula_ultima_materia_${safe}`;
 }
 
+/**
+ * Valida y distribuye el plan de Magia IA asignando ítems únicamente a los
+ * subjectIds autorizados del aula. Cualquier ítem con un subjectId desconocido o
+ * ausente se mueve a `unclassified` ("Pendiente de clasificar"). NUNCA se
+ * asigna automáticamente a Español u otra materia por defecto.
+ */
+function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, validSubjects) {
+  const validMap = new Map();
+  (Array.isArray(validSubjects) ? validSubjects : []).forEach((s) => {
+    if (s && s.id) validMap.set(String(s.id), String(s.name || s.id));
+  });
+
+  const validModules = [];
+  const validEvaluations = [];
+  const unclassified = Array.isArray(rawUnclassified) ? [...rawUnclassified] : [];
+  const matchedSubjects = new Set();
+
+  (Array.isArray(rawModules) ? rawModules : []).forEach((m, idx) => {
+    if (!m || typeof m !== 'object') return;
+    const subId = m.subjectId ? String(m.subjectId) : '';
+    const title = normalizeName(m.title || '');
+    if (subId && validMap.has(subId) && title) {
+      matchedSubjects.add(validMap.get(subId));
+      validModules.push({
+        subjectId: subId,
+        title,
+        description: String(m.description || '').trim(),
+        order: typeof m.order === 'number' && m.order > 0 ? m.order : idx + 1,
+      });
+    } else if (title) {
+      unclassified.push({
+        title,
+        content: String(m.description || 'Módulo sin materia asignada').trim(),
+      });
+    }
+  });
+
+  (Array.isArray(rawEvaluations) ? rawEvaluations : []).forEach((e) => {
+    if (!e || typeof e !== 'object') return;
+    const subId = e.subjectId ? String(e.subjectId) : '';
+    let title = normalizeName(e.title || '');
+    if (!title) return;
+
+    if (subId && validMap.has(subId)) {
+      matchedSubjects.add(validMap.get(subId));
+      const maxScore = typeof e.maxScore === 'number' && e.maxScore > 0 ? e.maxScore : Number(e.maxScore) || 100;
+      const date = typeof e.date === 'string' && e.date.trim() ? e.date.trim() : '';
+      const type = ['teorica', 'practica', 'apreciativa'].includes(e.type) ? e.type : 'teorica';
+      const isDraft = !date || maxScore <= 0;
+
+      if (isDraft && !title.toLowerCase().includes('borrador')) {
+        title = `${title} (Borrador pendiente de revisión)`;
+      }
+
+      validEvaluations.push({
+        subjectId: subId,
+        title,
+        maxScore,
+        date: date || new Date().toISOString().split('T')[0],
+        type,
+        isDraft,
+      });
+    } else {
+      unclassified.push({
+        title,
+        content: `Evaluación sin materia válida asignada por la IA`,
+      });
+    }
+  });
+
+  return {
+    ok: true,
+    validModules,
+    validEvaluations,
+    unclassified,
+    summary: {
+      matchedSubjects: Array.from(matchedSubjects),
+      assignedModulesCount: validModules.length,
+      assignedEvalsCount: validEvaluations.length,
+      unclassifiedCount: unclassified.length,
+    },
+  };
+}
+
+/**
+ * Prepara el objeto `originalPlan` para ser guardado con ámbito `classGroupId`.
+ */
+function buildOriginalPlanData(content, fileName, fileType, planType, previousVersion) {
+  const normContent = String(content || '').trim();
+  const v = typeof previousVersion === 'number' && previousVersion > 0 ? previousVersion + 1 : 1;
+  return {
+    content: normContent,
+    fileName: normalizeName(fileName || 'Plan de Aula'),
+    fileType: String(fileType || 'text/plain'),
+    loadedAt: Date.now(),
+    version: v,
+    format: String(planType || 'semanal'),
+    scope: 'classGroup',
+  };
+}
+
 module.exports = {
   MODALIDADES,
   SUGERENCIAS_MATERIAS,
   MIN_MATERIAS_AULA,
   MAX_MATERIAS_AULA,
   normalizeName,
+  computeAulaDisplayName,
   nameKey,
   validateMateriaNames,
   validateClassGroupInput,
@@ -316,4 +453,6 @@ module.exports = {
   filterEvaluationsByMateria,
   planSubjectDeletion,
   lastMateriaStorageKey,
+  validateAIDistribution,
+  buildOriginalPlanData,
 };
