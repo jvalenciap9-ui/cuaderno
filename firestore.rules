@@ -41,6 +41,54 @@ service cloud.firestore {
     // múltiplo de 4 años desde 1970 la frontera cae EXACTA en 1 Ene 00:00 UTC.
     function currentYearKey() { return string(1970 + int(request.time.toMillis() / 31557600000)); }
 
+    // Helpers de entitlement separados para respetar el máximo de 10
+    // variables locales por función de Firestore Rules.
+    function profileBlocked(data) {
+      return (('disabled' in data) && data.disabled == true)
+        || (('isRevoked' in data) && data.isRevoked == true);
+    }
+
+    function pilotActiveProfile(data) {
+      return ('isPilot' in data)
+        && data.isPilot == true
+        && ('pilotExpiresAt' in data)
+        && data.pilotExpiresAt is number
+        && data.pilotExpiresAt > request.time.toMillis();
+    }
+
+    function trialOnlyProfile(data) {
+      return ('isTrial' in data)
+        && data.isTrial == true
+        && (!('paymentProvider' in data) || data.paymentProvider == 'trial');
+    }
+
+    function trialExpiredProfile(data) {
+      return trialOnlyProfile(data)
+        && ('trialEndsAt' in data)
+        && data.trialEndsAt is number
+        && data.trialEndsAt <= request.time.toMillis();
+    }
+
+    function trialActiveProfile(data) {
+      return trialOnlyProfile(data)
+        && ('trialEndsAt' in data)
+        && data.trialEndsAt is number
+        && data.trialEndsAt > request.time.toMillis();
+    }
+
+    function paidPlanExpiredProfile(data) {
+      return ('expiresAt' in data)
+        && data.expiresAt is number
+        && data.expiresAt <= request.time.toMillis();
+    }
+
+    function paidPlanActiveProfile(data) {
+      return !trialOnlyProfile(data)
+        && ('plan' in data)
+        && (data.plan == 'pro' || data.plan == 'school')
+        && (!('expiresAt' in data) || (data.expiresAt is number && data.expiresAt > request.time.toMillis()));
+    }
+
     function subjectCountWithinLimit() {
       let planPath = /databases/$(database)/documents/users/$(request.auth.uid);
       let counterPath = /databases/$(database)/documents/userCounters/$(request.auth.uid);
@@ -55,30 +103,22 @@ service cloud.firestore {
       // (y niega el write). El documento del cliente normalmente NO trae las
       // claves del trial (son backend-only), así que sin la guardia la creación
       // de una asignatura fallaría para cualquier usuario sin prueba.
-      let trialExpired = planDoc != null
-        && ('isTrial' in planDoc.data)
-        && planDoc.data.isTrial == true
-        && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial')
-        && ('trialEndsAt' in planDoc.data)
-        && planDoc.data.trialEndsAt is number
-        && planDoc.data.trialEndsAt <= request.time.toMillis();
-      let paidExpired = planDoc != null
-        && ('expiresAt' in planDoc.data)
-        && planDoc.data.expiresAt is number
-        && planDoc.data.expiresAt <= request.time.toMillis();
-      let pilotActive = planDoc != null
-        && ('isPilot' in planDoc.data)
-        && planDoc.data.isPilot == true
-        && ('pilotExpiresAt' in planDoc.data)
-        && planDoc.data.pilotExpiresAt is number
-        && planDoc.data.pilotExpiresAt > request.time.toMillis()
-        && (!('disabled' in planDoc.data) || planDoc.data.disabled != true)
-        && (!('isRevoked' in planDoc.data) || planDoc.data.isRevoked != true);
-      let effectivePlan = trialExpired || paidExpired ? 'free' : (planDoc != null ? planDoc.data.plan : null);
+      let effectivePlan = planDoc != null
+        && (trialExpiredProfile(planDoc.data) || paidPlanExpiredProfile(planDoc.data))
+        ? 'free'
+        : (planDoc != null ? planDoc.data.plan : null);
       // Un código piloto vigente equivale a Pro tanto para Aula
       // Multiasignatura como para el contador general. Cliente y Rules deben
       // decidir exactamente lo mismo.
-      let max = pilotActive || effectivePlan == 'pro' || effectivePlan == 'school' ? 999 : 2;
+      let max = planDoc != null
+        && !profileBlocked(planDoc.data)
+        && (
+          pilotActiveProfile(planDoc.data)
+          || effectivePlan == 'pro'
+          || effectivePlan == 'school'
+        )
+        ? 999
+        : 2;
       let before = get(counterPath);
       let after = getAfter(counterPath);
       let year = currentYearKey();
@@ -184,30 +224,13 @@ service cloud.firestore {
     function canUseMultiSubjectRules() {
       let planPath = /databases/$(database)/documents/users/$(request.auth.uid);
       let planDoc = get(planPath);
-      let blocked = planDoc != null
+      return planDoc != null
+        && !profileBlocked(planDoc.data)
         && (
-          (('disabled' in planDoc.data) && planDoc.data.disabled == true)
-          || (('isRevoked' in planDoc.data) && planDoc.data.isRevoked == true)
+          pilotActiveProfile(planDoc.data)
+          || trialActiveProfile(planDoc.data)
+          || paidPlanActiveProfile(planDoc.data)
         );
-      let pilotActive = planDoc != null
-        && ('isPilot' in planDoc.data)
-        && planDoc.data.isPilot == true
-        && ('pilotExpiresAt' in planDoc.data)
-        && planDoc.data.pilotExpiresAt is number
-        && planDoc.data.pilotExpiresAt > request.time.toMillis();
-      let trialOnly = planDoc != null
-        && ('isTrial' in planDoc.data)
-        && planDoc.data.isTrial == true
-        && (!('paymentProvider' in planDoc.data) || planDoc.data.paymentProvider == 'trial');
-      let trialActive = trialOnly
-        && ('trialEndsAt' in planDoc.data)
-        && planDoc.data.trialEndsAt is number
-        && planDoc.data.trialEndsAt > request.time.toMillis();
-      let paidActive = planDoc != null
-        && !trialOnly
-        && (planDoc.data.plan == 'pro' || planDoc.data.plan == 'school')
-        && (!('expiresAt' in planDoc.data) || (planDoc.data.expiresAt is number && planDoc.data.expiresAt > request.time.toMillis()));
-      return !blocked && (pilotActive || trialActive || paidActive);
     }
 
     // ── classGroups (Aula/Grupo multiasignatura) ─────────────────────────

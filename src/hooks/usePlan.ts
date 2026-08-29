@@ -61,9 +61,10 @@ export function canUseMultiSubject(
   const now = Date.now();
   // Staging nunca concede permisos por sí mismo: cliente y Rules deben tomar
   // la misma decisión. Las cuentas QA se siembran con Pro/piloto vigente.
-  if (profile.isPilot === true) {
-    return typeof profile.pilotExpiresAt === 'number' && profile.pilotExpiresAt > now;
-  }
+  const pilotActive = profile.isPilot === true
+    && typeof profile.pilotExpiresAt === 'number'
+    && profile.pilotExpiresAt > now;
+  if (pilotActive) return true;
 
   // Prueba Pro vigente. Una prueba sin fecha no concede acceso indefinido.
   if (profile.isTrial) {
