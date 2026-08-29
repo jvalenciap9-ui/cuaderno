@@ -982,6 +982,9 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                             <p className="text-sm font-bold text-red-900 border-b border-red-200/50 pb-2">
                               ¿Eliminar TODOS los datos? Esta acción es irreversible.
                             </p>
+                            <p className="text-xs font-medium text-red-800 leading-relaxed">
+                              Se eliminarán aulas, materias y contenido académico. Tu cuenta, plan Premium Pro y código piloto no se modifican. Si después aparece Plan Gratis, la licencia piloto de esa cuenta no está activa en este proyecto.
+                            </p>
                             <div className="flex items-center gap-3 mt-1">
                               <button 
                                 onClick={() => setIsConfirmingClear(false)}

@@ -28,7 +28,7 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import * as XLSX from 'xlsx';
-import type { NoteDoc, SubjectModuleDoc, SubjectDoc } from "../types/firestore";
+import type { AulaPlanType, NoteDoc, SubjectModuleDoc, SubjectDoc } from "../types/firestore";
 import { MateriaSelector } from "./MateriaSelector";
 import { cn, parseLocalDate } from "../lib/utils";
 import { format, parseISO } from "date-fns";
@@ -44,6 +44,7 @@ import {
   buildPlanRunId,
   distributionDocId,
   filterModulesForMateria,
+  toAulaPlanType,
   useCanonicalSubjectId,
   validateAIDistribution,
 } from "../lib/classGroups";
@@ -106,7 +107,7 @@ export function ModulesTab({
     setInternalSubMode(mode);
     onScopeModeChange?.(mode);
   };
-  const [planType, setPlanType] = useState<'semanal' | 'mensual' | 'trimestral'>('semanal');
+  const [planType, setPlanType] = useState<AulaPlanType>('semanal');
   const [draftText, setDraftText] = useState('');
   const [loadedFileName, setLoadedFileName] = useState<string | null>(null);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
@@ -127,13 +128,11 @@ export function ModulesTab({
     if (groupDoc?.originalPlan?.fileName) {
       setLoadedFileName(groupDoc.originalPlan.fileName);
     }
-    if (groupDoc?.planType) {
-      setPlanType(groupDoc.planType as any);
-    }
+    setPlanType(toAulaPlanType(groupDoc?.planType || subject?.plan));
     if (groupDoc?.planStatus) {
       setPlanStatus(groupDoc.planStatus as any);
     }
-  }, [groupDoc]);
+  }, [groupDoc, subject?.plan]);
 
   const handleSaveDraft = async (customContent?: string, fileName?: string, fileType?: string): Promise<number | null> => {
     const textToSave = typeof customContent === 'string' ? customContent : draftText;
@@ -277,25 +276,35 @@ PLANIFICACIÓN A DISTRIBUIR (${planType.toUpperCase()}):
 "${draftText}"
 
 INSTRUCCIONES CRÍTICAS:
-1. Para cada tema o unidad, asígnalo a UNA de las materias de la lista según corresponda.
-2. Extrae también las ACTIVIDADES EVALUATIVAS (dictados, exámenes, prácticas, quices) y asígnalas a su materia correspondiente.
-3. USA EXCLUSIVAMENTE los identificadores "id" provistos.
-4. Responde ÚNICA Y EXCLUSIVAMENTE con un objeto JSON puro con la siguiente estructura:
+1. El orden, formato y diseño del documento pueden variar. Identifica cada bloque por el TÍTULO REAL de la materia; no uses el orden de la lista ni la materia activa como valor por defecto.
+2. Para cada tema, lección o unidad devuelve "subjectName" con el nombre exacto reconocido y "subjectId" con el ID exacto correspondiente de la lista.
+3. Si el encabezado o el texto dice Matemáticas, el ID debe ser el de Matemáticas aunque otra materia aparezca primero. Nunca anides una materia dentro de otra.
+4. Conserva la descripción, la fecha y el día de la semana del documento. Las fechas ISO deben coincidir con el día indicado; si no existe fecha suficiente, deja el elemento para revisión.
+5. Toda prueba, test, examen, quiz, dictado, práctica, laboratorio, proyecto o actividad evaluativa debe crearse también en "evaluations", con su título y materia correctos.
+6. Si no puedes vincular un elemento con UNA materia existente con certeza, colócalo en "unclassified". No lo asignes a Español ni a la primera materia.
+7. USA EXCLUSIVAMENTE los identificadores "id" provistos.
+8. Responde ÚNICA Y EXCLUSIVAMENTE con un objeto JSON puro con la siguiente estructura:
 {
   "modules": [
     {
       "subjectId": "ID_EXACTO_DE_LA_MATERIA",
-      "title": "Título del Módulo o Unidad",
-      "description": "Descripción breve de los temas",
+      "subjectName": "NOMBRE_EXACTO_DE_LA_MATERIA",
+      "title": "Título de la lección, tema, módulo o unidad; no uses solo el nombre de la materia",
+      "description": "Descripción completa de los temas y actividades",
+      "startDate": "YYYY-MM-DD",
+      "endDate": "YYYY-MM-DD",
+      "weekday": "lunes|martes|miércoles|jueves|viernes|sábado|domingo",
       "order": 1
     }
   ],
   "evaluations": [
     {
       "subjectId": "ID_EXACTO_DE_LA_MATERIA",
+      "subjectName": "NOMBRE_EXACTO_DE_LA_MATERIA",
       "title": "Título de la evaluación",
       "maxScore": ${gradingScale.maxScore || 100},
       "date": "YYYY-MM-DD",
+      "weekday": "lunes|martes|miércoles|jueves|viernes|sábado|domingo",
       "type": "teorica|practica|apreciativa"
     }
   ],
@@ -306,7 +315,7 @@ INSTRUCCIONES CRÍTICAS:
     }
   ]
 }
-5. La puntuación máxima de cada evaluación debe ser ${gradingScale.maxScore || 100}, que es la escala configurada por el docente o la institución.
+9. La puntuación máxima de cada evaluación debe ser ${gradingScale.maxScore || 100}, que es la escala configurada por el docente o la institución.
 NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
 
       const aiRes = await ai({
@@ -645,7 +654,8 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
             endDate: nm.endDate || null,
             order: maxOrder,
             createdAt: Date.now(),
-            parentId: note.moduleId || null
+            parentId: note.moduleId || null,
+            sourceNoteId: note.id,
           });
           if (nm.tempId) {
             tempIdToRealId[nm.tempId] = modRef.id;
@@ -670,6 +680,7 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
             title: nn.title || 'Apunte Extraído',
             content: nn.content || '',
             date: nn.date || note.date,
+            sourceNoteId: note.id,
             createdAt: Date.now(),
             updatedAt: Date.now()
           });
@@ -692,6 +703,7 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
             startTime: ev.startTime || null,
             endTime: ev.endTime || null,
             order: typeof ev.order === 'number' ? ev.order : null,
+            sourceNoteId: note.id,
           });
           addedEvents++;
         }
@@ -709,7 +721,8 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
               ? gradingScale.maxScore
               : (Number(ev.maxScore) > 0 ? Number(ev.maxScore) : gradingScale.maxScore || 100),
             date: ev.date || note.date,
-            type: ev.type || 'teorica'
+            type: ev.type || 'teorica',
+            sourceNoteId: note.id,
           });
           addedEvals++;
         }
@@ -1210,6 +1223,25 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
               Contenido por materia
             </button>
           </div>
+          {subMode === 'planificacion' && (
+            <label className="flex items-center gap-2 min-w-0">
+              <span className="text-[10px] font-black uppercase tracking-widest text-neutral-500 whitespace-nowrap">
+                Formato docente
+              </span>
+              <select
+                value={planType}
+                onChange={(e) => setPlanType(e.target.value as AulaPlanType)}
+                className="h-10 px-3 text-xs font-black border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-[#1A3C40]/20"
+                aria-label="Formato de planificación del aula"
+              >
+                <option value="semanal">Semanal</option>
+                <option value="mensual">Mensual</option>
+                <option value="trimestral">Trimestral</option>
+                <option value="cuatrimestral">Cuatrimestral</option>
+                <option value="anual">Anual</option>
+              </select>
+            </label>
+          )}
           {subMode === 'materia' && onSelectMateria && (
             <MateriaSelector
               currentSubject={{ id: subjectId } as SubjectDoc}
@@ -1254,22 +1286,7 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
-            <div>
-              <label className="block text-xs font-bold text-neutral-700 uppercase tracking-wider mb-2">
-                Tipo de Plan
-              </label>
-              <select
-                value={planType}
-                onChange={(e) => setPlanType(e.target.value as any)}
-                className="w-full h-11 px-3.5 text-sm font-bold border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-              >
-                <option value="semanal">Plan Semanal</option>
-                <option value="mensual">Plan Mensual</option>
-                <option value="trimestral">Plan Trimestral</option>
-              </select>
-            </div>
-            <div className="md:col-span-2 flex items-center justify-end gap-3 flex-wrap">
+          <div className="flex items-center justify-end gap-3 flex-wrap">
               <input
                 ref={planFileInputRef}
                 type="file"
@@ -1304,7 +1321,6 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
                 <Book className="w-4 h-4" />
                 {isDistributing ? 'Analizando y distribuyendo...' : '2. Analizar y distribuir'}
               </button>
-            </div>
           </div>
 
           {groupDoc?.originalPlan && (

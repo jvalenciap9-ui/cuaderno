@@ -214,6 +214,17 @@ console.log('\n🏫 Aulas Multiasignatura (classGroups & seguridad)');
     originalPlan: { content: 'Semana 1: lectura y fracciones', fileName: 'plan.txt', fileType: 'text/plain', loadedAt: NOW, version: 1, format: 'semanal', scope: 'classGroup' },
     updatedAt: NOW + 1,
   }));
+  await expectSucceeds('Docente A: Usar formato cuatrimestral en el Aula', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), {
+    planType: 'cuatrimestral',
+    updatedAt: NOW + 2,
+  }));
+  await expectSucceeds('Docente A: Usar formato anual en el Aula', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), {
+    planType: 'anual',
+    updatedAt: NOW + 3,
+  }));
+  await expectFails('Docente A: Formato de plan desconocido DENEGADO', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), {
+    planType: 'semestral-no-soportado',
+  }));
   await expectFails('Docente A: Plan global sobre el límite seguro DENEGADO', updateDoc(doc(dbA, 'classGroups', 'cg-aula-3a'), {
     planDraft: 'x'.repeat(500001),
   }));

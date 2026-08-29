@@ -125,6 +125,8 @@ console.log('── Clave de memoria por aula ──');
 check('clave estable y sanitizada', cg.lastMateriaStorageKey('g1') === 'ediagil_aula_ultima_materia_g1');
 
 console.log('── Distribución IA y Plan Original ──');
+check('plan anual legacy se normaliza al formato global anual', cg.toAulaPlanType('anual_10') === 'anual');
+check('plan cuatrimestral del docente se conserva en el aula', cg.toAulaPlanType('cuatrimestral') === 'cuatrimestral');
 const originalPlan = cg.buildOriginalPlanData('Plan de 2 semanas', 'plan-semanal.pdf', 'application/pdf', 'semanal', 1);
 check('buildOriginalPlanData establece scope = classGroup', originalPlan.scope === 'classGroup');
 check('buildOriginalPlanData incrementa versión (v2)', originalPlan.version === 2);
@@ -155,6 +157,40 @@ check('mueve evaluación huerfana a unclassified (NUNCA a Español por defecto)'
 check('evaluación sin fecha se marca como borrador', distResult.validEvaluations.some(e => e.title.includes('Borrador')));
 check('ningún contenido ajeno termina en Español (m1)', distResult.validModules.every(m => m.subjectId === 'm1' ? m.title === 'Lectura comprensiva' : true));
 
+const semanticCorrection = cg.validateAIDistribution(
+  [
+    { subjectId: 'm1', subjectName: 'Matemáticas', title: 'Fracciones', description: 'Suma de fracciones' },
+    { subjectId: 'm1', title: 'Ciencias Naturales — Fotosíntesis', description: 'Partes de la planta' },
+    { title: 'Los ecosistemas', description: 'Ciencias Naturales: relaciones entre seres vivos' },
+  ],
+  [
+    { subjectId: 'm1', subjectName: 'Matemáticas', title: 'Prueba de fracciones', maxScore: 100, date: '2026-09-15', weekday: 'martes', type: 'teorica' },
+  ],
+  [],
+  [...validSubjectsList].reverse(),
+);
+check('subjectName corrige un ID de Español asignado erróneamente a Matemáticas',
+  semanticCorrection.validModules[0].subjectId === 'm2');
+check('el título de materia corrige un ID válido pero semánticamente incorrecto',
+  semanticCorrection.validModules[1].subjectId === 'm3');
+check('la descripción permite clasificar cuando la IA no devuelve subjectId',
+  semanticCorrection.validModules[2].subjectId === 'm3');
+check('el orden de materias no altera la asignación semántica',
+  semanticCorrection.validEvaluations[0].subjectId === 'm2');
+check('una fecha que coincide con martes se conserva sin marcar borrador',
+  semanticCorrection.validEvaluations[0].date === '2026-09-15' && semanticCorrection.validEvaluations[0].isDraft === false);
+
+const dateValidation = cg.validateAIDistribution(
+  [{ subjectId: 'm2', subjectName: 'Matemáticas', title: 'Geometría', startDate: '2026-09-15', endDate: '2026-09-15', weekday: 'lunes' }],
+  [{ subjectId: 'm2', subjectName: 'Matemáticas', title: 'Quiz de geometría', maxScore: 100, date: '2026-09-15', weekday: 'lunes', type: 'practica' }],
+  [],
+  validSubjectsList,
+);
+check('fecha de módulo que no coincide con el día se retira para revisión',
+  !dateValidation.validModules[0].startDate && dateValidation.unclassified.some((item) => item.title.includes('Revisar fecha')));
+check('evaluación con día inconsistente queda como borrador visible',
+  dateValidation.validEvaluations[0].isDraft === true && dateValidation.validEvaluations[0].title.includes('Borrador'));
+
 const panamaDistribution = cg.validateAIDistribution(
   [],
   [{ subjectId: 'm2', title: 'Prueba de fracciones', maxScore: 100, date: '2026-09-12', type: 'practica' }],
@@ -165,13 +201,15 @@ const panamaDistribution = cg.validateAIDistribution(
 check('escala institucional 1–5 reemplaza el 100 genérico de la IA', panamaDistribution.validEvaluations[0].maxScore === 5);
 
 const distributedWrite = cg.buildDistributedModuleWrite(
-  { subjectId: 'm2', title: ' Fracciones ', description: ' Operaciones ', order: 2 },
+  { subjectId: 'm2', title: ' Fracciones ', description: ' Operaciones ', startDate: '2026-09-15', endDate: '2026-09-16', order: 2 },
   { userId: 'teacher-1', canonicalSubjectId: 'm1', classGroupId: 'g1', planRunId: 'plan_g1_v1', createdAt: 123 },
 );
 check('escritura IA conserva la materia real m2 aunque la estructura viva en la canónica m1',
   distributedWrite.subjectId === 'm1' && distributedWrite.assignedSubjectId === 'm2');
 check('escritura IA queda vinculada al aula y no a Español por defecto',
   distributedWrite.classGroupId === 'g1' && distributedWrite.title === 'Fracciones');
+check('escritura IA conserva el rango de fechas validado',
+  distributedWrite.startDate === '2026-09-15' && distributedWrite.endDate === '2026-09-16');
 
 const scopedModules = [
   { id: 'global', title: 'Trimestre 1' },

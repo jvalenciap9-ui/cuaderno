@@ -5,6 +5,7 @@ export interface FirestoreDoc {
 }
 
 export type Periodo = 'matutino' | 'vespertino' | 'nocturno' | '';
+export type AulaPlanType = 'semanal' | 'mensual' | 'trimestral' | 'cuatrimestral' | 'anual';
 
 // Nivel educativo de una asignatura (campo opcional usado por los filtros del
 // dashboard administrativo). Los valores son una whitelist compartida con el
@@ -52,7 +53,7 @@ export interface ClassGroupDoc extends FirestoreDoc {
   /** Versión de esquema del aula (1 = inicial). Para futuras migraciones. */
   schemaVersion?: number;
   planDraft?: string;
-  planType?: 'semanal' | 'mensual' | 'trimestral';
+  planType?: AulaPlanType;
   planStatus?: 'idle' | 'draft_saved' | 'distributed';
   originalPlan?: {
     content: string;
@@ -81,6 +82,8 @@ export interface NoteDoc extends FirestoreDoc {
   startTime?: string;
   endTime?: string;
   attachment?: AttachmentDoc;
+  /** Apunte original del que Magia IA derivó este registro. */
+  sourceNoteId?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -110,6 +113,7 @@ export interface EvaluationDoc extends FirestoreDoc {
   type: 'teorica' | 'practica' | 'apreciativa';
   isDraft?: boolean;
   planRunId?: string;
+  sourceNoteId?: string;
   createdAt?: number;
 }
 
@@ -142,6 +146,7 @@ export interface CalendarEventDoc extends FirestoreDoc {
   topic?: string;
   description?: string;
   order?: number;
+  sourceNoteId?: string;
 }
 
 export interface MaterialDoc extends FirestoreDoc {
@@ -167,6 +172,7 @@ export interface SubjectModuleDoc extends FirestoreDoc {
   classGroupId?: string;
   scope?: 'classGroup' | 'subject';
   planRunId?: string;
+  sourceNoteId?: string;
   parentId?: string;
   title: string;
   description?: string;

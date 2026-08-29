@@ -63,7 +63,7 @@ import {
 } from "./lib/analytics";
 
 import { useAuth } from './components/AuthProvider';
-import { collection, query, where, orderBy, deleteDoc, doc, getDocs, writeBatch, limit, addDoc } from 'firebase/firestore';
+import { collection, query, where, orderBy, deleteDoc, doc, getDoc, getDocs, writeBatch, limit, addDoc } from 'firebase/firestore';
 import { sendPasswordResetEmail } from 'firebase/auth';
 import { auth, db } from './lib/firebase';
 import { handleFirestoreError, OperationType } from './lib/firestoreUtils';
@@ -808,7 +808,66 @@ function CuadernoApp() {
 
   const handleDeleteNote = async (id: string) => {
     try {
-      await deleteDoc(doc(db, 'notes', id));
+      if (!user?.uid) return;
+      const noteRef = doc(db, 'notes', id);
+      const noteSnap = await getDoc(noteRef);
+      const noteData = noteSnap.exists() ? noteSnap.data() : null;
+      const subjectId = noteData?.subjectId ? String(noteData.subjectId) : '';
+
+      // Desde esta versión todos los documentos creados por Magia IA quedan
+      // vinculados al apunte original. Al borrarlo se elimina también su
+      // calendario, evaluaciones, módulos y apuntes derivados.
+      const refsToDelete: any[] = [noteRef];
+      const generatedEvaluationIds = new Set<string>();
+      if (subjectId) {
+        const noteSubject = (subjects as SubjectDoc[]).find((candidate) => String(candidate.id) === subjectId);
+        const canonicalSubjectId = noteSubject?.groupId
+          ? String(siblingsOf(subjects as SubjectDoc[], noteSubject.groupId)[0]?.id || subjectId)
+          : subjectId;
+        for (const collectionName of ['notes', 'calendarEvents', 'evaluations', 'subjectModules']) {
+          const storageSubjectId = collectionName === 'subjectModules' ? canonicalSubjectId : subjectId;
+          const derivedQuery = query(
+            collection(db, collectionName),
+            where('userId', '==', user.uid),
+            where('subjectId', '==', storageSubjectId),
+            limit(500),
+          );
+          const derivedSnapshot = await getDocs(derivedQuery);
+          for (const derivedDoc of derivedSnapshot.docs) {
+            if (derivedDoc.id !== id && String(derivedDoc.data().sourceNoteId || '') === id) {
+              refsToDelete.push(derivedDoc.ref);
+              if (collectionName === 'evaluations') generatedEvaluationIds.add(derivedDoc.id);
+            }
+          }
+        }
+      }
+
+      // Evita dejar calificaciones huérfanas si una evaluación generada desde
+      // el apunte ya recibió notas antes de eliminar el original.
+      for (const evaluationId of generatedEvaluationIds) {
+        const gradeQuery = query(
+          collection(db, 'grades'),
+          where('userId', '==', user.uid),
+          where('evaluationId', '==', evaluationId),
+          limit(500),
+        );
+        const gradeSnapshot = await getDocs(gradeQuery);
+        gradeSnapshot.docs.forEach((gradeDoc) => refsToDelete.push(gradeDoc.ref));
+      }
+
+      for (let offset = 0; offset < refsToDelete.length; offset += 400) {
+        const batch = writeBatch(db);
+        refsToDelete.slice(offset, offset + 400).forEach((ref) => batch.delete(ref));
+        await batch.commit();
+      }
+
+      const derivedCount = Math.max(0, refsToDelete.length - 1);
+      showToast(
+        'success',
+        derivedCount > 0
+          ? `Apunte eliminado junto con ${derivedCount} elementos generados.`
+          : 'Apunte eliminado.',
+      );
       trackEvent(ANALYTICS_CATEGORIES.NOTE, ANALYTICS_ACTIONS.DELETE);
       setNoteToDelete(null);
     } catch (e) {

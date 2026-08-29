@@ -36,7 +36,7 @@ import {
 } from 'firebase/firestore';
 import { db as firestore } from './firebase';
 import { db as dexieDb, type Subject as DexieSubject } from './db';
-import type { ClassGroupDoc, NivelEducativo, Periodo, SubjectDoc } from '../types/firestore';
+import type { AulaPlanType, ClassGroupDoc, NivelEducativo, Periodo, SubjectDoc } from '../types/firestore';
 import { useAuth } from '../components/AuthProvider';
 import { addSubjectCounterOp } from './subjectCounter';
 import { handleFirestoreError, OperationType } from './firestoreUtils';
@@ -98,6 +98,13 @@ export function computeAulaDisplayName(grado: string, seccion: string, customNam
 export function nameKey(s: string): string {
   const n = normalizeName(s).toLowerCase();
   return n.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+/** Convierte los formatos legacy de asignatura al formato global del aula. */
+export function toAulaPlanType(plan?: SubjectDoc['plan'] | AulaPlanType | string | null): AulaPlanType {
+  if (plan === 'mensual' || plan === 'trimestral' || plan === 'cuatrimestral') return plan;
+  if (plan === 'anual' || plan === 'anual_8' || plan === 'anual_10') return 'anual';
+  return 'semanal';
 }
 
 export interface MateriaNamesResult {
@@ -295,6 +302,7 @@ export async function createClassGroupWithMaterias(
     grado: normalizeName(input.grado || ''),
     seccion: normalizeName(input.seccion || ''),
     periodo: input.periodo || '',
+    planType: toAulaPlanType(input.planAcademico),
     modalidad: 'varias',
     schemaVersion: 1,
     createdAt: Date.now(),
@@ -337,6 +345,7 @@ export async function createClassGroupWithMaterias(
       grado: normalizeName(input.grado || ''),
       seccion: normalizeName(input.seccion || ''),
       periodo: input.periodo || '',
+      planType: toAulaPlanType(input.planAcademico),
       modalidad: 'varias',
       schemaVersion: 1,
       createdAt: Date.now(),
@@ -400,7 +409,7 @@ export function lastMateriaStorageKey(groupId: string | null | undefined): strin
 
 export interface ValidatedAIDistribution {
   ok: boolean;
-  validModules: Array<{ subjectId: string; title: string; description?: string; order?: number }>;
+  validModules: Array<{ subjectId: string; title: string; description?: string; startDate?: string; endDate?: string; order?: number }>;
   validEvaluations: Array<{ subjectId: string; title: string; maxScore: number; date: string; type: 'teorica' | 'practica' | 'apreciativa'; isDraft?: boolean }>;
   unclassified: Array<{ title: string; content?: string }>;
   summary: {
@@ -409,6 +418,75 @@ export interface ValidatedAIDistribution {
     assignedEvalsCount: number;
     unclassifiedCount: number;
   };
+}
+
+function semanticKey(value: unknown): string {
+  return nameKey(String(value || '')).replace(/[^a-z0-9ñ]+/g, ' ').trim();
+}
+
+function uniqueSubjectMention(
+  value: unknown,
+  subjects: Array<{ id: string; key: string }>,
+  exact = false,
+): string | null {
+  const text = semanticKey(value);
+  if (!text) return null;
+  const padded = ` ${text} `;
+  const matches = subjects.filter((subject) => exact
+    ? text === subject.key
+    : padded.includes(` ${subject.key} `));
+  return matches.length === 1 ? matches[0].id : null;
+}
+
+/**
+ * Resuelve la materia por significado, no por el orden entregado por la IA.
+ * Un subjectName/título explícito puede corregir un ID válido pero semánticamente
+ * equivocado (p. ej. la IA devuelve el ID de Español para "Matemáticas").
+ */
+function resolveDistributedSubjectId(
+  item: Record<string, any>,
+  validMap: Map<string, string>,
+  semanticSubjects: Array<{ id: string; key: string }>,
+): string {
+  const rawId = item.subjectId ? String(item.subjectId) : '';
+  const explicit = item.subjectName ?? item.materia ?? item.subject;
+  const explicitId = uniqueSubjectMention(explicit, semanticSubjects, true);
+  if (explicitId) return explicitId;
+  const titleId = uniqueSubjectMention(item.title, semanticSubjects);
+  if (titleId) return titleId;
+  if (rawId && validMap.has(rawId)) return rawId;
+  return uniqueSubjectMention(item.description ?? item.content, semanticSubjects) || '';
+}
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  domingo: 0,
+  lunes: 1,
+  martes: 2,
+  miercoles: 3,
+  jueves: 4,
+  viernes: 5,
+  sabado: 6,
+};
+
+function validIsoDate(value: unknown): string {
+  const date = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return '';
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date ? '' : date;
+}
+
+function expectedWeekday(value: unknown): number | null {
+  const key = semanticKey(value);
+  for (const [name, index] of Object.entries(WEEKDAY_INDEX)) {
+    if (` ${key} `.includes(` ${name} `)) return index;
+  }
+  return null;
+}
+
+function dateMatchesWeekday(date: string, weekday: unknown): boolean {
+  const expected = expectedWeekday(weekday);
+  if (!date || expected === null) return true;
+  return new Date(`${date}T00:00:00Z`).getUTCDay() === expected;
 }
 
 export function validateAIDistribution(
@@ -423,21 +501,46 @@ export function validateAIDistribution(
     if (s && s.id) validMap.set(String(s.id), String(s.name || s.id));
   });
 
-  const validModules: Array<{ subjectId: string; title: string; description?: string; order?: number }> = [];
+  const semanticSubjects = Array.from(validMap.entries()).map(([id, name]) => ({
+    id,
+    key: semanticKey(name),
+  })).filter((subject) => subject.key.length > 0);
+
+  const validModules: Array<{ subjectId: string; title: string; description?: string; startDate?: string; endDate?: string; order?: number }> = [];
   const validEvaluations: Array<{ subjectId: string; title: string; maxScore: number; date: string; type: 'teorica' | 'practica' | 'apreciativa'; isDraft?: boolean }> = [];
   const unclassified = Array.isArray(rawUnclassified) ? [...rawUnclassified] : [];
   const matchedSubjects = new Set<string>();
 
   (Array.isArray(rawModules) ? rawModules : []).forEach((m, idx) => {
     if (!m || typeof m !== 'object') return;
-    const subId = m.subjectId ? String(m.subjectId) : '';
+    const subId = resolveDistributedSubjectId(m, validMap, semanticSubjects);
     const title = normalizeName(m.title || '');
     if (subId && validMap.has(subId) && title) {
+      let startDate = validIsoDate(m.startDate || m.date);
+      let endDate = validIsoDate(m.endDate) || startDate;
+      const weekday = m.weekday || m.dayOfWeek || m.dia;
+      if (startDate && !dateMatchesWeekday(startDate, weekday)) {
+        unclassified.push({
+          title: `Revisar fecha: ${title}`,
+          content: `La fecha ${startDate} no coincide con el día indicado (${String(weekday)}).`,
+        });
+        startDate = '';
+        endDate = '';
+      }
+      if (startDate && endDate && endDate < startDate) {
+        unclassified.push({
+          title: `Revisar rango: ${title}`,
+          content: `La fecha final ${endDate} es anterior a ${startDate}.`,
+        });
+        endDate = startDate;
+      }
       matchedSubjects.add(validMap.get(subId)!);
       validModules.push({
         subjectId: subId,
         title,
         description: String(m.description || '').trim(),
+        ...(startDate ? { startDate } : {}),
+        ...(endDate ? { endDate } : {}),
         order: typeof m.order === 'number' && m.order > 0 ? m.order : idx + 1,
       });
     } else if (title) {
@@ -450,7 +553,7 @@ export function validateAIDistribution(
 
   (Array.isArray(rawEvaluations) ? rawEvaluations : []).forEach((e) => {
     if (!e || typeof e !== 'object') return;
-    const subId = e.subjectId ? String(e.subjectId) : '';
+    const subId = resolveDistributedSubjectId(e, validMap, semanticSubjects);
     let title = normalizeName(e.title || '');
     if (!title) return;
 
@@ -465,10 +568,19 @@ export function validateAIDistribution(
       const maxScore = configuredMaxScore !== 100
         ? configuredMaxScore
         : (hasValidRawMaxScore ? rawMaxScore : configuredMaxScore);
-      const date = typeof e.date === 'string' && e.date.trim() ? e.date.trim() : '';
+      const date = validIsoDate(e.date);
+      const weekday = e.weekday || e.dayOfWeek || e.dia;
+      const weekdayMismatch = !!date && !dateMatchesWeekday(date, weekday);
       const rawType = e.type;
       const type: 'teorica' | 'practica' | 'apreciativa' = ['teorica', 'practica', 'apreciativa'].includes(rawType) ? rawType : 'teorica';
-      const isDraft = !date || !hasValidRawMaxScore;
+      const isDraft = !date || !hasValidRawMaxScore || weekdayMismatch;
+
+      if (weekdayMismatch) {
+        unclassified.push({
+          title: `Revisar fecha: ${title}`,
+          content: `La fecha ${date} no coincide con el día indicado (${String(weekday)}).`,
+        });
+      }
 
       if (isDraft && !title.toLowerCase().includes('borrador')) {
         title = `${title} (Borrador pendiente de revisión)`;
@@ -514,6 +626,8 @@ export interface DistributedModuleWrite {
   scope: 'subject';
   title: string;
   description: string;
+  startDate?: string;
+  endDate?: string;
   order: number;
   planRunId: string;
   createdAt: number;
@@ -525,7 +639,7 @@ export interface DistributedModuleWrite {
  * la primera materia/canónica (habitualmente Español).
  */
 export function buildDistributedModuleWrite(
-  item: { subjectId: string; title: string; description?: string; order?: number },
+  item: { subjectId: string; title: string; description?: string; startDate?: string; endDate?: string; order?: number },
   context: { userId: string; canonicalSubjectId: string; classGroupId: string; planRunId: string; createdAt: number },
 ): DistributedModuleWrite {
   return {
@@ -536,6 +650,8 @@ export function buildDistributedModuleWrite(
     scope: 'subject',
     title: normalizeName(item.title),
     description: String(item.description || '').trim(),
+    ...(item.startDate ? { startDate: item.startDate } : {}),
+    ...(item.endDate ? { endDate: item.endDate } : {}),
     order: typeof item.order === 'number' && item.order > 0 ? item.order : 1,
     planRunId: context.planRunId,
     createdAt: context.createdAt,

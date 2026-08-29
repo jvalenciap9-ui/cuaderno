@@ -253,7 +253,7 @@ service cloud.firestore {
           && (!('periodo' in data) || (data.periodo is string && data.periodo.size() <= 40))
           && (!('schemaVersion' in data) || data.schemaVersion is number)
           && (!('planDraft' in data) || (data.planDraft is string && data.planDraft.size() <= 500000))
-          && (!('planType' in data) || (data.planType is string && data.planType in ['semanal', 'mensual', 'trimestral']))
+          && (!('planType' in data) || (data.planType is string && data.planType in ['semanal', 'mensual', 'trimestral', 'cuatrimestral', 'anual']))
           && (!('planStatus' in data) || (data.planStatus is string && data.planStatus in ['idle', 'draft_saved', 'distributed']))
           && (!('lastPlanRunId' in data) || (data.lastPlanRunId is string && data.lastPlanRunId.size() <= 128))
           && (!('unclassifiedItems' in data) || (data.unclassifiedItems is list && data.unclassifiedItems.size() <= 200))
@@ -341,7 +341,8 @@ service cloud.firestore {
           && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
           && data.title is string && data.title.size() > 0 && data.title.size() <= 200
           && data.content is string && data.content.size() >= 0 && data.content.size() <= 300000
-          && data.date is string && data.date.size() > 0 && data.date.size() <= 30;
+          && data.date is string && data.date.size() > 0 && data.date.size() <= 30
+          && (!('sourceNoteId' in data) || (data.sourceNoteId is string && data.sourceNoteId.size() > 0 && data.sourceNoteId.size() <= 128));
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(noteId) && isExistingOwner();
@@ -383,6 +384,7 @@ service cloud.firestore {
           && data.type is string && data.type.size() > 0 && data.type.size() <= 50
           && (!('isDraft' in data) || data.isDraft is bool)
           && (!('planRunId' in data) || (data.planRunId is string && data.planRunId.size() <= 128))
+          && (!('sourceNoteId' in data) || (data.sourceNoteId is string && data.sourceNoteId.size() > 0 && data.sourceNoteId.size() <= 128))
           && (!('createdAt' in data) || data.createdAt is number);
       }
       allow list: if isSignedIn() && isExistingOwner();
@@ -479,7 +481,8 @@ service cloud.firestore {
           && data.subjectId is string && data.subjectId.size() > 0 && data.subjectId.size() <= 128
           && data.title is string && data.title.size() > 0 && data.title.size() <= 200
           && data.date is string && data.date.size() > 0 && data.date.size() <= 30
-          && data.type is string && data.type.size() > 0 && data.type.size() <= 50;
+          && data.type is string && data.type.size() > 0 && data.type.size() <= 50
+          && (!('sourceNoteId' in data) || (data.sourceNoteId is string && data.sourceNoteId.size() > 0 && data.sourceNoteId.size() <= 128));
       }
       allow list: if isSignedIn() && isExistingOwner();
       allow get: if isSignedIn() && isValidId(calendarEventId) && isExistingOwner();
@@ -521,7 +524,8 @@ service cloud.firestore {
           && (!('assignedSubjectId' in data) || data.assignedSubjectId == null || (data.assignedSubjectId is string && data.assignedSubjectId.size() > 0 && data.assignedSubjectId.size() <= 128))
           && (!('classGroupId' in data) || (data.classGroupId is string && data.classGroupId.size() > 0 && data.classGroupId.size() <= 128))
           && (!('scope' in data) || data.scope in ['classGroup', 'subject'])
-          && (!('planRunId' in data) || (data.planRunId is string && data.planRunId.size() <= 128));
+          && (!('planRunId' in data) || (data.planRunId is string && data.planRunId.size() <= 128))
+          && (!('sourceNoteId' in data) || (data.sourceNoteId is string && data.sourceNoteId.size() > 0 && data.sourceNoteId.size() <= 128));
       }
       function assignmentTargetOk(data) {
         return !('assignedSubjectId' in data) || data.assignedSubjectId == null || (

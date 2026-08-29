@@ -84,6 +84,12 @@ function nameKey(s) {
   return n.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
+function toAulaPlanType(plan) {
+  if (plan === 'mensual' || plan === 'trimestral' || plan === 'cuatrimestral') return plan;
+  if (plan === 'anual' || plan === 'anual_8' || plan === 'anual_10') return 'anual';
+  return 'semanal';
+}
+
 /**
  * Valida la lista de materias de un aula multiasignatura.
  * Rechaza vacíos (tras normalizar) y duplicados dentro del aula
@@ -336,11 +342,72 @@ function lastMateriaStorageKey(groupId) {
  * ausente se mueve a `unclassified` ("Pendiente de clasificar"). NUNCA se
  * asigna automáticamente a Español u otra materia por defecto.
  */
+function semanticKey(value) {
+  return nameKey(String(value || '')).replace(/[^a-z0-9ñ]+/g, ' ').trim();
+}
+
+function uniqueSubjectMention(value, subjects, exact = false) {
+  const text = semanticKey(value);
+  if (!text) return null;
+  const padded = ` ${text} `;
+  const matches = subjects.filter((subject) => exact
+    ? text === subject.key
+    : padded.includes(` ${subject.key} `));
+  return matches.length === 1 ? matches[0].id : null;
+}
+
+function resolveDistributedSubjectId(item, validMap, semanticSubjects) {
+  const rawId = item.subjectId ? String(item.subjectId) : '';
+  const explicit = item.subjectName != null ? item.subjectName : (item.materia != null ? item.materia : item.subject);
+  const explicitId = uniqueSubjectMention(explicit, semanticSubjects, true);
+  if (explicitId) return explicitId;
+  const titleId = uniqueSubjectMention(item.title, semanticSubjects);
+  if (titleId) return titleId;
+  if (rawId && validMap.has(rawId)) return rawId;
+  return uniqueSubjectMention(item.description != null ? item.description : item.content, semanticSubjects) || '';
+}
+
+const WEEKDAY_INDEX = {
+  domingo: 0,
+  lunes: 1,
+  martes: 2,
+  miercoles: 3,
+  jueves: 4,
+  viernes: 5,
+  sabado: 6,
+};
+
+function validIsoDate(value) {
+  const date = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return '';
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date ? '' : date;
+}
+
+function expectedWeekday(value) {
+  const key = semanticKey(value);
+  for (const [name, index] of Object.entries(WEEKDAY_INDEX)) {
+    if (` ${key} `.includes(` ${name} `)) return index;
+  }
+  return null;
+}
+
+function dateMatchesWeekday(date, weekday) {
+  const expected = expectedWeekday(weekday);
+  if (!date || expected === null) return true;
+  return new Date(`${date}T00:00:00Z`).getUTCDay() === expected;
+}
+
 function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, validSubjects, defaultMaxScore = 100) {
   const validMap = new Map();
   (Array.isArray(validSubjects) ? validSubjects : []).forEach((s) => {
     if (s && s.id) validMap.set(String(s.id), String(s.name || s.id));
   });
+
+  const semanticSubjects = Array.from(validMap.entries()).map(([id, name]) => ({
+    id,
+    key: semanticKey(name),
+  })).filter((subject) => subject.key.length > 0);
 
   const validModules = [];
   const validEvaluations = [];
@@ -349,14 +416,34 @@ function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, val
 
   (Array.isArray(rawModules) ? rawModules : []).forEach((m, idx) => {
     if (!m || typeof m !== 'object') return;
-    const subId = m.subjectId ? String(m.subjectId) : '';
+    const subId = resolveDistributedSubjectId(m, validMap, semanticSubjects);
     const title = normalizeName(m.title || '');
     if (subId && validMap.has(subId) && title) {
+      let startDate = validIsoDate(m.startDate || m.date);
+      let endDate = validIsoDate(m.endDate) || startDate;
+      const weekday = m.weekday || m.dayOfWeek || m.dia;
+      if (startDate && !dateMatchesWeekday(startDate, weekday)) {
+        unclassified.push({
+          title: `Revisar fecha: ${title}`,
+          content: `La fecha ${startDate} no coincide con el día indicado (${String(weekday)}).`,
+        });
+        startDate = '';
+        endDate = '';
+      }
+      if (startDate && endDate && endDate < startDate) {
+        unclassified.push({
+          title: `Revisar rango: ${title}`,
+          content: `La fecha final ${endDate} es anterior a ${startDate}.`,
+        });
+        endDate = startDate;
+      }
       matchedSubjects.add(validMap.get(subId));
       validModules.push({
         subjectId: subId,
         title,
         description: String(m.description || '').trim(),
+        ...(startDate ? { startDate } : {}),
+        ...(endDate ? { endDate } : {}),
         order: typeof m.order === 'number' && m.order > 0 ? m.order : idx + 1,
       });
     } else if (title) {
@@ -369,7 +456,7 @@ function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, val
 
   (Array.isArray(rawEvaluations) ? rawEvaluations : []).forEach((e) => {
     if (!e || typeof e !== 'object') return;
-    const subId = e.subjectId ? String(e.subjectId) : '';
+    const subId = resolveDistributedSubjectId(e, validMap, semanticSubjects);
     let title = normalizeName(e.title || '');
     if (!title) return;
 
@@ -381,9 +468,18 @@ function validateAIDistribution(rawModules, rawEvaluations, rawUnclassified, val
       const maxScore = configuredMaxScore !== 100
         ? configuredMaxScore
         : (hasValidRawMaxScore ? rawMaxScore : configuredMaxScore);
-      const date = typeof e.date === 'string' && e.date.trim() ? e.date.trim() : '';
+      const date = validIsoDate(e.date);
+      const weekday = e.weekday || e.dayOfWeek || e.dia;
+      const weekdayMismatch = !!date && !dateMatchesWeekday(date, weekday);
       const type = ['teorica', 'practica', 'apreciativa'].includes(e.type) ? e.type : 'teorica';
-      const isDraft = !date || !hasValidRawMaxScore;
+      const isDraft = !date || !hasValidRawMaxScore || weekdayMismatch;
+
+      if (weekdayMismatch) {
+        unclassified.push({
+          title: `Revisar fecha: ${title}`,
+          content: `La fecha ${date} no coincide con el día indicado (${String(weekday)}).`,
+        });
+      }
 
       if (isDraft && !title.toLowerCase().includes('borrador')) {
         title = `${title} (Borrador pendiente de revisión)`;
@@ -428,6 +524,8 @@ function buildDistributedModuleWrite(item, context) {
     scope: 'subject',
     title: normalizeName(item.title),
     description: String(item.description || '').trim(),
+    ...(item.startDate ? { startDate: item.startDate } : {}),
+    ...(item.endDate ? { endDate: item.endDate } : {}),
     order: typeof item.order === 'number' && item.order > 0 ? item.order : 1,
     planRunId: context.planRunId,
     createdAt: context.createdAt,
@@ -487,6 +585,7 @@ module.exports = {
   normalizeName,
   computeAulaDisplayName,
   nameKey,
+  toAulaPlanType,
   validateMateriaNames,
   validateClassGroupInput,
   siblingSortKey,

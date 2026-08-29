@@ -40,6 +40,7 @@ export interface ClassGroup {
   grado?: string;
   seccion?: string;
   periodo?: string;
+  planType?: 'semanal' | 'mensual' | 'trimestral' | 'cuatrimestral' | 'anual';
   schemaVersion?: number;
   createdAt: number;
   updatedAt: number;
