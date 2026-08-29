@@ -61,6 +61,25 @@ interface ModulesTabProps {
   onScopeModeChange?: (mode: 'materia' | 'planificacion') => void;
 }
 
+const MAX_PLAN_IMAGE_BYTES = 6 * 1024 * 1024;
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('No se pudo leer la imagen seleccionada.'));
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const separator = dataUrl.indexOf(',');
+      if (separator < 0) {
+        reject(new Error('La imagen no tiene un formato válido.'));
+        return;
+      }
+      resolve(dataUrl.slice(separator + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 export function ModulesTab({
   subjectId,
   onOpenNoteModal,
@@ -180,6 +199,29 @@ export function ModulesTab({
       let extractedText = '';
       if (file.type.startsWith('text/') || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
         extractedText = await file.text();
+      } else if (file.type.startsWith('image/')) {
+        if (file.size > MAX_PLAN_IMAGE_BYTES) {
+          showToast('warning', 'La imagen supera 6 MB. Reduce su tamaño o conviértela a PDF antes de cargarla.');
+          return;
+        }
+        const base64Data = await fileToBase64(file);
+        const transcription = await ai({
+          model: 'gemini-2.5-flash',
+          contents: [{
+            role: 'user',
+            parts: [
+              {
+                text: `Transcribe fielmente todo el texto visible de esta planificación escolar.
+Conserva títulos, materias, semanas, fechas, actividades, evaluaciones y el orden de tablas o columnas.
+No clasifiques todavía el contenido, no lo resumas y no inventes información.
+Devuelve únicamente la transcripción en texto plano.`,
+              },
+              { inlineData: { data: base64Data, mimeType: file.type } },
+            ],
+          }],
+          config: { temperature: 0 },
+        });
+        extractedText = transcription.text || '';
       } else {
         const buffer = await file.arrayBuffer();
         extractedText = await extractTextFromFile(buffer, file.type);
@@ -190,10 +232,19 @@ export function ModulesTab({
       }
       setDraftText(extractedText);
       setLoadedFileName(file.name);
-      await handleSaveDraft(extractedText, file.name, file.type);
+      const savedVersion = await handleSaveDraft(extractedText, file.name, file.type);
+      if (savedVersion && file.type.startsWith('image/')) {
+        showToast('success', 'Imagen transcrita y plan guardado. Revisa el texto y pulsa “2. Analizar y distribuir”.');
+      }
     } catch (err: any) {
       console.error('Error al leer archivo de plan:', err);
-      showToast('error', 'Error al leer el archivo. Intenta pegar el texto manualmente.');
+      const cause = err instanceof Error ? err.message : '';
+      showToast(
+        'error',
+        cause.includes('permanece guardado')
+          ? cause.replace('El contenido permanece guardado', 'El plan permanece guardado')
+          : 'No se pudo leer o transcribir el archivo. Intenta pegar el texto manualmente.',
+      );
     } finally {
       if (planFileInputRef.current) planFileInputRef.current.value = '';
     }
@@ -1251,7 +1302,7 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
                 className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-xs font-black uppercase tracking-wider transition-colors shadow-lg shadow-indigo-500/20 min-h-[44px] flex items-center gap-2"
               >
                 <Book className="w-4 h-4" />
-                {isDistributing ? 'Procesando con Magia IA...' : '2. Procesar con Magia IA'}
+                {isDistributing ? 'Analizando y distribuyendo...' : '2. Analizar y distribuir'}
               </button>
             </div>
           </div>
