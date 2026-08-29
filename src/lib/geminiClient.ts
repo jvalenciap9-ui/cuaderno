@@ -6,12 +6,10 @@
  * La API Key NUNCA llega al navegador.
  */
 
-// URL del proxy backend
-// En dev: servidor Express local. En prod: Cloud Run (directo, evita 502 del proxy de Hosting)
-const GEMINI_URL = import.meta.env.DEV
-  ? 'http://localhost:3001'
-  : 'https://geminiproxy-t6k4ah2mva-uc.a.run.app';
-// Health check / others pasan por hosting
+// URL opcional del proxy backend. Debe contener el endpoint COMPLETO; nunca se
+// concatena el nombre de la Function porque las URLs directas de Cloud Run y
+// los rewrites de Hosting no comparten el mismo pathname.
+const CONFIGURED_GEMINI_PROXY_URL = String(import.meta.env.VITE_GEMINI_PROXY_URL || '').trim();
 const API_BASE = import.meta.env.DEV ? 'http://localhost:3001' : '';
 const EMULATOR_PROJECT_ID = import.meta.env.VITE_EMULATOR_PROJECT_ID || 'demo-ediagil';
 
@@ -54,7 +52,7 @@ export async function callGemini(options: {
     ? `http://127.0.0.1:5001/${EMULATOR_PROJECT_ID}/us-central1/geminiproxy`
     : import.meta.env.DEV
       ? `${API_BASE}/api/gemini`
-      : `${GEMINI_URL}/geminiproxy`;
+      : CONFIGURED_GEMINI_PROXY_URL || '/api/gemini';
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   
@@ -69,11 +67,23 @@ export async function callGemini(options: {
     }
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ model, contents, config }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model, contents, config }),
+    });
+  } catch (error) {
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    const detail = error instanceof Error ? error.message : String(error || '');
+    console.error('No se pudo conectar con geminiproxy:', { url, detail, offline });
+    throw new Error(
+      offline
+        ? 'No tienes conexión a internet. El contenido permanece guardado y puedes reintentar al recuperar la conexión.'
+        : 'No fue posible conectar con Magia IA. El contenido permanece guardado y puedes reintentar.',
+    );
+  }
 
   const bodyText = await response.text().catch(() => '');
   if (!response.ok) {

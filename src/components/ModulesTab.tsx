@@ -344,8 +344,10 @@ NO incluyas explicaciones adicionales ni bloques fuera del JSON.`;
       trackEvent(ANALYTICS_CATEGORIES.MODULE, ANALYTICS_ACTIONS.CREATE);
     } catch (error: any) {
       console.error('Error en Magia IA al distribuir plan:', error);
-      // Requisito de fallback de error de la instrucción:
-      const msg = 'No fue posible distribuir el plan. El original está guardado y puedes reintentar.';
+      const cause = error instanceof Error ? error.message : '';
+      const msg = cause.includes('permanece guardado')
+        ? cause.replace('El contenido permanece guardado', 'El plan original permanece guardado')
+        : 'No fue posible distribuir el plan. El original está guardado y puedes reintentar.';
       setAiAlertMessage(msg);
       showToast('error', msg);
     } finally {
@@ -667,7 +669,10 @@ let addedEvents = 0, addedEvals = 0, addedModules = 0, addedNotes = 0;
       setAiAlertMessage(`¡Magia completada! Se guardaron: ${addedModules} módulos, ${addedNotes} apuntes, ${addedEvents} eventos, y ${addedEvals} evaluaciones.`);
     } catch (e: unknown) {
       console.error("Error en MAGIC AI:", e);
-      const msg = 'Hubo un error al procesar la IA: ' + ((e instanceof Error ? e.message : '') || 'Desconocido');
+      const cause = (e instanceof Error ? e.message : '') || 'No se pudo completar el análisis.';
+      const msg = cause.includes('permanece guardado')
+        ? cause.replace('El contenido permanece guardado', 'El apunte permanece guardado')
+        : `No fue posible procesar el apunte con Magia IA. ${cause}`;
       setAiAlertMessage(msg);
       toast.error(msg);
     } finally {
