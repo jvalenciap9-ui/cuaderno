@@ -6,8 +6,8 @@
 import { spawn } from 'node:child_process';
 
 const projectId = process.env.FIREBASE_PROJECT_ID || 'demo-ediagil';
-if (!projectId.startsWith('demo-')) {
-  console.error(`BLOCKED — FIREBASE_PROJECT_ID debe comenzar con "demo-" (recibido: ${projectId}).`);
+if (!/^demo-[a-z0-9-]+$/.test(projectId)) {
+  console.error(`BLOCKED — FIREBASE_PROJECT_ID debe ser un identificador demo seguro (recibido: ${projectId}).`);
   process.exit(1);
 }
 
@@ -28,8 +28,8 @@ const env = {
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || 'emulator-gemini-key',
 };
 
-const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-const child = spawn(npx, [
+const isWindows = process.platform === 'win32';
+const firebaseArgs = [
   'firebase',
   'emulators:exec',
   '--config',
@@ -38,8 +38,19 @@ const child = spawn(npx, [
   'auth,firestore,functions,storage',
   '--project',
   projectId,
-  `${process.execPath} scripts/test-pilot-emulator-suite.mjs`,
-], { stdio: 'inherit', env });
+  'node scripts/test-pilot-emulator-suite.mjs',
+];
+
+// Node 24 en Windows puede devolver spawn EINVAL al abrir directamente un
+// archivo .cmd. Invocar cmd.exe de forma explícita evita esa dependencia.
+const child = isWindows
+  ? spawn(process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe', [
+      '/d',
+      '/s',
+      '/c',
+      `npx firebase emulators:exec --config firebase.pilot.json --only auth,firestore,functions,storage --project ${projectId} "node scripts/test-pilot-emulator-suite.mjs"`,
+    ], { stdio: 'inherit', env })
+  : spawn('npx', firebaseArgs, { stdio: 'inherit', env });
 
 child.on('error', (error) => {
   console.error(`BLOCKED — no se pudo iniciar Firebase CLI: ${error.message}`);
