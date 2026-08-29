@@ -363,13 +363,24 @@ async function sendWebhook(payloadObj, secret) {
 
   // order_created pro
   const ev1 = lsEvent('order_created', { id: 'order_1', variantId: PRO_VARIANT_ID }, { user_id: u.whPro.uid });
+  const orderCreatedStartedAt = Date.now();
   const r1 = await sendWebhook(ev1);
+  const orderCreatedFinishedAt = Date.now();
   expectStatus('order_created (pro) → 200', r1, 200);
   let d = (await readUser(u.whPro.uid)).data;
   record('order_created pro: plan=pro', d?.plan === 'pro');
   record('order_created: paymentProvider=lemonsqueezy', d?.paymentProvider === 'lemonsqueezy');
   record('order_created: limpió isTrial y trialUsed=true', d?.isTrial === false && d?.trialUsed === true);
-  record('order_created: expiresAt ≈ +1 año', typeof d?.expiresAt === 'number' && Math.abs(d.expiresAt - (NOW + 365 * DAY)) < 120_000);
+  const expectedExpiryMin = orderCreatedStartedAt + 365 * DAY;
+  const expectedExpiryMax = orderCreatedFinishedAt + 365 * DAY;
+  const expiryIsValid = typeof d?.expiresAt === 'number'
+    && d.expiresAt >= expectedExpiryMin
+    && d.expiresAt <= expectedExpiryMax;
+  record(
+    'order_created: expiresAt ≈ +1 año',
+    expiryIsValid,
+    `(actual=${JSON.stringify(d?.expiresAt)}, tipo=${typeof d?.expiresAt}, rango=${expectedExpiryMin}..${expectedExpiryMax})`,
+  );
 
   // order_created school → rol admin + institución
   const ev2 = lsEvent('order_created', { id: 'order_2', variantId: SCHOOL_VARIANT_ID }, { user_id: u.whSchool.uid, institutionName: 'Escuela Nueva' });
